@@ -193,6 +193,8 @@ def build_embedding_provider(settings: Settings) -> EmbeddingProvider:
 
     return OpenAIEmbeddingProvider(
         api_key=key.get_secret_value(),
-        model=settings.embedding_model,
+        # Resolved, not read raw: an unset EMBEDDING_MODEL must become the model
+        # this provider actually serves rather than an empty name.
+        model=settings.embedding_model_name,
         dimensions=settings.embedding_dimensions,
     )

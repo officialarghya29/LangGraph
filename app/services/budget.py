@@ -231,7 +231,13 @@ class BudgetedProvider(LLMProvider):
         Args:
             inner: The provider to delegate to.
         """
-        super().__init__(default_model=inner.default_model)
+        super().__init__(
+            default_model=inner.default_model,
+            # Read leniently, as in the retry decorator: a provider that declares
+            # neither still composes, and neither is consulted for a decision.
+            default_temperature=getattr(inner, "default_temperature", 0.0),
+            default_max_tokens=getattr(inner, "default_max_tokens", None),
+        )
         self.inner = inner
         # Instance attribute shadowing the class default, so a log line names the
         # real provider rather than "provider".
@@ -242,7 +248,7 @@ class BudgetedProvider(LLMProvider):
         messages: Sequence[Message],
         *,
         model: str | None = None,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> LLMResponse:
         """Charge the call to the budget, then delegate.

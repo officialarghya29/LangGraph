@@ -24,7 +24,7 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 
 [![Ruff](https://img.shields.io/badge/Ruff-passing-D7FF64?style=for-the-badge&logo=ruff&logoColor=black)](#quality-gates)
 [![MyPy](https://img.shields.io/badge/MyPy-strict-2A6DB2?style=for-the-badge)](#quality-gates)
-[![Tests](https://img.shields.io/badge/tests-899%20passing-brightgreen?style=for-the-badge)](#quality-gates)
+[![Tests](https://img.shields.io/badge/tests-929%20passing-brightgreen?style=for-the-badge)](#quality-gates)
 
 [![Status](https://img.shields.io/badge/phases-45%20of%2045-brightgreen?style=for-the-badge)](#build-status)
 [![License](https://img.shields.io/badge/license-proprietary-red?style=for-the-badge)](#license)
@@ -44,7 +44,7 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 > $ ruff format --check .   →  141 files already formatted
 > $ ruff check .            →  All checks passed
 > $ mypy app scripts        →  Success: no issues found in 81 source files
-> $ pytest                  →  899 passed, 1 skipped in 47s
+> $ pytest                  →  929 passed, 1 skipped in 29s
 > $ python scripts/evaluate.py --quiet
 > rule-based baseline: accuracy=0.911 adversarial=0.429 macro_f1=0.920 ⟶
 >   approval_recall=1.000 p50=0.06ms p95=0.09ms
@@ -626,8 +626,11 @@ than warn.
 | `APP_ENV` | `development` | `development` / `staging` / `production` |
 | `DEBUG` | `false` | Verbose error output |
 | `LLM_PROVIDER` | `openai` | Provider selection |
-| `LLM_MODEL` | — | Model name, never hardcoded in agents |
+| `LLM_MODEL` | provider default | Model name; unset resolves per provider, never hardcoded in agents |
 | `LLM_API_KEY` | — | Provider credential |
+| `LLM_TEMPERATURE` | `0.0` | Sampling temperature for calls that do not state one |
+| `LLM_MAX_OUTPUT_TOKENS` | — | Output ceiling; unset uses the vendor's own default |
+| `LLM_MAX_RETRIES` | `2` | Attempts per model call, separate from `MAX_RETRIES` |
 | `EMBEDDING_PROVIDER` | `local` | Embedding backend; `local` needs no credential |
 | `DATABASE_URL` | local Postgres | Durable task, approval, memory, and checkpoint storage |
 | `DATABASE_TOOL_URL` | — | Target for the `database` tool; unset means it is not registered |
@@ -650,6 +653,42 @@ than warn.
 | `GITHUB_TOOL_ALLOW_WRITES` | `false` | GitHub write toggle |
 
 See [`.env.example`](.env.example) for the complete annotated list.
+
+### Choosing a model
+
+`LLM_MODEL` is deliberately unset by default, and the default is derived from the
+provider instead of written down. The reason is that a model name is only
+meaningful to the vendor that serves it, so a single default is necessarily wrong
+for every provider but one: `LLM_PROVIDER=anthropic` on its own sent an OpenAI
+model name to the Messages API and failed with a model-not-found error that
+pointed at the model rather than at the configuration. Unset now resolves to
+`gpt-5.6-terra` for `openai`, `claude-sonnet-5-5` for `anthropic`, and
+`llama3.1:8b` for a local server, and the resolved name is logged at startup
+because it is no longer visible in the environment.
+
+**The request is shaped to the model, not just to the endpoint.** The current
+generation of reasoning models rejects sampling parameters outright rather than
+ignoring them: `temperature` fails the whole request with `HTTP 400`,
+`Unsupported value: 'temperature' does not support 0.0 with this model`, and
+`max_tokens` is refused in favour of `max_completion_tokens`. Since the default
+model is one of these, sending either field unconditionally would make every call
+in the system fail — so the adapter picks the legal fields from the resolved model
+name. `gpt-oss` is excluded from that match: it is an OpenAI model name served by
+the local runtimes, and it accepts the ordinary parameters.
+
+**The output ceiling is left unset on purpose.** On a reasoning model the ceiling
+covers the model's own reasoning before it covers a token of answer, so a small
+value truncates the reply instead of shortening it, and the right number depends
+entirely on which model is configured. `LLM_MAX_OUTPUT_TOKENS` exists for the
+case where a limit is genuinely required; unset means the vendor's default. It is
+required on Anthropic either way, where the Messages API has no server-side
+default and one is supplied if nothing else does.
+
+The shipped names are the balanced tier of each vendor's current line at the time
+of writing — `gpt-5.6-luna` and `gpt-5.6-sol`, `claude-opus-5-5` and
+`claude-fable-5-1` are drop-in alternatives. Model lineups move faster than
+documentation does, so treat the defaults as a starting point to check against
+the vendor's current list rather than as an endorsement.
 
 ### Budgets and throttling
 
@@ -880,7 +919,7 @@ one is failing.
 | **API** | Health, readiness, chat, task creation, status, approve, reject, cancel, events, discovery | FastAPI test client, with durability read back over a separate connection |
 | **Security** | Path traversal, prompt injection, unauthorised tools, cross-user access, SSRF, unsafe SQL, secret leakage | Adversarial cases |
 | **Evaluation** | Routing quality against a labelled corpus, and the hot-path timings | Per-route precision and recall, a rule-based baseline, and a percentile timing harness |
-| **Provider transport** | Both model adapters, over a real socket | A scripted loopback server asserting the endpoint, headers, payload, usage fields, and error mapping — then the whole decorator stack against it |
+| **Provider transport** | Both model adapters, over a real socket | A scripted loopback server asserting the endpoint, headers, payload, usage fields, and error mapping — then the whole decorator stack against it. The payload assertions are per model: a reasoning model must not be sent `temperature` and takes its ceiling as `max_completion_tokens`, and that is checked on the wire rather than on the object |
 | **Assets** | The generated diagrams | An audit that measures every drawn label and fails on overlap or overflow |
 | **Configuration drift** | `.env.example`, `docker-compose.yml`, the `Dockerfile`, `.dockerignore` | Every documented key is compared against the settings layer in both directions, and the container's environment is checked for names that do not exist — a typo there is accepted silently and configures nothing |
 | **Concurrency** | Two runs in flight against one compiled graph | Separate event sinks, token budgets, and ceilings; the same request is asserted to cost the same whether or not it had company |

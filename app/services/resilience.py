@@ -68,7 +68,16 @@ class RetryingProvider(LLMProvider):
             sleep: Injectable sleep, so tests do not wait out real backoff.
             on_retry: Optional observer, called once per failed attempt.
         """
-        super().__init__(default_model=inner.default_model)
+        super().__init__(
+            default_model=inner.default_model,
+            # Read leniently: this decorator's contract is "an object with
+            # ``ainvoke``", and a provider that does not declare sampling defaults
+            # should still compose. Nothing here consults them for a decision —
+            # they are copied so a caller inspecting the wrapper sees the same
+            # configuration it wrapped.
+            default_temperature=getattr(inner, "default_temperature", 0.0),
+            default_max_tokens=getattr(inner, "default_max_tokens", None),
+        )
         self.inner = inner
         self.max_retries = max_retries
         self._sleep = sleep
@@ -85,7 +94,7 @@ class RetryingProvider(LLMProvider):
         messages: Sequence[Message],
         *,
         model: str | None = None,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> LLMResponse:
         """Call the provider, retrying failures worth retrying.

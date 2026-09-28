@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from types import MappingProxyType
 from typing import Literal
 
 from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
@@ -20,12 +21,52 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.core.exceptions import ConfigurationError
 
-__all__ = ["AppEnv", "LogLevel", "Settings", "get_settings", "reset_settings_cache"]
+__all__ = [
+    "DEFAULT_EMBEDDING_MODELS",
+    "DEFAULT_LLM_MODELS",
+    "AppEnv",
+    "LogLevel",
+    "Settings",
+    "get_settings",
+    "reset_settings_cache",
+]
 
 AppEnv = Literal["development", "staging", "production"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 LLMProviderName = Literal["openai", "anthropic", "local"]
 EmbeddingProviderName = Literal["local", "openai"]
+
+#: Model a provider is called with when the operator does not name one.
+#:
+#: Keyed by provider, because a model name only means anything to the vendor that
+#: serves it. There used to be a single default, and it was an OpenAI name, so
+#: setting ``LLM_PROVIDER=anthropic`` without also setting ``LLM_MODEL`` sent a GPT
+#: model to the Messages API and failed with a model-not-found error that pointed
+#: at the model rather than at the configuration.
+#:
+#: The OpenAI entry is the model OpenAI's own documentation badges as the default
+#: for balanced work, and it is served over ``/v1/chat/completions``. Cheaper and
+#: more expensive siblings (``gpt-5.6-luna``, ``gpt-5.6-sol``) are drop-in names.
+#: The Anthropic entry is the current balanced model; ``claude-opus-5-5`` and
+#: ``claude-fable-5-1`` are the larger alternatives.
+DEFAULT_LLM_MODELS: MappingProxyType[str, str] = MappingProxyType(
+    {
+        "openai": "gpt-5.6-terra",
+        "anthropic": "claude-sonnet-5-5",
+        "local": "llama3.1:8b",
+    }
+)
+
+#: Embedding model used when the operator does not name one. The local entry is
+#: descriptive rather than a model name: the local embedder is the hashing one,
+#: which takes no model. It is here so the resolved value never reads as if a
+#: hosted model were in use when none is.
+DEFAULT_EMBEDDING_MODELS: MappingProxyType[str, str] = MappingProxyType(
+    {
+        "local": "local-hashing",
+        "openai": "text-embedding-3-small",
+    }
+)
 
 
 class Settings(BaseSettings):
@@ -46,15 +87,30 @@ class Settings(BaseSettings):
 
     # --- LLM --------------------------------------------------------------- #
     llm_provider: LLMProviderName = "openai"
-    llm_model: str = "gpt-4o-mini"
+    #: Unset means "use :data:`DEFAULT_LLM_MODELS` for the chosen provider", which
+    #: is resolved by :attr:`llm_model_name`. It is deliberately optional rather
+    #: than defaulted to one provider's model name, because that name would be
+    #: wrong for every other provider.
+    llm_model: str | None = None
     llm_api_key: SecretStr | None = None
     llm_base_url: str | None = None
     llm_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
     llm_max_retries: int = Field(default=2, ge=0, le=10)
+    #: Sampling temperature applied when a call site does not state one. Zero by
+    #: default: the agents are asked for a decision or an extraction, not prose,
+    #: and a reproducible verdict is worth more than a varied one. Ignored for
+    #: models that reject the parameter — see ``app.services.llm``.
+    llm_temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+    #: Ceiling on model output, per call. Unset leaves the vendor's own default,
+    #: which is why it is not defaulted to a number: a low ceiling on a reasoning
+    #: model is spent on the model's own reasoning and starves the answer, and the
+    #: right value depends entirely on which model is configured.
+    llm_max_output_tokens: int | None = Field(default=None, ge=1, le=200_000)
 
     # --- Embeddings -------------------------------------------------------- #
     embedding_provider: EmbeddingProviderName = "local"
-    embedding_model: str = "text-embedding-3-small"
+    #: Unset means "use :data:`DEFAULT_EMBEDDING_MODELS` for the chosen provider".
+    embedding_model: str | None = None
     embedding_api_key: SecretStr | None = None
     embedding_dimensions: int = Field(default=256, gt=0, le=8192)
 
@@ -284,6 +340,8 @@ class Settings(BaseSettings):
         "otel_exporter_otlp_endpoint",
         "jwt_audience",
         "jwt_issuer",
+        "llm_model",
+        "embedding_model",
         mode="after",
     )
     @classmethod
@@ -296,6 +354,12 @@ class Settings(BaseSettings):
         holds for a JWT audience or issuer, where an empty string is a claim to
         check against rather than the absence of one.
 
+        The model names belong here for the same reason. ``LLM_MODEL=`` is how an
+        operator asks for the provider's own default, and reading it as the empty
+        string produced a provider called with no model at all: an error about the
+        request rather than about the configuration, from a file that looked
+        correctly filled in.
+
         Args:
             value: The parsed text, if any.
 
@@ -307,16 +371,21 @@ class Settings(BaseSettings):
         text = value.strip()
         return text or None
 
-    @field_validator("api_docs_enabled", mode="before")
+    @field_validator("api_docs_enabled", "llm_max_output_tokens", mode="before")
     @classmethod
     def _blank_flag_means_unset(cls, value: object) -> object:
-        """Treat an empty string as "not set" for the tri-state flags.
+        """Treat an empty string as "not set" for the tri-state fields.
 
         ``API_DOCS_ENABLED=`` is how an operator says "decide from the
         environment", which is the documented meaning of leaving it unset. It is
         not, however, parseable as a boolean, so the value was rejected and the
         process refused to start — over a setting that was left deliberately
         blank, in a file that shipped it that way.
+
+        ``LLM_MAX_OUTPUT_TOKENS=`` is the same statement about a number, and it
+        fails the same way: the blank cannot be parsed as an ``int``, so the
+        process refuses to start over a value whose whole purpose is to say "use
+        the vendor's default". Blank is the template's own value for it.
 
         Args:
             value: The raw input, before type coercion.
@@ -330,8 +399,6 @@ class Settings(BaseSettings):
 
     @field_validator(
         "app_name",
-        "llm_model",
-        "embedding_model",
         "otel_service_name",
         mode="after",
     )
@@ -339,15 +406,19 @@ class Settings(BaseSettings):
     def _blank_text_means_default(cls, value: str, info: ValidationInfo) -> str:
         """Treat a blank string as "use the default".
 
-        The same failure as a blank secret, one layer further from the credential:
-        ``LLM_MODEL=`` in a ``.env`` file is valid input for a ``str`` field, so it
-        was accepted, and the provider was then called with an empty model name.
-        That fails at request time with an error about the model rather than about
-        the configuration — and the setting *looked* set in the file, which is what
-        makes it expensive to find.
+        ``APP_NAME=`` is valid input for a ``str`` field, so it was accepted, and
+        the empty string then reached whatever names the process — a log prefix, a
+        tracer's service name — where it produced unnamed output rather than an
+        error. The setting *looked* set in the file, which is what makes it
+        expensive to find.
 
         Surrounding whitespace is stripped for the same reason it is on a secret: a
         value pasted with a trailing newline is not the value someone meant.
+
+        Fields whose absence is meaningful (``llm_model``, ``llm_base_url``) are not
+        listed here: blank resolves to ``None`` for those, through
+        :meth:`_blank_optional_means_unset`, and the default is then derived from
+        the rest of the configuration rather than restated.
 
         Args:
             value: The parsed text.
@@ -394,6 +465,31 @@ class Settings(BaseSettings):
             )
 
         return self
+
+    @property
+    def llm_model_name(self) -> str:
+        """The model the provider will be called with.
+
+        Resolves the provider's default when ``LLM_MODEL`` names nothing, so the
+        name a call uses is always a complete one. Kept as a property rather than
+        filled into the field by a validator so that "the operator did not choose a
+        model" stays visible in the configuration, which is what tells an operator
+        that switching provider also switches model.
+
+        Returns:
+            The configured model name, or the default for the active provider.
+        """
+        return self.llm_model or DEFAULT_LLM_MODELS[self.llm_provider]
+
+    @property
+    def embedding_model_name(self) -> str:
+        """The embedding model a hosted embedder will be called with.
+
+        Returns:
+            The configured name, or the default for the active provider. The local
+            embedder takes no model, so its value is a label rather than a name.
+        """
+        return self.embedding_model or DEFAULT_EMBEDDING_MODELS[self.embedding_provider]
 
     @property
     def execution_sandbox_available(self) -> bool:

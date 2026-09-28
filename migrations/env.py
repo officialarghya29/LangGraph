@@ -33,7 +33,13 @@ from app.database.base import Base
 config = context.config
 
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # ``disable_existing_loggers=False`` is not the default and has to be asked
+    # for. ``fileConfig`` otherwise sets ``disabled = True`` on every logger that
+    # already exists and is not named in ``alembic.ini`` — which, when migrations
+    # are run in the same process as the application, is every logger the
+    # application owns. The result is a process that migrates, starts, serves
+    # traffic, and emits no log lines at all, with nothing to say why.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 

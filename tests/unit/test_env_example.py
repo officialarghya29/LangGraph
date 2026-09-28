@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from app.core.config import Settings
+from app.core.config import DEFAULT_EMBEDDING_MODELS, DEFAULT_LLM_MODELS, Settings
 
 TEMPLATE = Path(".env.example")
 
@@ -93,8 +93,12 @@ def test_a_blank_value_falls_back_to_the_default() -> None:
     """
     loaded = Settings(_env_file=str(TEMPLATE), llm_model="   ", embedding_model="")
 
-    assert loaded.llm_model == "gpt-4o-mini"
-    assert loaded.embedding_model == "text-embedding-3-small"
+    assert loaded.llm_model is None
+    assert loaded.embedding_model is None
+    # ``None`` is not the answer that reaches the wire: the provider's own default
+    # is resolved in its place.
+    assert loaded.llm_model_name == DEFAULT_LLM_MODELS["openai"]
+    assert loaded.embedding_model_name == DEFAULT_EMBEDDING_MODELS["local"]
 
 
 def test_a_blank_secret_is_absent_rather_than_empty() -> None:

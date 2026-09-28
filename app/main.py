@@ -212,6 +212,14 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     else:
         application.state.provider = provider
         application.state.provider_error = None
+        # Which model this process will call is now derived from the provider when
+        # LLM_MODEL is unset, so it is not visible in the environment. Logging it
+        # is the only way an operator can confirm from the outside that the
+        # intended model is the one running.
+        logger.info(
+            "startup.model_ready",
+            extra={"provider": settings.llm_provider, "model": settings.llm_model_name},
+        )
         application.state.graph = build_graph(
             settings,
             provider,

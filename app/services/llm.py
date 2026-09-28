@@ -7,6 +7,11 @@ Structured output is implemented once, on the base class, by instructing the
 model to emit JSON and validating the result against a Pydantic schema. That
 keeps structured generation behaving identically across providers instead of
 relying on vendor-specific tool-calling formats.
+
+Sampling parameters are a property of the *model*, not of this client, and the
+current generation of reasoning models rejects them outright — see
+:data:`_REASONING_PREFIXES`. The payload builders therefore decide per model which
+fields are legal rather than sending a fixed shape and hoping.
 """
 
 from __future__ import annotations
@@ -43,6 +48,7 @@ __all__ = [
     "Role",
     "TokenUsage",
     "build_llm_provider",
+    "is_reasoning_model",
 ]
 
 T = TypeVar("T", bound=BaseModel)
@@ -101,7 +107,55 @@ def _run_sync[R](coro: Coroutine[Any, Any, R]) -> R:
 
 #: Statuses where the provider is telling the client to come back later, and where
 #: a ``Retry-After`` header is meaningful.
-_THROTTLE_STATUSES = frozenset({429, 503})
+#:
+#: This mirrors the retry set the official OpenAI client ships with. Three of the
+#: members are worth naming: 429 and 503 are explicit back-pressure; 500 and 502
+#: and 504 are the gateway and origin failures that are transient far more often
+#: than they are permanent; and 501 is deliberately absent, because "not
+#: implemented" is a property of the request and will be just as unimplemented on
+#: the next attempt. Treating a 5xx as permanent would fail a run that a second
+#: attempt would have completed.
+_THROTTLE_STATUSES = frozenset({408, 409, 429, 500, 502, 503, 504})
+
+#: Model families that do their reasoning internally and reject the sampling
+#: knobs as a consequence.
+#:
+#: OpenAI's reasoning models do not ignore ``temperature``; they fail the whole
+#: request with HTTP 400, "Unsupported value: 'temperature' does not support 0.0
+#: with this model". They also reject ``max_tokens`` — "Unsupported parameter:
+#: 'max_tokens' is not supported with this model. Use 'max_completion_tokens'
+#: instead" — and take the ceiling as ``max_completion_tokens``. Sending either
+#: field unconditionally, as this module did, means every call to such a model
+#: fails, and it fails in a way that reads like a request bug rather than a
+#: configuration one. Match is by family prefix because these names carry a
+#: version and often a tier suffix (``gpt-5.6-terra``, ``o3-mini``).
+_REASONING_PREFIXES = ("o1", "o3", "o4", "gpt-5", "gpt-6")
+
+#: Prefixes excluded from the match above despite looking like it.
+#:
+#: ``gpt-oss`` is OpenAI's open-weights family and it is served by the runtimes
+#: ``LLM_PROVIDER=local`` targets. It accepts the ordinary sampling parameters, so
+#: treating it as a reasoning model would silently drop the temperature an operator
+#: configured.
+_NOT_REASONING_PREFIXES = ("gpt-oss",)
+
+
+def is_reasoning_model(name: str) -> bool:
+    """Return whether ``name`` is a model that rejects sampling parameters.
+
+    Args:
+        name: A model identifier, as passed by the operator or a call site.
+
+    Returns:
+        True when the model takes ``max_completion_tokens`` and must not be sent
+        ``temperature``. Unknown names return False, because the alternative is to
+        guess wrong for a self-hosted model this module has never heard of and
+        strip a parameter its server would have accepted.
+    """
+    lowered = name.strip().lower()
+    if lowered.startswith(_NOT_REASONING_PREFIXES):
+        return False
+    return lowered.startswith(_REASONING_PREFIXES)
 
 
 def _retry_after(headers: Mapping[str, str]) -> float | None:
@@ -213,8 +267,34 @@ class LLMProvider(ABC):
     #: Stable identifier used in logs and metadata.
     name: str = "provider"
 
-    def __init__(self, *, default_model: str) -> None:
+    #: Sampling defaults, restated as class attributes so that a provider which
+    #: sets only ``default_model`` — every test double, and the decorators reading
+    #: these off an inner provider — still has a well-defined value rather than an
+    #: ``AttributeError`` at construction time.
+    default_temperature: float = 0.0
+    default_max_tokens: int | None = None
+
+    def __init__(
+        self,
+        *,
+        default_model: str,
+        default_temperature: float = 0.0,
+        default_max_tokens: int | None = None,
+    ) -> None:
+        """Configure the provider.
+
+        Args:
+            default_model: Model used when a call does not name one.
+            default_temperature: Sampling temperature used when a call does not
+                state one. It lives here rather than as a literal default on
+                :meth:`ainvoke` so that ``LLM_TEMPERATURE`` reaches every call site
+                without each of them having to read the settings.
+            default_max_tokens: Output ceiling used when a call does not state one.
+                ``None`` means "whatever the vendor defaults to".
+        """
         self.default_model = default_model
+        self.default_temperature = default_temperature
+        self.default_max_tokens = default_max_tokens
 
     @abstractmethod
     async def ainvoke(
@@ -222,17 +302,46 @@ class LLMProvider(ABC):
         messages: Sequence[Message],
         *,
         model: str | None = None,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> LLMResponse:
-        """Send messages to the model and return its completion."""
+        """Send messages to the model and return its completion.
+
+        Args:
+            messages: The conversation to send.
+            model: Optional model override.
+            temperature: Optional sampling temperature. ``None`` uses the
+                provider's configured default, which is what lets a call site that
+                has no opinion inherit one instead of restating ``0.0``.
+            max_tokens: Optional ceiling on the completion.
+        """
+
+    def _sampling(
+        self, temperature: float | None, max_tokens: int | None
+    ) -> tuple[float, int | None]:
+        """Resolve per-call sampling parameters against the provider defaults.
+
+        Resolution happens here, at the innermost provider, and not in the
+        decorators: a decorator that resolved ``None`` into a number would decide
+        on the caller's behalf and the setting would be read twice with the outer
+        layer winning.
+
+        Args:
+            temperature: The call's temperature, or ``None``.
+            max_tokens: The call's ceiling, or ``None``.
+
+        Returns:
+            The temperature and ceiling to send.
+        """
+        resolved = self.default_temperature if temperature is None else temperature
+        return resolved, (self.default_max_tokens if max_tokens is None else max_tokens)
 
     def invoke(
         self,
         messages: Sequence[Message],
         *,
         model: str | None = None,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> LLMResponse:
         """Synchronous convenience wrapper around :meth:`ainvoke`."""
@@ -246,6 +355,8 @@ class LLMProvider(ABC):
         schema: type[T],
         *,
         model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
         max_attempts: int = 3,
     ) -> T:
         """Request output conforming to ``schema``.
@@ -254,10 +365,17 @@ class LLMProvider(ABC):
         it can correct itself. Exhausting ``max_attempts`` raises
         :class:`StructuredOutputError` rather than returning partial data.
 
+        Sampling parameters are accepted here as well as on :meth:`ainvoke`,
+        because a structured call is still a model call. They used to be dropped
+        on this path — the correction loop is where a caller most wants to pin the
+        temperature, and it had no way to.
+
         Args:
             messages: The conversation to send.
             schema: Pydantic model the response must validate against.
             model: Optional model override.
+            temperature: Optional sampling temperature.
+            max_tokens: Optional ceiling on the completion.
             max_attempts: Total attempts including the first. Must be at least 1.
 
         Returns:
@@ -277,7 +395,9 @@ class LLMProvider(ABC):
         last_error: Exception | None = None
 
         for _ in range(max_attempts):
-            response = await self.ainvoke(conversation, model=model)
+            response = await self.ainvoke(
+                conversation, model=model, temperature=temperature, max_tokens=max_tokens
+            )
             try:
                 return schema.model_validate_json(_extract_json(response.content))
             except (ValidationError, ValueError) as exc:
@@ -305,11 +425,20 @@ class LLMProvider(ABC):
         schema: type[T],
         *,
         model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
         max_attempts: int = 3,
     ) -> T:
         """Synchronous convenience wrapper around :meth:`astructured_output`."""
         return _run_sync(
-            self.astructured_output(messages, schema, model=model, max_attempts=max_attempts)
+            self.astructured_output(
+                messages,
+                schema,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                max_attempts=max_attempts,
+            )
         )
 
 
@@ -334,9 +463,15 @@ class OpenAICompatibleProvider(LLMProvider):
         model: str,
         base_url: str = "https://api.openai.com/v1",
         timeout: float = 60.0,
+        default_temperature: float = 0.0,
+        default_max_tokens: int | None = None,
         client: httpx.AsyncClient | None = None,
     ) -> None:
-        super().__init__(default_model=model)
+        super().__init__(
+            default_model=model,
+            default_temperature=default_temperature,
+            default_max_tokens=default_max_tokens,
+        )
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
@@ -349,13 +484,40 @@ class OpenAICompatibleProvider(LLMProvider):
         temperature: float,
         max_tokens: int | None,
     ) -> dict[str, Any]:
+        """Build a request body the target model will actually accept.
+
+        Which sampling fields are legal is a property of the model, not of this
+        endpoint, and the two families disagree: reasoning models reject
+        ``temperature`` and ``max_tokens`` with a 400, everything else requires
+        them under exactly those names. The field names are therefore chosen from
+        the resolved model rather than fixed.
+
+        Args:
+            messages: The conversation to send.
+            model: Model override, or ``None`` for the provider default.
+            temperature: The already-resolved sampling temperature.
+            max_tokens: The already-resolved output ceiling, if any.
+
+        Returns:
+            The JSON body to post.
+        """
+        name = model or self.default_model
         payload: dict[str, Any] = {
-            "model": model or self.default_model,
+            "model": name,
             "messages": [{"role": m.role.value, "content": m.content} for m in messages],
-            "temperature": temperature,
         }
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
+        if is_reasoning_model(name):
+            # No temperature at all. Reasoning models spend the ceiling on their
+            # own reasoning before emitting a token of answer, so a small value
+            # truncates the reply rather than shortening it, and the vendor's own
+            # default is the only well-informed choice for a name this module
+            # cannot price.
+            if max_tokens is not None:
+                payload["max_completion_tokens"] = max_tokens
+        else:
+            payload["temperature"] = temperature
+            if max_tokens is not None:
+                payload["max_tokens"] = max_tokens
         return payload
 
     async def ainvoke(
@@ -363,7 +525,7 @@ class OpenAICompatibleProvider(LLMProvider):
         messages: Sequence[Message],
         *,
         model: str | None = None,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> LLMResponse:
         """Call ``/chat/completions`` and normalise the response."""
@@ -372,6 +534,7 @@ class OpenAICompatibleProvider(LLMProvider):
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
         }
+        temperature, max_tokens = self._sampling(temperature, max_tokens)
         payload = self._payload(messages, model, temperature, max_tokens)
 
         client = self._client or httpx.AsyncClient(timeout=self._timeout)
@@ -428,6 +591,11 @@ class AnthropicProvider(LLMProvider):
 
     name = "anthropic"
 
+    #: Ceiling used when neither the call nor ``LLM_MAX_OUTPUT_TOKENS`` states one.
+    #: Unlike the OpenAI endpoint, the Messages API has no server-side default:
+    #: ``max_tokens`` is a required field, so one of these three has to supply it.
+    DEFAULT_MAX_TOKENS = 4096
+
     def __init__(
         self,
         *,
@@ -435,14 +603,18 @@ class AnthropicProvider(LLMProvider):
         model: str,
         base_url: str = "https://api.anthropic.com/v1",
         timeout: float = 60.0,
-        max_tokens: int = 4096,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        default_temperature: float = 0.0,
         client: httpx.AsyncClient | None = None,
     ) -> None:
-        super().__init__(default_model=model)
+        super().__init__(
+            default_model=model,
+            default_temperature=default_temperature,
+            default_max_tokens=max_tokens,
+        )
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
-        self._default_max_tokens = max_tokens
         self._client = client
 
     async def ainvoke(
@@ -450,7 +622,7 @@ class AnthropicProvider(LLMProvider):
         messages: Sequence[Message],
         *,
         model: str | None = None,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> LLMResponse:
         """Call ``/messages`` and normalise the response.
@@ -468,9 +640,10 @@ class AnthropicProvider(LLMProvider):
         if not turns or turns[0]["role"] != Role.USER.value:
             turns.insert(0, {"role": Role.USER.value, "content": "(no user message)"})
 
+        temperature, max_tokens = self._sampling(temperature, max_tokens)
         payload: dict[str, Any] = {
             "model": model or self.default_model,
-            "max_tokens": max_tokens or self._default_max_tokens,
+            "max_tokens": max_tokens or self.DEFAULT_MAX_TOKENS,
             "temperature": temperature,
             "messages": turns,
         }
@@ -551,8 +724,14 @@ class FakeLLMProvider(LLMProvider):
         default: str = "ok",
         responder: Callable[[Sequence[Message]], str] | None = None,
         model: str = "fake-model",
+        default_temperature: float = 0.0,
+        default_max_tokens: int | None = None,
     ) -> None:
-        super().__init__(default_model=model)
+        super().__init__(
+            default_model=model,
+            default_temperature=default_temperature,
+            default_max_tokens=default_max_tokens,
+        )
         self._queue: deque[str] = deque(responses or ())
         self._default = default
         self._responder = responder
@@ -603,7 +782,7 @@ class FakeLLMProvider(LLMProvider):
         messages: Sequence[Message],
         *,
         model: str | None = None,
-        temperature: float = 0.0,
+        temperature: float | None = None,
         max_tokens: int | None = None,
     ) -> LLMResponse:
         """Return the next scripted response without touching the network."""
@@ -651,7 +830,12 @@ def build_llm_provider(settings: Settings) -> LLMProvider:
         ConfigurationError: If a required credential or base URL is missing.
     """
     provider = settings.llm_provider
-    model = settings.llm_model
+    # Resolved, not read raw: an unset LLM_MODEL must become the model the chosen
+    # provider actually serves, rather than the empty name a previous version
+    # passed on or another vendor's model name.
+    model = settings.llm_model_name
+    temperature = settings.llm_temperature
+    max_tokens = settings.llm_max_output_tokens
 
     if provider == "local":
         if not settings.llm_base_url:
@@ -663,6 +847,8 @@ def build_llm_provider(settings: Settings) -> LLMProvider:
             model=model,
             base_url=settings.llm_base_url,
             timeout=settings.llm_timeout_seconds,
+            default_temperature=temperature,
+            default_max_tokens=max_tokens,
         )
 
     if settings.llm_api_key is None:
@@ -676,10 +862,14 @@ def build_llm_provider(settings: Settings) -> LLMProvider:
             model=model,
             base_url=settings.llm_base_url or "https://api.openai.com/v1",
             timeout=settings.llm_timeout_seconds,
+            default_temperature=temperature,
+            default_max_tokens=max_tokens,
         )
 
     return AnthropicProvider(
         api_key=secret,
         model=model,
         timeout=settings.llm_timeout_seconds,
+        max_tokens=max_tokens or AnthropicProvider.DEFAULT_MAX_TOKENS,
+        default_temperature=temperature,
     )

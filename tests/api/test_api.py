@@ -12,6 +12,7 @@ asserted here.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Callable
 from typing import Any
 
@@ -353,6 +354,49 @@ def test_the_provider_uses_its_own_retry_budget(monkeypatch: pytest.MonkeyPatch)
             assert type(provider.inner).__name__ == "BudgetedProvider"
     finally:
         reset_settings_cache()
+
+
+def test_startup_names_the_model_it_will_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The model is derived from the provider, so the environment no longer says.
+
+    With ``LLM_MODEL`` unset the answer is computed rather than written down, and
+    "which model is this process calling?" is a question an operator has to be
+    able to answer from outside the process.
+
+    The record is collected through a handler of this test's own rather than
+    through ``caplog``: start-up calls ``configure_logging``, which replaces the
+    root handlers on purpose so that a reloaded process does not log every line
+    twice, and that takes pytest's handler with it.
+    """
+    monkeypatch.setenv("LLM_API_KEY", "sk-test-key")
+    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    reset_settings_cache()
+
+    collected: list[logging.LogRecord] = []
+
+    class Collect(logging.Handler):
+        """Keep every record the application emits during start-up."""
+
+        def emit(self, record: logging.LogRecord) -> None:
+            """Store the record as emitted, before any formatter touches it."""
+            collected.append(record)
+
+    collector = Collect()
+    app_logger = logging.getLogger("app")
+    app_logger.addHandler(collector)
+    try:
+        with TestClient(create_app()):
+            pass
+    finally:
+        app_logger.removeHandler(collector)
+        reset_settings_cache()
+
+    lines = [r for r in collected if r.getMessage() == "startup.model_ready"]
+
+    assert len(lines) == 1
+    assert getattr(lines[0], "model", None) == "claude-sonnet-5-5"
+    assert getattr(lines[0], "provider", None) == "anthropic"
 
 
 def test_a_task_reports_the_tokens_it_spent_as_metrics(direct: ApiHarness) -> None:

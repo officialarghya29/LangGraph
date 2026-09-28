@@ -372,9 +372,10 @@ The tri-state flag now treats an empty string as unset.
 **A blank value that configured nothing.** `LLM_MODEL=` is perfectly valid input
 for a ``str`` field, so it was accepted, and every model call was then made with
 an empty model name — an error about the request, not about the configuration,
-from a file that looked correctly filled in. Blank names now fall back to their
-declared defaults, and blank optional strings to "unset", which is the same rule
-the secrets already followed.
+from a file that looked correctly filled in. Blank now means "unset" for the
+model names, the same rule the secrets and the optional strings already followed,
+and the third pass then gave "unset" a meaning: the provider's own default model,
+rather than a second copy of one vendor's name.
 
 **A settings template that documented 41 of 66 settings.** The missing ones
 included the security-relevant switches — `TRUST_IDENTITY_HEADER`,
@@ -405,6 +406,77 @@ would hold a runner until GitHub's default cutoff and report the hang as a
 timeout of its own. Every job is now bounded, and a committed-credential scan runs
 over the full history, because a secret committed once lives in every clone and in
 the history after the file is deleted.
+
+### Found by the third pass, and fixed
+
+This pass started from the model layer and followed it outward. The theme that
+emerged is worth stating, because it produced five of the seven findings: **a
+setting that is only correct for one vendor is a setting that is wrong for the
+others, and the failure arrives at request time wearing the wrong label.**
+
+**A default model from the previous generation, and from one vendor.**
+`LLM_MODEL` defaulted to `gpt-4o-mini`: a name from an earlier model line, and an
+OpenAI name, in a system whose whole claim is that the provider is swappable.
+Setting `LLM_PROVIDER=anthropic` and leaving the model alone — the natural thing
+to do — sent a GPT model to the Messages API and failed with a model-not-found
+error that named the model rather than the configuration. The default is now keyed
+by provider (`gpt-5.6-terra`, `claude-sonnet-5-5`, `llama3.1:8b` for a local
+server), resolved in one place, and asserted against the provider enum so adding a
+provider without adding a model fails in the test suite rather than on the first
+request.
+
+**A request shape that the new defaults reject outright.** This is the finding
+that would have made the system dead on arrival, and it was latent before the
+default changed: OpenAI's reasoning models do not ignore `temperature`, they fail
+the request with `HTTP 400`, `Unsupported value: 'temperature' does not support
+0.0 with this model`, and they reject `max_tokens` in favour of
+`max_completion_tokens`. The adapter sent both unconditionally. With a reasoning
+model as the default that is *every call in the system* failing, reported as a
+request error rather than a configuration one. The payload is now built from the
+resolved model name, with `gpt-oss` excluded from the match because it is an
+OpenAI name served by the local runtimes that does accept the ordinary
+parameters — a false positive there would have silently dropped a configured
+temperature.
+
+**Sampling parameters that no setting could reach.** The temperature was a
+literal default on the provider interface, so no configuration could change it,
+and the output ceiling was a constructor argument no operator could see. Both now
+come from `LLM_TEMPERATURE` and `LLM_MAX_OUTPUT_TOKENS`, are carried on the
+provider, and apply to a call that does not state its own. Two things fell out of
+that: the structured-output path was dropping both parameters on the floor, which
+matters because a correction loop is exactly where a caller wants to pin the
+temperature; and the ceiling is left unset by default on purpose, because on a
+reasoning model it covers the model's own reasoning first, so a low value
+*truncates* the answer rather than shortening it.
+
+**A blank ceiling that crashed the process.** `LLM_MAX_OUTPUT_TOKENS=` is how the
+template says "use the vendor's default", and it is not parseable as an integer,
+so the process refused to start over the value that means "no limit" — the same
+defect as `API_DOCS_ENABLED=`, found by the drift test the second pass added, in a
+setting the third pass introduced. The test caught its own class of bug on the
+first run, which is the argument for the test.
+
+**A migration that silenced the application.** `alembic/env.py` called
+`fileConfig`, which defaults to `disable_existing_loggers=True` and sets
+`disabled = True` on every logger not named in `alembic.ini` — in practice every
+logger the application owns. Anything running migrations in the same process then
+served traffic and emitted no log lines at all, with nothing to say why. The
+deployment in `docker-compose.yml` was safe only by accident, because it migrates
+in a separate process. This was found while trying to assert on a start-up log
+line, which is a pleasing way to find it: the missing logs were the finding.
+
+**No way to tell which model was running.** With the default derived rather than
+written down, the environment no longer answers that question, and nothing else
+did either. Start-up now logs `startup.model_ready` with the provider and the
+resolved model — the one line an operator needs when a model behaves differently
+from the one they thought they configured.
+
+**A transient 5xx treated as permanent.** The throttle set was `{429, 503}`, so a
+gateway's `500`, `502`, or `504` — transient far more often than not — failed the
+run on the first attempt while a retry policy sat beside it. The set now matches
+the one the official OpenAI client retries, with `501` deliberately excluded:
+"not implemented" is a property of the request, and will be just as unimplemented
+on the next attempt.
 
 ### Verified, not a defect
 
@@ -463,6 +535,7 @@ arguments, which are model-authored and can carry a credential.
 | 44 | Performance review | Complete — one optimisation shipped, budgets asserted |
 | 45 | Architecture review | Complete — no layer violations; stale documentation corrected |
 | — | Deep scan | Complete — thirteen findings fixed, one verified non-defect, five settings documented and two configuration defects closed |
+| — | Deep scan, third pass | Complete — seven findings fixed, all in the model layer or found from it; two settings added, two configuration defects closed |
 
 Migration verification, which was blocked alongside the container work, was
 completed without a container runtime: the revision applies to an empty database,

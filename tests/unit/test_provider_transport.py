@@ -184,6 +184,27 @@ async def test_the_body_keeps_the_roles_and_the_model() -> None:
     ]
 
 
+async def test_a_reasoning_model_reaches_the_socket_without_a_temperature() -> None:
+    """The shape that used to be rejected, sent over a real connection.
+
+    OpenAI fails these requests outright rather than ignoring the field, and the
+    shipped default model is one of them — so this is the difference between the
+    system working and every call failing.
+    """
+    with scripted((200, {}, completion(model="gpt-5.6-terra"))) as server:
+        provider = OpenAICompatibleProvider(
+            api_key=API_KEY, model="gpt-5.6-terra", base_url=server.base_url
+        )
+        await provider.ainvoke(MESSAGES, temperature=0.3, max_tokens=256)
+
+    body = server.received[0]["body"]
+
+    assert body["model"] == "gpt-5.6-terra"
+    assert "temperature" not in body
+    assert body["max_completion_tokens"] == 256
+    assert "max_tokens" not in body
+
+
 async def test_an_anthropic_call_uses_its_own_shape() -> None:
     """Different vendor, different payload and different usage field names."""
     with scripted((200, {}, anthropic_message("an answer"))) as server:

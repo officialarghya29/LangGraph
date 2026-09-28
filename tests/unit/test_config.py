@@ -3,12 +3,27 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import get_args
 
 import pytest
 from pydantic import ValidationError
 
-from app.core.config import Settings, get_settings, reset_settings_cache
+from app.core.config import (
+    DEFAULT_EMBEDDING_MODELS,
+    DEFAULT_LLM_MODELS,
+    EmbeddingProviderName,
+    LLMProviderName,
+    Settings,
+    get_settings,
+    reset_settings_cache,
+)
 from app.core.exceptions import ConfigurationError
+
+#: Every application module, for the "is this setting read anywhere?" checks below.
+#: Reading source text is a blunt instrument, but it is the only one that catches
+#: the failure it is aimed at: a setting that is parsed, validated, documented, and
+#: then never consulted, which no behavioural test can observe.
+_APP_SOURCES = sorted(Path("app").rglob("*.py"))
 
 
 def make_settings(**overrides: object) -> Settings:
@@ -25,6 +40,79 @@ def test_defaults_are_sane() -> None:
     assert settings.max_tool_calls == 25
     assert settings.python_execution_enabled is False
     assert settings.github_tool_allow_writes is False
+
+
+def test_every_provider_has_a_default_model() -> None:
+    """A provider with no entry would raise ``KeyError`` on the first call.
+
+    The resolution is a dictionary lookup keyed by provider, so adding a value to
+    ``LLMProviderName`` without adding a model would move the failure from startup
+    to the first request — which is the thing this configuration layer exists to
+    prevent. Checking the keys against the literal keeps the two in step.
+    """
+    assert set(DEFAULT_LLM_MODELS) == set(get_args(LLMProviderName))
+    assert set(DEFAULT_EMBEDDING_MODELS) == set(get_args(EmbeddingProviderName))
+
+
+def test_an_unset_model_resolves_to_the_provider_default() -> None:
+    """Which is the whole point of keeping it unset."""
+    settings = make_settings()
+
+    assert settings.llm_model is None
+    assert settings.llm_model_name == DEFAULT_LLM_MODELS["openai"]
+
+
+def test_switching_provider_switches_the_model() -> None:
+    """Otherwise ``LLM_PROVIDER=anthropic`` alone sends a GPT name to Anthropic.
+
+    That is a real request-time failure — a model-not-found error that names the
+    model rather than the configuration, from a setting the operator never
+    touched.
+    """
+    anthropic = make_settings(llm_provider="anthropic", llm_api_key="key")
+
+    assert anthropic.llm_model is None
+    assert anthropic.llm_model_name == DEFAULT_LLM_MODELS["anthropic"]
+    assert "gpt" not in anthropic.llm_model_name
+
+
+def test_a_named_model_still_wins() -> None:
+    """The default is a fallback, not a policy."""
+    settings = make_settings(llm_model="gpt-5.6-sol")
+
+    assert settings.llm_model_name == "gpt-5.6-sol"
+
+
+@pytest.mark.parametrize("field", ["llm_temperature", "llm_max_output_tokens"])
+def test_the_sampling_settings_are_read_by_the_code(field: str) -> None:
+    """A declared setting nobody reads is a setting that does nothing.
+
+    ``LLM_MAX_RETRIES`` and ``TRACE_HISTORY_SIZE`` were both declared and unread
+    until they were wired up; this is the cheap check that catches the next one.
+    """
+    readers = [path for path in _APP_SOURCES if f"settings.{field}" in path.read_text()]
+
+    assert readers, f"{field} is declared but never read"
+
+
+def test_a_blank_ceiling_means_the_vendor_default() -> None:
+    """``LLM_MAX_OUTPUT_TOKENS=`` is how the template ships it.
+
+    It is not parseable as an integer, so before the tri-state handling it stopped
+    the process from starting — over the value that means "do not cap this".
+    """
+    settings = make_settings(llm_max_output_tokens="  ")
+
+    assert settings.llm_max_output_tokens is None
+
+
+def test_the_temperature_is_bounded() -> None:
+    """A temperature outside the vendor's range is a 400, so it fails at startup."""
+    with pytest.raises(ValidationError):
+        make_settings(llm_temperature=2.5)
+
+    with pytest.raises(ValidationError):
+        make_settings(llm_temperature=-0.1)
 
 
 def test_environment_overrides_defaults(monkeypatch: pytest.MonkeyPatch) -> None:

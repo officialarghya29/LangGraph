@@ -121,7 +121,7 @@ choice was made with the real constraints in view rather than in advance:
 
 | Decision | Phase | Choice |
 | --- | --- | --- |
-| LLM vendor and default model | 5 | Provider abstraction with OpenAI, Anthropic, and a deterministic fake; no vendor SDK reaches business logic |
+| LLM vendor and default model | 5 | Provider abstraction with OpenAI, Anthropic, and a deterministic fake; no vendor SDK reaches business logic. The default model is keyed by provider and resolved at build time, and the request body is shaped to the model — reasoning models reject `temperature` and take their ceiling as `max_completion_tokens` |
 | Embedding provider and model | 6 | Local hashing embeddings by default; OpenAI optional. A model is never required just to run |
 | Checkpoint backend | 21 | PostgreSQL through `langgraph-checkpoint-postgres`, so a run survives a restart |
 | Authentication | 25 | JWT bearer tokens via PyJWT, with a trusted identity header allowed only in development |
@@ -144,9 +144,18 @@ are stated where they would otherwise be assumed:
   spoken real HTTP to a scripted loopback server, which covers the request and
   response contract — the endpoint path, the authentication header, the payload
   shape, the usage fields, and the error mapping. What that still cannot cover is
-  vendor-specific behaviour: real rate-limit quirks, model-specific payloads, and
-  anything only the live endpoint does. "The contract is tested over a socket"
-  and "a real call has succeeded" are different claims, and only the first is
-true here.
+  vendor-specific behaviour: real rate-limit quirks, and anything only the live
+  endpoint does. "The contract is tested over a socket" and "a real call has
+  succeeded" are different claims, and only the first is true here.
+
+  The model-specific payload rules are the sharpest example of the gap, and they
+  are worth naming precisely. Which fields a model accepts is documented by the
+  vendor and encoded here from that documentation: `temperature` and `max_tokens`
+  are withheld from reasoning models because the vendor's own error text and its
+  models page say those requests fail. That reasoning is sound, and it has been
+  checked against a scripted server that echoes what it receives — but no live
+  endpoint has confirmed it, and neither default model name has been sent
+  anywhere. Treat the shipped names as a starting point to verify against the
+  vendor's current lineup rather than as a tested configuration.
 - ~~Frontend framework for the control dashboard — Phase 42.~~ Settled: no
   framework. See the table above.

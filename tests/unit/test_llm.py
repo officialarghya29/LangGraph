@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 
 import httpx
 import pytest
@@ -19,11 +20,13 @@ from app.core.exceptions import (
 from app.services.llm import (
     AnthropicProvider,
     FakeLLMProvider,
+    LLMProvider,
     Message,
     OpenAICompatibleProvider,
     Role,
     _extract_json,
     build_llm_provider,
+    is_reasoning_model,
 )
 
 
@@ -401,3 +404,243 @@ def test_factory_requires_a_key_for_hosted_providers() -> None:
 
     with pytest.raises(ConfigurationError, match="LLM_API_KEY"):
         build_llm_provider(settings)
+
+
+def test_the_factory_gives_each_provider_a_model_its_vendor_serves() -> None:
+    """The default model follows the provider.
+
+    A single default was an OpenAI name, so ``LLM_PROVIDER=anthropic`` with the
+    model left unset sent a GPT model to the Messages API. This asserts the
+    resolved name, not that a provider object was built — the object was always
+    built; it was the name inside it that was wrong.
+    """
+    openai = build_settings(llm_provider="openai", llm_api_key="key")
+    anthropic = build_settings(llm_provider="anthropic", llm_api_key="key")
+
+    assert build_llm_provider(openai).default_model == "gpt-5.6-terra"
+    assert build_llm_provider(anthropic).default_model == "claude-sonnet-5-5"
+    assert "gpt" not in build_llm_provider(anthropic).default_model
+
+
+def test_the_factory_passes_the_sampling_settings_to_the_provider() -> None:
+    """``LLM_TEMPERATURE`` and the output ceiling have to reach the provider.
+
+    Both are read by the provider and neither is read anywhere else, so a factory
+    that dropped them would leave two settings silently inert.
+    """
+    settings = build_settings(
+        llm_provider="openai", llm_api_key="key", llm_temperature=0.7, llm_max_output_tokens=1234
+    )
+
+    provider = build_llm_provider(settings)
+
+    assert provider.default_temperature == 0.7
+    assert provider.default_max_tokens == 1234
+
+
+# --------------------------------------------------------------------------- #
+# Sampling parameters the target model will accept
+# --------------------------------------------------------------------------- #
+
+
+def anthropic_ok_body(content: str = "hello") -> dict[str, object]:
+    """Return a well-formed Anthropic Messages payload."""
+    return {
+        "model": "claude-test",
+        "content": [{"type": "text", "text": content}],
+        "stop_reason": "end_turn",
+        "usage": {"input_tokens": 4, "output_tokens": 6},
+    }
+
+
+async def _capture(
+    handler_body: dict[str, object],
+    build: Callable[[httpx.AsyncClient], LLMProvider],
+    *,
+    call_temperature: float | None = None,
+    call_max_tokens: int | None = None,
+) -> dict[str, object]:
+    """Send one call and return the JSON body that went out.
+
+    Args:
+        handler_body: What the scripted endpoint replies with.
+        build: Builds the provider under test around the scripted client.
+        call_temperature: Temperature for the call, or ``None`` to omit it.
+        call_max_tokens: Ceiling for the call, or ``None`` to omit it.
+
+    Returns:
+        The parsed request body.
+    """
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json=handler_body, request=request)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        await build(client).ainvoke(
+            user("hello"), temperature=call_temperature, max_tokens=call_max_tokens
+        )
+    finally:
+        await client.aclose()
+
+    body = captured["body"]
+    assert isinstance(body, dict)
+    return body
+
+
+async def openai_body(
+    model: str,
+    *,
+    call_temperature: float | None = None,
+    call_max_tokens: int | None = None,
+    provider_temperature: float = 0.0,
+    provider_max_tokens: int | None = None,
+) -> dict[str, object]:
+    """Return the body an OpenAI-compatible call to ``model`` sends."""
+    return await _capture(
+        openai_ok_body(),
+        lambda client: OpenAICompatibleProvider(
+            api_key="k",
+            model=model,
+            client=client,
+            default_temperature=provider_temperature,
+            default_max_tokens=provider_max_tokens,
+        ),
+        call_temperature=call_temperature,
+        call_max_tokens=call_max_tokens,
+    )
+
+
+async def anthropic_body(
+    *,
+    call_temperature: float | None = None,
+    provider_temperature: float = 0.0,
+    provider_max_tokens: int = AnthropicProvider.DEFAULT_MAX_TOKENS,
+) -> dict[str, object]:
+    """Return the body an Anthropic call sends."""
+    return await _capture(
+        anthropic_ok_body(),
+        lambda client: AnthropicProvider(
+            api_key="k",
+            model="claude-sonnet-5-5",
+            client=client,
+            max_tokens=provider_max_tokens,
+            default_temperature=provider_temperature,
+        ),
+        call_temperature=call_temperature,
+    )
+
+
+@pytest.mark.parametrize(
+    ("model", "reasoning"),
+    [
+        ("gpt-5.6-terra", True),
+        ("gpt-5.6-luna", True),
+        ("gpt-5.6-sol", True),
+        ("o3-mini", True),
+        ("gpt-4o-mini", False),
+        ("gpt-4.1", False),
+        ("gpt-oss:20b", False),
+        ("llama3.1:8b", False),
+        ("mistral-nemo", False),
+    ],
+)
+def test_only_models_that_reject_sampling_parameters_are_recognised(
+    model: str, reasoning: bool
+) -> None:
+    """The predicate has to be right in both directions.
+
+    A false positive strips a temperature the server would have honoured; a false
+    negative sends one it rejects, and the whole request fails. ``gpt-oss:20b`` is
+    the interesting case: an OpenAI model name that is served locally and accepts
+    the ordinary parameters.
+    """
+    assert is_reasoning_model(model) is reasoning
+
+
+async def test_a_reasoning_model_is_never_sent_a_temperature() -> None:
+    """It is a hard 400, not an ignored field.
+
+    "Unsupported value: 'temperature' does not support 0.0 with this model" — and
+    the shipped default model is one of these, so getting this wrong makes every
+    call in the system fail.
+    """
+    body = await openai_body("gpt-5.6-terra", call_temperature=0.4)
+
+    assert "temperature" not in body
+    assert body["model"] == "gpt-5.6-terra"
+
+
+async def test_a_reasoning_model_is_given_the_ceiling_under_the_right_name() -> None:
+    """``max_tokens`` is rejected as an unsupported parameter on these models."""
+    body = await openai_body("gpt-5.6-terra", call_max_tokens=512)
+
+    assert body["max_completion_tokens"] == 512
+    assert "max_tokens" not in body
+
+
+async def test_an_ordinary_model_keeps_both_parameters() -> None:
+    """The other half of the branch: names that do take the sampling knobs."""
+    body = await openai_body("gpt-4o-mini", call_temperature=0.4, call_max_tokens=512)
+
+    assert body["temperature"] == 0.4
+    assert body["max_tokens"] == 512
+    assert "max_completion_tokens" not in body
+
+
+async def test_the_provider_temperature_applies_when_a_call_states_none() -> None:
+    """``LLM_TEMPERATURE`` reaches the wire without every call site restating it."""
+    body = await openai_body("gpt-4o-mini", provider_temperature=0.7)
+
+    assert body["temperature"] == 0.7
+
+
+async def test_an_explicit_temperature_beats_the_provider_default() -> None:
+    """The setting is a default, not an override of the call site."""
+    body = await openai_body("gpt-4o-mini", call_temperature=0.1, provider_temperature=0.7)
+
+    assert body["temperature"] == 0.1
+
+
+async def test_the_provider_ceiling_applies_when_a_call_states_none() -> None:
+    """``LLM_MAX_OUTPUT_TOKENS`` has to reach the wire as well."""
+    body = await openai_body("gpt-4o-mini", provider_max_tokens=2048)
+
+    assert body["max_tokens"] == 2048
+
+
+async def test_anthropic_gets_the_provider_temperature_too() -> None:
+    """Both vendors, one setting, so the configuration does not depend on the API."""
+    body = await anthropic_body(provider_temperature=0.3, provider_max_tokens=2048)
+
+    assert body["temperature"] == 0.3
+    assert body["max_tokens"] == 2048
+
+
+async def test_structured_output_forwards_the_sampling_parameters() -> None:
+    """A structured call is still a model call.
+
+    The correction loop is exactly where a caller wants to pin the temperature,
+    and this path used to drop both parameters on the floor.
+    """
+    seen: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(
+            200, json=openai_ok_body('{"passed": true, "reason": "fine"}'), request=request
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    provider = OpenAICompatibleProvider(api_key="k", model="gpt-4o-mini", client=client)
+
+    result = await provider.astructured_output(
+        user("grade this"), Verdict, temperature=0.9, max_tokens=77
+    )
+
+    assert result.passed is True
+    assert seen[0]["temperature"] == 0.9
+    assert seen[0]["max_tokens"] == 77
+    await client.aclose()

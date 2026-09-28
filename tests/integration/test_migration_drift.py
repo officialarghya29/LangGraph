@@ -16,14 +16,17 @@ and "``tasks.owner_id`` exists in the model and not in the database" is.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
 import pytest
+from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import inspect, text
 
+from app.core.config import get_settings
 from app.database.base import Base
 from app.database.connection import Database
 
@@ -43,6 +46,16 @@ _CHECKPOINTER_TABLES = frozenset(
 _SUPPORTED_EXTRAS = _CHECKPOINTER_TABLES | {_ALEMBIC_TABLE}
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def settings_database_url() -> str:
+    """Return the database URL the session is pointed at.
+
+    Read from the settings rather than from the environment so the test migrates
+    the throwaway database the rest of the suite uses, not whichever database
+    ``DATABASE_URL`` named before the session fixture replaced it.
+    """
+    return get_settings().database_url
 
 
 @pytest.fixture
@@ -180,3 +193,28 @@ async def test_the_search_path_is_not_relied_on_for_the_models(database: Databas
     schemas = {table.schema for table in Base.metadata.tables.values()}
 
     assert schemas in ({None}, set()), f"models pin an explicit schema: {schemas}"
+
+
+def test_running_a_migration_in_process_does_not_silence_the_application() -> None:
+    """Alembic's ``fileConfig`` disables loggers that already exist.
+
+    ``fileConfig`` defaults to ``disable_existing_loggers=True``, which sets
+    ``disabled = True`` on every logger not named in ``alembic.ini`` — so a process
+    that runs migrations and *then* serves traffic emits no log lines at all, and
+    nothing reports a problem. The deployment in ``docker-compose.yml`` is safe by
+    accident, because it migrates in a separate process; anything that migrates in
+    process was not.
+
+    The logger is created before the upgrade deliberately: that is the condition
+    ``disable_existing_loggers`` acts on.
+    """
+    logger = logging.getLogger("app.migration_probe")
+    logger.disabled = False
+
+    config = Config(str(REPO_ROOT / "alembic.ini"))
+    config.set_main_option("script_location", str(REPO_ROOT / "migrations"))
+    config.set_main_option("sqlalchemy.url", settings_database_url())
+
+    command.upgrade(config, "head")
+
+    assert logger.disabled is False, "running a migration disabled the application's loggers"
