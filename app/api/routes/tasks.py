@@ -33,7 +33,14 @@ from app.graph.nodes import event_sink_for
 from app.models.approval import ApprovalDecision, ApprovalStatus
 from app.models.execution import TaskStatus
 from app.services.limits import limits_for, run_limits
-from app.services.task_store import TaskRecord, execute_task_with_store, task_event_sink
+from app.services.task_store import (
+    TaskRecord,
+    TimelineAgentRun,
+    TimelineStep,
+    TimelineToolCall,
+    execute_task_with_store,
+    task_event_sink,
+)
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
 
@@ -88,6 +95,28 @@ class TaskStatusResponse(BaseModel):
     status: str
     approval_status: str
     has_answer: bool
+
+
+class TaskTimelineResponse(BaseModel):
+    """What a task did, in order, and what it cost.
+
+    The task's own counters plus the run's durable trail. Built for the question
+    an operator asks about a run they did not watch: which subtasks ran, which
+    tools were touched, which agents spent the tokens, and where it stopped.
+
+    Nothing here is caller-supplied or model-authored text beyond the agents' own
+    result summaries — no prompts, no reasoning, and no tool arguments.
+    """
+
+    task_id: str
+    status: str
+    route: str | None = None
+    iteration_count: int = 0
+    retry_count: int = 0
+    tool_call_count: int = 0
+    steps: list[TimelineStep] = Field(default_factory=list)
+    tool_calls: list[TimelineToolCall] = Field(default_factory=list)
+    agent_runs: list[TimelineAgentRun] = Field(default_factory=list)
 
 
 class ApprovalRequest(BaseModel):
@@ -192,6 +221,35 @@ async def get_task(
 ) -> TaskResponse:
     """Fetch a task's full visible state."""
     return TaskResponse.from_record(await _owned_task(store, task_id, principal.user_id))
+
+
+@router.get("/{task_id}/timeline", response_model=TaskTimelineResponse)
+async def get_task_timeline(
+    task_id: str,
+    store: TaskStoreDep,
+    principal: PrincipalDep,
+) -> TaskTimelineResponse:
+    """Fetch the durable trail of one task.
+
+    Raises:
+        HTTPException: 404 if the task is absent or owned by somebody else, so
+            the timeline cannot be used to confirm that another user's task
+            exists — the same rule the rest of this router follows.
+    """
+    record = await _owned_task(store, task_id, principal.user_id)
+    trail = await store.timeline(task_id)
+
+    return TaskTimelineResponse(
+        task_id=record.task_id,
+        status=record.status.value,
+        route=record.route,
+        iteration_count=record.iteration_count,
+        retry_count=record.retry_count,
+        tool_call_count=record.tool_call_count,
+        steps=trail.steps,
+        tool_calls=trail.tool_calls,
+        agent_runs=trail.agent_runs,
+    )
 
 
 @router.get("/{task_id}/status", response_model=TaskStatusResponse)

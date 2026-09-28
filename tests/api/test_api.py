@@ -57,6 +57,62 @@ def responder(
     return respond
 
 
+def research_responder() -> Any:
+    """Script a full planned run: routing, planning, two workers, criticism, synthesis.
+
+    The other responders here answer in one shape for every role, which exercises a
+    single agent. This one drives the orchestration the way a real request does, so
+    the audit trail is checked against a run that has more than one agent in it.
+    """
+    plan = {
+        "objective": "compare two stores",
+        "subtasks": [
+            {
+                "id": "a",
+                "description": "research postgres",
+                "agent": "researcher",
+                "tools": ["web_search"],
+                "expected_output": "notes",
+                "success_criteria": "sourced",
+            },
+            {
+                "id": "b",
+                "description": "research redis",
+                "agent": "researcher",
+                "tools": ["web_search"],
+                "expected_output": "notes",
+                "success_criteria": "sourced",
+            },
+        ],
+    }
+
+    def respond(messages: Any) -> str:
+        joined = "\n".join(message.content for message in messages)
+        if "You route requests" in joined:
+            return json.dumps(route_payload("research"))
+        if "You are a planning agent" in joined:
+            return json.dumps(plan)
+        if "You are a research agent" in joined:
+            subtask_id = "a" if "postgres" in joined else "b"
+            return json.dumps(
+                {
+                    "agent": "researcher",
+                    "subtask_id": subtask_id,
+                    "content": f"finding for {subtask_id}",
+                    "summary": f"summary for {subtask_id}",
+                    "sources": [f"https://example.test/{subtask_id}"],
+                    "confidence": 0.8,
+                }
+            )
+        if "You are a verification agent" in joined:
+            return json.dumps({"passed": True, "confidence": 0.9, "issues": []})
+        if "You are a synthesis agent" in joined:
+            return json.dumps({"answer": "Postgres and Redis differ.", "sources": []})
+        return "unexpected role"
+
+    return respond
+
+
 @pytest.fixture
 def direct(harness: ApiHarness) -> ApiHarness:
     """A harness whose requests route straight to a direct answer."""
@@ -492,6 +548,141 @@ def test_a_tool_call_reaches_the_durable_event_log(
 
     assert "tool_started" in kinds, kinds
     assert "tool_completed" in kinds, kinds
+
+
+def test_every_agent_invocation_reaches_the_audit_table(
+    harness: ApiHarness, sql: Callable[..., list[tuple]]
+) -> None:
+    """One row per invocation, each carrying the tokens that invocation spent.
+
+    A run total cannot answer "what did the planner cost" or "was the second
+    researcher more expensive than the first". Per-agent figures have to come from
+    the agent's own scope rather than from a counter shared with whatever ran
+    beside it, which is what the concurrency is for.
+    """
+    harness.rewire(research_responder())
+
+    created = harness.client.post("/api/v1/tasks", json={"request": "compare two stores"}).json()
+    fetched = harness.client.get(f"/api/v1/tasks/{created['task_id']}").json()
+    assert fetched["status"] == "completed", fetched["failure_reason"]
+
+    rows = sql(
+        "SELECT agent, status, prompt_tokens, completion_tokens FROM agent_runs "
+        "WHERE task_id = %s ORDER BY created_at",
+        (created["task_id"],),
+    )
+    by_agent: dict[str, list[tuple]] = {}
+    for agent, status, prompt, completion in rows:
+        by_agent.setdefault(agent, []).append((status, prompt, completion))
+
+    assert {"planner", "researcher", "critic", "synthesizer"} <= set(by_agent), by_agent
+    assert len(by_agent["researcher"]) == 2, "a row per invocation, not per agent"
+    for agent, runs in by_agent.items():
+        for status, prompt, completion in runs:
+            assert status == "completed", f"{agent} recorded as {status}"
+            assert prompt > 0, f"{agent} recorded no prompt tokens"
+            assert completion > 0, f"{agent} recorded no completion tokens"
+
+
+def test_the_plan_s_steps_are_recorded_too(
+    harness: ApiHarness, sql: Callable[..., list[tuple]]
+) -> None:
+    """The step trail answers "which subtasks ran, and how did they turn out"."""
+    harness.rewire(research_responder())
+
+    created = harness.client.post("/api/v1/tasks", json={"request": "compare two stores"}).json()
+    harness.client.get(f"/api/v1/tasks/{created['task_id']}")
+
+    rows = sql(
+        "SELECT subtask_id, agent, status FROM task_steps WHERE task_id = %s ORDER BY subtask_id",
+        (created["task_id"],),
+    )
+
+    assert rows == [("a", "researcher", "completed"), ("b", "researcher", "completed")]
+
+
+def test_a_planned_run_reports_its_iterations(
+    harness: ApiHarness, sql: Callable[..., list[tuple]]
+) -> None:
+    """The counters on the task row are read from the run, not left at their default."""
+    harness.rewire(research_responder())
+
+    created = harness.client.post("/api/v1/tasks", json={"request": "compare two stores"}).json()
+    harness.client.get(f"/api/v1/tasks/{created['task_id']}")
+
+    rows = sql(
+        "SELECT iteration_count, retry_count FROM tasks WHERE id = %s",
+        (created["task_id"],),
+    )
+
+    assert rows[0][0] >= 1, "the dispatch loop ran at least once"
+    assert rows[0][1] == 0, "the verdict passed, so nothing was retried"
+
+
+def test_the_timeline_describes_what_the_run_did(
+    harness: ApiHarness,
+) -> None:
+    """The trail is readable over the API, not only by opening a SQL client."""
+    harness.rewire(research_responder())
+
+    created = harness.client.post("/api/v1/tasks", json={"request": "compare two stores"}).json()
+
+    response = harness.client.get(f"/api/v1/tasks/{created['task_id']}/timeline")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "completed"
+    assert body["iteration_count"] >= 1
+    assert [step["subtask_id"] for step in body["steps"]] == ["a", "b"]
+    assert all(step["status"] == "completed" for step in body["steps"])
+    assert body["steps"][0]["summary"], "the step's own result summary"
+    assert {run["agent"] for run in body["agent_runs"]} >= {
+        "planner",
+        "researcher",
+        "critic",
+        "synthesizer",
+    }
+    assert all(run["prompt_tokens"] > 0 for run in body["agent_runs"])
+
+
+def test_the_timeline_exposes_no_tool_arguments(gated: ApiHarness) -> None:
+    """Tool arguments are model-authored and can carry a path or a credential."""
+    created = gated.client.post("/api/v1/tasks", json={"request": "delete everything"}).json()
+    gated.client.post(f"/api/v1/tasks/{created['task_id']}/approve", json={})
+
+    body = gated.client.get(f"/api/v1/tasks/{created['task_id']}/timeline").json()
+
+    assert body["tool_calls"], "the approved action should appear"
+    recorded = body["tool_calls"][0]
+    assert set(recorded) == {
+        "tool",
+        "agent",
+        "ok",
+        "risk_level",
+        "approved",
+        "approval_required",
+        "failure_kind",
+        "duration_ms",
+        "created_at",
+    }, "a field appeared that the audit contract does not promise"
+
+
+def test_another_user_cannot_read_a_timeline(gated: ApiHarness) -> None:
+    """The trail names every agent and tool a run touched, so it is owner-only."""
+    created = gated.client.post(
+        "/api/v1/tasks", json={"request": "delete it"}, headers={"X-User-Id": "alice"}
+    ).json()
+
+    response = gated.client.get(
+        f"/api/v1/tasks/{created['task_id']}/timeline",
+        headers={"X-User-Id": "mallory"},
+    )
+
+    assert response.status_code == 404
+
+
+def test_an_unknown_timeline_is_a_404(client: TestClient) -> None:
+    assert client.get("/api/v1/tasks/not-a-task/timeline").status_code == 404
 
 
 def test_a_tool_call_reaches_the_audit_table(

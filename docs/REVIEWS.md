@@ -361,6 +361,51 @@ column requires a level *name* — rejected by its own check constraint. And a
 resumed run bound no event sink at all, so a client following a gated task saw it
 fall silent at exactly the point where the action was performed.
 
+### Found by the second pass, and fixed
+
+**A blank value that crashed the process.** `API_DOCS_ENABLED=` is how an
+operator says "decide from the environment". It is also not parseable as a
+boolean, so the value was rejected and the application refused to start — over a
+setting that was left deliberately blank, in a template that shipped it blank.
+The tri-state flag now treats an empty string as unset.
+
+**A blank value that configured nothing.** `LLM_MODEL=` is perfectly valid input
+for a ``str`` field, so it was accepted, and every model call was then made with
+an empty model name — an error about the request, not about the configuration,
+from a file that looked correctly filled in. Blank names now fall back to their
+declared defaults, and blank optional strings to "unset", which is the same rule
+the secrets already followed.
+
+**A settings template that documented 41 of 66 settings.** The missing ones
+included the security-relevant switches — `TRUST_IDENTITY_HEADER`,
+`RATE_LIMIT_FAIL_CLOSED`, `ALLOW_PRIVATE_NETWORK_EGRESS`, `JWT_AUDIENCE`,
+`METRICS_ENABLED` — so the settings an operator most needs to know exist were
+exactly the ones absent from the file they copy. It also advertised
+`EMBEDDING_PROVIDER` as accepting ``cloud``, which the code has never accepted.
+
+The template is now complete and annotated, and the suite holds it there: every
+documented key must be a real setting, every real setting must be documented, and
+the file must parse as working configuration. That check has a second purpose,
+because the settings layer ignores unknown keys — a typo in a key name is accepted
+in silence and the setting it meant to configure stays at its default while the
+file says otherwise. The same check now covers `docker-compose.yml`, where the
+same typo would be just as invisible and rather harder to notice.
+
+**Two deployment artefacts that could not be checked by running them.** There is
+no container runtime here, so the `Dockerfile` and `docker-compose.yml` remain
+unbuilt — but the parts that *can* be checked statically now are: that every
+variable compose sets exists, that its hostnames are the services it starts, that
+it waits for them to be healthy, that the image copies the migrations its own
+start-up command runs, that it runs as a non-root user, and that a real `.env`
+cannot be baked into a layer. None of that is a substitute for building the image;
+it is the subset that does not require one.
+
+**A job that could hang for six hours.** CI had no timeout anywhere. A hung test
+would hold a runner until GitHub's default cutoff and report the hang as a
+timeout of its own. Every job is now bounded, and a committed-credential scan runs
+over the full history, because a secret committed once lives in every clone and in
+the history after the file is deleted.
+
 ### Verified, not a defect
 
 **`except ValueError: pass` in the SSRF check.** The one place in the codebase
@@ -370,18 +415,43 @@ tries to parse the host as a literal address before resolving it through DNS: a
 fallback is the next statement, not a silent failure. The DNS branch that follows
 is what fails closed.
 
-### Accepted
+### Closed after the first pass
 
-**`record_agent_run` is still called by nothing.** Per-agent token attribution is
-the reason: the budget is counted per run, and up to `MAX_PARALLEL_TASKS` agents
-run concurrently against it, so a delta taken around one agent's call measures
-whatever finished in that window rather than that agent. Wiring the method would
-write zeros into columns named `prompt_tokens` and `completion_tokens`, which is
-the defect this section exists to remove. The run-level totals are on the task
-row and are exact; per-agent totals need a provider wrapper per agent, and that
-is tracked work rather than something to fake. `agent_runs` is therefore still
-empty, and this is the one claim in the store's docstring that remains false —
-recorded here so it is not mistaken for working.
+**Per-agent cost, and the `agent_runs` table with it.** This was recorded here as
+an accepted gap: `record_agent_run` was called by nothing, so `agent_runs` was
+empty, and the store's docstring promised a trail it did not write. The reason for
+accepting it was real — the token budget is counted per run, and up to
+`MAX_PARALLEL_TASKS` agents spend against it concurrently, so a delta taken around
+one agent's call measures whatever happened to finish in that window. Wire that and
+the columns named `prompt_tokens` hold numbers that are not prompt tokens, which is
+the defect the whole section exists to remove.
+
+It is closed rather than excused, because the correct instrument turned out to be
+one that already existed in the codebase. The budget is scoped by a context
+variable so that concurrent runs cannot pool their counts; scoping the *agent*
+the same way answers the attribution question without a shared counter, because
+`asyncio.gather` gives every coroutine its own copy of the context. Each
+invocation therefore gets a fresh accumulator, every model call inside it is
+charged once to the run and once to that invocation, and a retried subtask reports
+its second attempt's cost rather than twice its first.
+
+The scope is applied at the one place every agent invocation now passes through,
+which also closed a second gap: the planner, critic, synthesizer, and executor were
+running real model calls that the event stream never announced, so a client
+following a gated task saw nothing between "approving" and "done".
+
+Verified three ways: the unit suite asserts that two concurrent scopes cannot see
+each other's usage and that a nested scope restores the outer one; the API suite
+drives a full planned run — routing, a plan with two workers, criticism, synthesis
+— and asserts one row per invocation with non-zero prompt and completion tokens for
+every one of them; and a graph test runs two different shapes of run against a
+single compiled graph at once, asserting that each stream received only its own
+events and that a request costs the same whether or not it had company.
+
+**A task timeline over HTTP.** The trail was readable only by opening a SQL
+client. `GET /api/v1/tasks/{task_id}/timeline` now returns it, owner-scoped, and
+the response schema is asserted in the suite — including the absence of tool
+arguments, which are model-authored and can carry a credential.
 
 ---
 
@@ -392,7 +462,7 @@ recorded here so it is not mistaken for working.
 | 43 | Security review | Complete — one finding fixed, one accepted and documented |
 | 44 | Performance review | Complete — one optimisation shipped, budgets asserted |
 | 45 | Architecture review | Complete — no layer violations; stale documentation corrected |
-| — | Deep scan | Complete — eleven findings fixed, one verified non-defect, one accepted and documented above |
+| — | Deep scan | Complete — thirteen findings fixed, one verified non-defect, five settings documented and two configuration defects closed |
 
 Migration verification, which was blocked alongside the container work, was
 completed without a container runtime: the revision applies to an empty database,

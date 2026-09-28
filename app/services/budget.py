@@ -25,6 +25,11 @@ metadata it writes into.
 paid for should not have its result thrown away: overshooting by at most one call
 is the honest behaviour, and the alternative discards a completion that the
 provider has already billed. What is prevented is starting another one.
+
+The same call is charged twice over, to two different questions: the run's total,
+and the invoking agent's own figure. The second one needs to know *which* agent is
+spending, which is what :func:`agent_scope` establishes — and it is established in
+a context variable for the same concurrency reason as the budget itself.
 """
 
 from __future__ import annotations
@@ -41,6 +46,7 @@ from app.services.llm import LLMProvider, LLMResponse, Message
 __all__ = [
     "BudgetedProvider",
     "TokenBudget",
+    "agent_scope",
     "budget_for",
     "current_budget",
     "token_budget",
@@ -88,14 +94,21 @@ class TokenBudget:
         return self.spent >= self.limit
 
     def record(self, *, prompt: int, completion: int) -> None:
-        """Accumulate one call's usage.
+        """Accumulate one call's usage, against the run and against its agent.
 
         Args:
             prompt: Tokens sent.
             completion: Tokens generated.
         """
         self.calls += 1
-        self.usage.add(prompt=max(0, prompt), completion=max(0, completion))
+        sent, generated = max(0, prompt), max(0, completion)
+        self.usage.add(prompt=sent, completion=generated)
+        # Charged to the invoking agent as well, when there is one in scope. The
+        # run total and the per-agent figure are recorded from the same call, so
+        # they cannot disagree.
+        scope = _CURRENT_AGENT.get()
+        if scope is not None:
+            scope[1].add(prompt=sent, completion=generated)
 
     def check(self) -> None:
         """Refuse further work if the allowance is spent.
@@ -121,6 +134,42 @@ class TokenBudget:
 #: which is the behaviour outside a graph run — a direct call to a provider from
 #: a script should not need a budget to be arranged first.
 _CURRENT: ContextVar[TokenBudget | None] = ContextVar("token_budget", default=None)
+
+#: The agent currently spending in this context, paired with the accumulator for
+#: its current invocation. One tuple rather than two variables, so the name and
+#: its usage can never be restored out of step with each other.
+_CURRENT_AGENT: ContextVar[tuple[str, TokenUsageSummary] | None] = ContextVar(
+    "current_agent", default=None
+)
+
+
+@contextmanager
+def agent_scope(agent: str) -> Iterator[TokenUsageSummary]:
+    """Attribute every model call inside the block to ``agent``.
+
+    Yields a *fresh* accumulator rather than one per agent name, so an agent that
+    runs twice — a subtask the critic sends back, for example — reports each
+    invocation's own cost instead of a running total that makes the second run
+    look twice as expensive as it was.
+
+    The scope travels in a context variable, which is what makes the attribution
+    correct under concurrency: ``asyncio.gather`` runs each coroutine in a task
+    with its own copy of the context, so four agents dispatching at once cannot
+    see, charge, or credit each other's calls. A shared counter around the outside
+    of the dispatch loop would measure whatever finished in the window.
+
+    Args:
+        agent: The agent name to charge.
+
+    Yields:
+        The usage this invocation accumulates.
+    """
+    usage = TokenUsageSummary()
+    token = _CURRENT_AGENT.set((agent, usage))
+    try:
+        yield usage
+    finally:
+        _CURRENT_AGENT.reset(token)
 
 
 def budget_for(state: Mapping[str, Any], limit: int) -> TokenBudget:

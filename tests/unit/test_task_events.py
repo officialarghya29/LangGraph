@@ -26,6 +26,7 @@ class RecordingStore:
         self.steps: list[dict[str, Any]] = []
         self.finished: list[dict[str, Any]] = []
         self.tool_calls: list[dict[str, Any]] = []
+        self.agent_runs: list[dict[str, Any]] = []
 
     async def append_event(
         self, task_id: str, event_type: str, payload: dict[str, object] | None = None
@@ -48,6 +49,11 @@ class RecordingStore:
         """Record a tool call."""
         del task_id
         self.tool_calls.append(fields)
+
+    async def record_agent_run(self, task_id: str, **fields: Any) -> None:
+        """Record one agent invocation with its cost."""
+        del task_id
+        self.agent_runs.append(fields)
 
 
 class ExplodingStore(RecordingStore):
@@ -104,6 +110,76 @@ async def test_an_agent_completion_closes_its_step() -> None:
             "duration_ms": 12.5,
         }
     ]
+
+
+async def test_an_agent_completion_records_a_run_with_its_own_cost() -> None:
+    """The per-agent figures are the invocation's, not a figure shared with peers."""
+    store = RecordingStore()
+
+    await sink_for(store)(
+        "agent_completed",
+        {
+            "agent": "researcher",
+            "subtask": "a",
+            "status": "completed",
+            "duration_ms": 12.5,
+            "prompt_tokens": 120,
+            "completion_tokens": 40,
+        },
+    )
+
+    assert store.agent_runs == [
+        {
+            "agent": "researcher",
+            "status": "completed",
+            "prompt_tokens": 120,
+            "completion_tokens": 40,
+            "duration_ms": 12.5,
+            "error": None,
+        }
+    ]
+
+
+async def test_an_agent_run_without_a_subtask_still_gets_a_row() -> None:
+    """A planner and a critic are agent invocations, so they belong in the table."""
+    store = RecordingStore()
+
+    await sink_for(store)(
+        "agent_completed",
+        {"agent": "planner", "status": "completed", "prompt_tokens": 10},
+    )
+
+    assert store.finished == [], "there is no step to close"
+    assert [run["agent"] for run in store.agent_runs] == ["planner"]
+
+
+async def test_a_failed_agent_run_is_recorded_as_failed() -> None:
+    store = RecordingStore()
+
+    await sink_for(store)(
+        "agent_completed",
+        {
+            "agent": "synthesizer",
+            "subtask": "a",
+            "status": "failed",
+            "reason": "model_failure",
+            "prompt_tokens": 5,
+        },
+    )
+
+    assert store.agent_runs[0]["status"] == "failed"
+    assert store.agent_runs[0]["error"] == "model_failure"
+    assert store.agent_runs[0]["prompt_tokens"] == 5
+
+
+async def test_missing_token_counts_are_reported_as_zero_not_crashed() -> None:
+    """A payload from an older graph must not fail the run it is describing."""
+    store = RecordingStore()
+
+    await sink_for(store)("agent_completed", {"agent": "critic"})
+
+    assert store.agent_runs[0]["prompt_tokens"] == 0
+    assert store.agent_runs[0]["completion_tokens"] == 0
 
 
 async def test_a_failed_step_records_the_failure_kind_as_its_error() -> None:
@@ -208,6 +284,7 @@ async def test_an_unexpected_event_type_mirrors_nothing() -> None:
     assert store.steps == []
     assert store.finished == []
     assert store.tool_calls == []
+    assert store.agent_runs == []
     assert store.events
 
 

@@ -33,11 +33,12 @@ from app.core.exceptions import AppError
 from app.graph.state import AgentState
 from app.models.agent import AgentOutput, VerificationResult
 from app.models.approval import ApprovalStatus
-from app.models.execution import ExecutionError, ExecutionMetadata
+from app.models.execution import ExecutionError, ExecutionMetadata, TokenUsageSummary
 from app.models.memory import MemoryType
 from app.models.tool import AccessMode
 from app.schemas.events import EventType
 from app.schemas.plans import Plan, Subtask
+from app.services.budget import agent_scope
 from app.services.llm import LLMProvider, Message, Role
 from app.services.memory import MemoryManager, MemoryQuery
 from app.tools.registry import ToolRegistry
@@ -81,6 +82,20 @@ def event_sink_for(sink: EventSink | None) -> Iterator[None]:
         yield
     finally:
         _run_sink.reset(token)
+
+
+@dataclass(slots=True)
+class AgentInvocation:
+    """One agent invocation: what it produced, what it cost, how long it took.
+
+    Returned as a record rather than the output alone, because the other two are
+    measured inside :meth:`GraphNodes._invoke_agent` and a caller that needs one
+    should not have to reconstruct it from a timestamp it took itself.
+    """
+
+    output: Any
+    usage: TokenUsageSummary
+    duration_ms: float
 
 
 @dataclass(slots=True)
@@ -173,6 +188,88 @@ class GraphNodes:
     # ------------------------------------------------------------------ #
     # Helpers
     # ------------------------------------------------------------------ #
+
+    async def _invoke_agent(
+        self,
+        agent: BaseAgent[Any, Any],
+        payload: BaseModel,
+        state: AgentState,
+        *,
+        description: str = "",
+        describe: Callable[[Any], str] | None = None,
+        approved: bool = False,
+        subtask: str | None = None,
+    ) -> AgentInvocation:
+        """Run one agent, announcing it and charging its usage to itself.
+
+        One place rather than five, because the two things that are easy to forget
+        per call site are exactly the two that make the audit trail worth having:
+        that the invocation was announced at all, and what it cost. Announcement
+        happens on both paths, so a failed agent is a closed record rather than an
+        open one.
+
+        Args:
+            agent: The agent to run.
+            payload: Its typed input.
+            state: The run's state, for the context handed to the agent.
+            description: Short, client-safe description for the started event.
+            describe: Extracts a short summary from the output, if it has one.
+            approved: Whether a human approved this action.
+            subtask: The plan's subtask id, when this invocation is one.
+
+        Returns:
+            The output, and what this invocation cost and took.
+
+        Raises:
+            AppError: Whatever the agent raised, after announcing the failure.
+        """
+        await self._emit(
+            EventType.AGENT_STARTED,
+            agent=agent.name,
+            subtask=subtask,
+            description=description[:200],
+        )
+        started = time.perf_counter()
+        with agent_scope(agent.name) as usage:
+            try:
+                output = await agent.run(payload, self._agent_context(state, approved=approved))
+            except AppError as exc:
+                await self._emit(
+                    EventType.AGENT_COMPLETED,
+                    agent=agent.name,
+                    subtask=subtask,
+                    status="failed",
+                    reason=exc.failure_kind.value,
+                    duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                    prompt_tokens=usage.prompt_tokens,
+                    completion_tokens=usage.completion_tokens,
+                )
+                raise
+            except Exception as exc:
+                await self._emit(
+                    EventType.AGENT_COMPLETED,
+                    agent=agent.name,
+                    subtask=subtask,
+                    status="failed",
+                    reason=type(exc).__name__,
+                    duration_ms=round((time.perf_counter() - started) * 1000, 3),
+                    prompt_tokens=usage.prompt_tokens,
+                    completion_tokens=usage.completion_tokens,
+                )
+                raise
+
+        duration_ms = round((time.perf_counter() - started) * 1000, 3)
+        await self._emit(
+            EventType.AGENT_COMPLETED,
+            agent=agent.name,
+            subtask=subtask,
+            status="completed",
+            duration_ms=duration_ms,
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            summary=(describe(output)[:200] if describe is not None else ""),
+        )
+        return AgentInvocation(output=output, usage=usage, duration_ms=duration_ms)
 
     def _agent_context(self, state: AgentState, *, approved: bool = False) -> AgentContext:
         """Build the context for one agent invocation.
@@ -349,7 +446,14 @@ class GraphNodes:
                 agent_tools=self._worker_capabilities(),
                 max_subtasks=max(1, min(self.deps.settings.max_agent_iterations, 6)),
             )
-            plan = await self.deps.planner.run(payload, self._agent_context(state))
+            invocation = await self._invoke_agent(
+                self.deps.planner,
+                payload,
+                state,
+                description=request,
+                describe=lambda output: output.objective,
+            )
+            plan: Plan = invocation.output
         except AppError as exc:
             # Covers both a planning failure and an unresolvable agent tool set;
             # either way the run degrades to a reported failure, not a crash.
@@ -459,7 +563,6 @@ class GraphNodes:
             return {}
 
         context_text = self._context_text(state)
-        context = self._agent_context(state)
         limit = asyncio.Semaphore(self.deps.settings.max_parallel_tasks)
 
         async def run_one(subtask: Subtask) -> tuple[AgentOutput | None, ExecutionError | None]:
@@ -471,51 +574,29 @@ class GraphNodes:
                         f"no agent registered as {subtask.agent!r}",
                         FailureKind.PERMANENT,
                     )
-                await self._emit(
-                    EventType.AGENT_STARTED,
-                    agent=subtask.agent,
-                    subtask=subtask.id,
-                    description=subtask.description[:200],
-                )
-                started = time.perf_counter()
                 try:
                     payload = _subtask_payload(agent.input_model, subtask, context_text)
-                    output = await agent.run(payload, context)
-                except AppError as exc:
-                    await self._emit(
-                        EventType.AGENT_COMPLETED,
-                        agent=subtask.agent,
+                    invocation = await self._invoke_agent(
+                        agent,
+                        payload,
+                        state,
+                        description=subtask.description,
+                        describe=lambda produced: produced.summary or produced.content[:200],
                         subtask=subtask.id,
-                        status="failed",
-                        reason=exc.failure_kind.value,
                     )
+                    output = invocation.output
+                    output.duration_ms = invocation.duration_ms
+                except AppError as exc:
                     return None, _error(
                         "agent_execution", f"{subtask.id}: {exc.message}", exc.failure_kind
                     )
                 except Exception as exc:
-                    await self._emit(
-                        EventType.AGENT_COMPLETED,
-                        agent=subtask.agent,
-                        subtask=subtask.id,
-                        status="failed",
-                        reason=type(exc).__name__,
-                    )
                     return None, _error(
                         "agent_execution",
                         f"{subtask.id}: agent raised unexpectedly",
                         FailureKind.UNKNOWN,
                         detail=type(exc).__name__,
                     )
-                duration_ms = round((time.perf_counter() - started) * 1000, 3)
-                output.duration_ms = duration_ms
-                await self._emit(
-                    EventType.AGENT_COMPLETED,
-                    agent=subtask.agent,
-                    subtask=subtask.id,
-                    status="completed",
-                    duration_ms=duration_ms,
-                    summary=(output.summary or output.content[:200]),
-                )
                 return output, None
 
         outcomes = await asyncio.gather(*(run_one(subtask) for subtask in ready))
@@ -554,7 +635,14 @@ class GraphNodes:
         )
         await self._emit(EventType.VERIFICATION_STARTED, outputs=len(outputs))
         try:
-            verdict = await self.deps.critic.run(payload, self._agent_context(state))
+            invocation = await self._invoke_agent(
+                self.deps.critic,
+                payload,
+                state,
+                description="verify the aggregated results",
+                describe=lambda output: output.verification_summary,
+            )
+            verdict: VerificationResult = invocation.output
         except AppError as exc:
             # A failed critic must not block delivery; it degrades to "unverified".
             verdict = VerificationResult(
@@ -616,7 +704,14 @@ class GraphNodes:
             critic_notes=notes,
         )
         try:
-            result = await self.deps.synthesizer.run(payload, self._agent_context(state))
+            invocation = await self._invoke_agent(
+                self.deps.synthesizer,
+                payload,
+                state,
+                description="combine the verified results",
+                describe=lambda output: output.answer,
+            )
+            result = invocation.output
         except AppError as exc:
             return {
                 "final_answer": (
@@ -725,9 +820,15 @@ class GraphNodes:
             rationale="approved by a human",
         )
         try:
-            result = await self.deps.executor.run(
-                payload, self._agent_context(state, approved=True)
+            invocation = await self._invoke_agent(
+                self.deps.executor,
+                payload,
+                state,
+                description=f"perform the approved action: {tool}",
+                describe=lambda output: output.summary,
+                approved=True,
             )
+            result = invocation.output
         except AppError as exc:
             # The action could not even be attempted: the tool is missing or the
             # executor is not authorised for it. Report rather than raise, so an

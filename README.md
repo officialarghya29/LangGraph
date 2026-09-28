@@ -24,7 +24,7 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 
 [![Ruff](https://img.shields.io/badge/Ruff-passing-D7FF64?style=for-the-badge&logo=ruff&logoColor=black)](#quality-gates)
 [![MyPy](https://img.shields.io/badge/MyPy-strict-2A6DB2?style=for-the-badge)](#quality-gates)
-[![Tests](https://img.shields.io/badge/tests-862%20passing-brightgreen?style=for-the-badge)](#quality-gates)
+[![Tests](https://img.shields.io/badge/tests-899%20passing-brightgreen?style=for-the-badge)](#quality-gates)
 
 [![Status](https://img.shields.io/badge/phases-45%20of%2045-brightgreen?style=for-the-badge)](#build-status)
 [![License](https://img.shields.io/badge/license-proprietary-red?style=for-the-badge)](#license)
@@ -41,10 +41,10 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 > — not mocks, and not a plan.
 >
 > ```console
-> $ ruff format --check .   →  139 files already formatted
+> $ ruff format --check .   →  141 files already formatted
 > $ ruff check .            →  All checks passed
 > $ mypy app scripts        →  Success: no issues found in 81 source files
-> $ pytest                  →  862 passed in 59s
+> $ pytest                  →  899 passed, 1 skipped in 47s
 > $ python scripts/evaluate.py --quiet
 > rule-based baseline: accuracy=0.911 adversarial=0.429 macro_f1=0.920 ⟶
 >   approval_recall=1.000 p50=0.06ms p95=0.09ms
@@ -75,13 +75,17 @@ timing harness plus the optimisation it found — see
 **Also complete:** CI, the operator console, and the final reviews — see
 [Delivery](#delivery) and [`docs/REVIEWS.md`](docs/REVIEWS.md).
 
-**Complete and verified (deep scan).** A pass that asked which of this
-repository's own claims were not true, and fixed what it found: ceilings that
-bounded nothing, counters that were always zero, three audit tables nothing
-wrote to, a kill switch that killed nothing, and a console whose live stream
-could not authenticate. One gap remains, and it is recorded rather than
-papered over — per-agent token attribution, which would mean writing zeros into
-columns named `prompt_tokens`. See [the deep scan](docs/REVIEWS.md#deep-scan).
+**Complete and verified (deep scan).** Two passes that asked which of this
+repository's own claims were not true, and fixed what they found: ceilings that
+bounded nothing, counters that were always zero, four audit tables nothing wrote
+to, a kill switch that killed nothing, a console whose live stream could not
+authenticate, a blank value that crashed the process over a setting left
+deliberately empty, and a settings template that documented forty-one of
+sixty-six settings while listing a value the code has never accepted.
+
+The second pass closed the one gap the first had recorded as accepted, rather
+than leaving it excused: per-agent cost, which is now attributed per invocation
+and readable over the API. See [the deep scan](docs/REVIEWS.md#deep-scan).
 
 **Unbuilt, not unverified.** The `Dockerfile` and `docker-compose.yml` are
 written and lint-checked, but this host has no container runtime, so neither has
@@ -108,6 +112,7 @@ Two further limits are deliberate, and are stated rather than hidden:
 
 ## Contents
 
+- [Build status](#build-status)
 - [What this is](#what-this-is)
 - [Why it is built this way](#why-it-is-built-this-way)
 - [Architecture](#architecture)
@@ -493,8 +498,9 @@ Two details are worth knowing, because both are easy to get wrong:
 
 ## API surface
 
-Seventeen routes. Every task, approval, and event read is scoped to the
-authenticated caller.
+Eighteen paths, nineteen operations, all of them enforced against the
+authenticated caller — a task, approval, timeline, or event stream belonging to
+somebody else is indistinguishable from one that does not exist.
 
 | Method | Path | Purpose |
 | :--- | :--- | :--- |
@@ -505,15 +511,64 @@ authenticated caller.
 | `GET` | `/api/v1/tasks` | List the caller's tasks |
 | `GET` | `/api/v1/tasks/{task_id}` | Fetch a task |
 | `GET` | `/api/v1/tasks/{task_id}/status` | Execution status |
+| `GET` | `/api/v1/tasks/{task_id}/timeline` | The durable trail: steps, tool calls, agent runs, counters |
 | `POST` | `/api/v1/tasks/{task_id}/approve` | Approve a gated action and resume the run |
 | `POST` | `/api/v1/tasks/{task_id}/reject` | Reject a gated action |
 | `POST` | `/api/v1/tasks/{task_id}/cancel` | Cancel a running task |
 | `GET` | `/api/v1/events/{task_id}` | Stream execution events (SSE) |
 | `GET` | `/api/v1/events/{task_id}/history` | Replay the durable event log |
 | `GET` | `/api/v1/agents`, `/api/v1/tools` | Discovery |
-| `GET` | `/metrics` | Prometheus exposition |
+| `GET` | `/metrics` | Prometheus exposition — **404 unless `METRICS_ENABLED`** |
 | `GET` | `/dashboard` | Operator console — **off unless `DASHBOARD_ENABLED` is set** |
 | `GET` | `/dashboard/app.js`, `/dashboard/app.css` | Console assets, served under a strict CSP |
+
+### The timeline
+
+`GET /api/v1/tasks/{task_id}/timeline` answers the question an operator asks
+about a run they did not watch: which subtasks ran, which tools were touched,
+which agents spent the tokens, and where it stopped.
+
+```json
+{
+  "task_id": "3f1c…",
+  "status": "completed",
+  "route": "research",
+  "iteration_count": 1,
+  "retry_count": 0,
+  "tool_call_count": 1,
+  "steps": [
+    {"subtask_id": "a", "agent": "researcher", "status": "completed",
+     "summary": "summary for a", "duration_ms": 0.4, "created_at": "…"}
+  ],
+  "tool_calls": [
+    {"tool": "write_file", "agent": "executor", "ok": false, "risk_level": "MEDIUM",
+     "approved": true, "approval_required": false, "failure_kind": "validation",
+     "duration_ms": 0.2, "created_at": "…"}
+  ],
+  "agent_runs": [
+    {"agent": "planner", "status": "completed", "prompt_tokens": 412,
+     "completion_tokens": 96, "total_tokens": 508, "duration_ms": 0.7, "created_at": "…"}
+  ]
+}
+```
+
+Three properties are worth naming, because each is a decision rather than a
+default:
+
+- **It is assembled from what the run wrote as it went.** Steps, tool calls, and
+  agent runs are recorded while the work happens, not reconstructed from final
+  state. A run that crashed halfway is exactly the run whose timeline matters, and
+  a reconstruction would have nothing to reconstruct from.
+- **Every agent invocation is a row, with its own cost.** The token figures come
+  from a scope bound to the invocation rather than from a counter shared with the
+  agents dispatching beside it, so a planner, two researchers, a critic, and a
+  synthesizer each report what they actually spent. A retried subtask reports its
+  second attempt's cost, not the running total.
+- **Tool arguments are absent, and so are prompts.** Arguments are model-authored
+  and can carry a path, a fragment of a prompt, or a credential. The tool's name,
+  its risk level, and whether it worked are what an audit asks for; the response
+  schema is asserted in the test suite so a field cannot be added to it by
+  accident.
 
 A live `/ready` looks like this:
 
@@ -718,12 +773,14 @@ write files or touch a database.
 
 ### Continuous integration
 
-`.github/workflows/ci.yml` runs six checks on every push and pull request:
+`.github/workflows/ci.yml` runs five jobs, covering seven checks, on every push
+and pull request:
 
 | Job | What it proves |
 | :--- | :--- |
 | **Lint and types** | Formatting, lint, and `mypy --strict` — including `warn_unused_ignores`, so a stale suppression fails rather than hides |
 | **Tests** | The full suite against real PostgreSQL 18 and Redis 8, with `REQUIRE_SERVICES=1` so a missing service is a failure instead of a silent skip |
+| **Credentials** | `git grep` over the full history for token and private-key patterns, so a credential is caught before it merges rather than after it is rotated |
 | **Evaluation** | The routing report is printed on every run, so a quality regression is visible in the log and not only in a failed threshold |
 | **Generated assets** | Regenerates every diagram and fails if the committed PNGs differ |
 | **Migration cycle** | Apply, reverse, re-apply — plus `alembic check`, which asks the tool that owns the migration whether it would generate anything new |
@@ -731,7 +788,9 @@ write files or touch a database.
 
 That last job exists for an honest reason. The image has never been run locally,
 so the build is delegated to a runner that has a container runtime rather than
-reported as verified here.
+reported as verified here. Every job carries a `timeout-minutes`, so a hung test
+fails the build in twenty minutes instead of holding a runner for hours and
+hiding the hang behind a timeout of its own.
 
 ### Containers
 
@@ -823,6 +882,9 @@ one is failing.
 | **Evaluation** | Routing quality against a labelled corpus, and the hot-path timings | Per-route precision and recall, a rule-based baseline, and a percentile timing harness |
 | **Provider transport** | Both model adapters, over a real socket | A scripted loopback server asserting the endpoint, headers, payload, usage fields, and error mapping — then the whole decorator stack against it |
 | **Assets** | The generated diagrams | An audit that measures every drawn label and fails on overlap or overflow |
+| **Configuration drift** | `.env.example`, `docker-compose.yml`, the `Dockerfile`, `.dockerignore` | Every documented key is compared against the settings layer in both directions, and the container's environment is checked for names that do not exist — a typo there is accepted silently and configures nothing |
+| **Concurrency** | Two runs in flight against one compiled graph | Separate event sinks, token budgets, and ceilings; the same request is asserted to cost the same whether or not it had company |
+| **Ceilings** | `MAX_TOOL_CALLS`, `MAX_EXECUTION_TIME`, `MAX_TOKEN_BUDGET` | Each refusal is asserted to happen *before* the work, and to leave a caller with a reason rather than a stack trace |
 
 Two testing decisions are worth calling out, because both were found by getting
 them wrong first:
@@ -1093,7 +1155,7 @@ $ curl -s http://127.0.0.1:8000/ready | python -m json.tool
 - [x] **Phase 20** — memory manager — four tiers, scored retrieval, durable store
 - [x] **Phase 21** — checkpointing and human approval — durable PostgreSQL backend, resume verified
 - [x] **Phase 22** — approval records persisted to the database
-- [x] **Phase 23** — HTTP API — 17 routes including metrics and the console
+- [x] **Phase 23** — HTTP API — 18 paths including metrics, the task timeline, and the console
 - [x] **Phase 24** — execution-event streaming — SSE over the durable event log, plus replay
 - [x] **Phase 25** — authorization — bearer tokens and ownership on every read
 - [x] **Phase 26** — rate limiting — Redis-backed, fail-open or fail-closed
@@ -1110,6 +1172,7 @@ $ curl -s http://127.0.0.1:8000/ready | python -m json.tool
 - [x] **Phase 42** — operator console — off by default, strict CSP, and no HTML built from user input
 - [x] **Phases 43–45** — final reviews — see [`docs/REVIEWS.md`](docs/REVIEWS.md): two findings fixed, the rest verified or accepted on the record
 - [x] **Deep scan** — a claim-by-claim audit of this repository: eleven findings fixed, one verified non-defect, one accepted gap on the record
+- [x] **Post-review hardening** — per-agent token accounting, the task timeline, deployment-config drift tests, and a committed-credential scan in CI
 
 </details>
 

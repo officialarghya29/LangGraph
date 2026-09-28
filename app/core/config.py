@@ -15,7 +15,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, field_validator, model_validator
+from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.core.exceptions import ConfigurationError
@@ -282,26 +282,90 @@ class Settings(BaseSettings):
         "database_tool_url",
         "search_api_url",
         "otel_exporter_otlp_endpoint",
+        "jwt_audience",
+        "jwt_issuer",
         mode="after",
     )
     @classmethod
-    def _blank_url_means_unset(cls, value: str | None) -> str | None:
-        """Treat an empty or whitespace-only URL as not set.
+    def _blank_optional_means_unset(cls, value: str | None) -> str | None:
+        """Treat an empty or whitespace-only optional string as not set.
 
         The same failure as a blank secret, one layer on: ``DATABASE_TOOL_URL=``
         would register the database tool against an empty target, and the tool's
-        own "is a target configured?" check is an ``is not None`` test.
+        own "is a target configured?" check is an ``is not None`` test. The same
+        holds for a JWT audience or issuer, where an empty string is a claim to
+        check against rather than the absence of one.
 
         Args:
-            value: The parsed URL, if any.
+            value: The parsed text, if any.
 
         Returns:
-            The stripped URL, or ``None`` when there was nothing in it.
+            The stripped text, or ``None`` when there was nothing in it.
         """
         if value is None:
             return None
         text = value.strip()
         return text or None
+
+    @field_validator("api_docs_enabled", mode="before")
+    @classmethod
+    def _blank_flag_means_unset(cls, value: object) -> object:
+        """Treat an empty string as "not set" for the tri-state flags.
+
+        ``API_DOCS_ENABLED=`` is how an operator says "decide from the
+        environment", which is the documented meaning of leaving it unset. It is
+        not, however, parseable as a boolean, so the value was rejected and the
+        process refused to start — over a setting that was left deliberately
+        blank, in a file that shipped it that way.
+
+        Args:
+            value: The raw input, before type coercion.
+
+        Returns:
+            ``None`` for blank input, so the field keeps its tri-state meaning.
+        """
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator(
+        "app_name",
+        "llm_model",
+        "embedding_model",
+        "otel_service_name",
+        mode="after",
+    )
+    @classmethod
+    def _blank_text_means_default(cls, value: str, info: ValidationInfo) -> str:
+        """Treat a blank string as "use the default".
+
+        The same failure as a blank secret, one layer further from the credential:
+        ``LLM_MODEL=`` in a ``.env`` file is valid input for a ``str`` field, so it
+        was accepted, and the provider was then called with an empty model name.
+        That fails at request time with an error about the model rather than about
+        the configuration — and the setting *looked* set in the file, which is what
+        makes it expensive to find.
+
+        Surrounding whitespace is stripped for the same reason it is on a secret: a
+        value pasted with a trailing newline is not the value someone meant.
+
+        Args:
+            value: The parsed text.
+            info: Validation context, used to recover the field's default.
+
+        Returns:
+            The trimmed value, or the default when there was nothing in it.
+        """
+        text = value.strip()
+        if text:
+            return text
+        field_name = info.field_name
+        if field_name is None:  # pragma: no cover - pydantic always names the field
+            return value
+        default = cls.model_fields[field_name].default
+        # Every field this validator is attached to declares a non-empty string
+        # default, so this cannot leave an empty value in place.
+        return default if isinstance(default, str) and default else value
 
     @model_validator(mode="after")
     def _enforce_production_safety(self) -> Settings:

@@ -25,8 +25,16 @@ jobs:
   quality:
     name: Lint and types
     runs-on: ubuntu-24.04
+    # Every job is bounded. A hung test should fail the build in twenty minutes,
+    # not hold a runner for six hours and hide the hang behind a timeout of its
+    # own.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
+        # Full history, so the credential scan below can see past commits rather
+        # than only the current tree.
+        with:
+          fetch-depth: 0
 
       - uses: astral-sh/setup-uv@v6
         with:
@@ -49,12 +57,27 @@ jobs:
       - name: Types
         run: .venv/bin/mypy app scripts
 
+      # A credential committed once lives in every clone and in the history after
+      # the file is deleted, so the cheapest place to catch one is before it
+      # merges. The patterns are specific rather than generic — a placeholder in a
+      # template must not be reported as a leak, or the check becomes noise and
+      # gets ignored. Binary files are skipped, which is what keeps the committed
+      # diagrams from being read as text.
+      - name: No committed credentials
+        run: |
+          if git grep -n -I -E 'ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----' -- . ; then
+            echo "::error::a credential appears to be committed"
+            exit 1
+          fi
+          echo "no credentials found"
+
   # ------------------------------------------------------------------------- #
   # The suite, against real PostgreSQL and real Redis
   # ------------------------------------------------------------------------- #
   test:
     name: Tests
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:18-alpine
@@ -129,6 +152,7 @@ jobs:
   evaluation:
     name: Evaluation
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
 
@@ -154,6 +178,7 @@ jobs:
   assets:
     name: Generated assets
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
 
@@ -187,6 +212,7 @@ jobs:
   container:
     name: Container build
     runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
 

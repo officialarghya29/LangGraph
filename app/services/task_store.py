@@ -51,6 +51,10 @@ __all__ = [
     "PostgresTaskStore",
     "TaskRecord",
     "TaskStore",
+    "TaskTimeline",
+    "TimelineAgentRun",
+    "TimelineStep",
+    "TimelineToolCall",
     "execute_task_with_store",
     "task_event_sink",
 ]
@@ -103,18 +107,40 @@ async def _mirror_audit(
         return
 
     if event_type == "agent_completed":
+        agent = _text(payload.get("agent"))
+        status = _text(payload.get("status")) or "completed"
+        # The agent's own summary, and the failure kind rather than an exception
+        # message: the trail records what happened without copying a prompt
+        # fragment or a URL into it.
+        summary = _text(payload.get("summary"))
+        reason = _text(payload.get("reason"))
+        duration_ms = _number(payload.get("duration_ms"))
+
         subtask = payload.get("subtask")
         if isinstance(subtask, str):
             await store.finish_step(
                 task_id,
                 subtask_id=subtask,
-                status=_text(payload.get("status")) or "completed",
-                # The agent's own summary, and the failure kind rather than an
-                # exception message: the trail records what happened without
-                # copying a prompt fragment or a URL into it.
-                output=_text(payload.get("summary")),
-                error=_text(payload.get("reason")),
-                duration_ms=_number(payload.get("duration_ms")),
+                status=status,
+                output=summary,
+                error=reason,
+                duration_ms=duration_ms,
+            )
+
+        # Every invocation is a run, whether or not it belonged to a subtask: a
+        # planner and a critic are agent invocations too, and the point of the
+        # table is that the cost of each one is visible. The tokens come from the
+        # agent's own usage scope, so they are this invocation's rather than a
+        # figure shared with whatever ran beside it.
+        if agent is not None:
+            await store.record_agent_run(
+                task_id,
+                agent=agent,
+                status=status,
+                prompt_tokens=_count(payload.get("prompt_tokens")),
+                completion_tokens=_count(payload.get("completion_tokens")),
+                duration_ms=duration_ms,
+                error=reason,
             )
         return
 
@@ -165,6 +191,66 @@ def task_event_sink(task_id: str, store: TaskStore) -> EventSink:
     return publish
 
 
+class TimelineStep(BaseModel):
+    """One plan subtask and how it turned out."""
+
+    subtask_id: str
+    agent: str
+    status: str
+    #: The agent's own short restatement of its result — the same text the event
+    #: stream already carries to this task's owner. Never the agent's reasoning.
+    summary: str | None = None
+    duration_ms: float = 0.0
+    created_at: datetime
+    updated_at: datetime
+
+
+class TimelineToolCall(BaseModel):
+    """One tool invocation.
+
+    Deliberately without ``arguments``: they are model-authored and can carry a
+    prompt fragment, a path, or a credential. The tool's name, its risk, and
+    whether it worked are what an audit asks for.
+    """
+
+    tool: str
+    agent: str | None = None
+    ok: bool = False
+    risk_level: str = "LOW"
+    approved: bool = False
+    approval_required: bool = False
+    failure_kind: str | None = None
+    duration_ms: float = 0.0
+    created_at: datetime
+
+
+class TimelineAgentRun(BaseModel):
+    """One agent invocation, its outcome, and what it cost."""
+
+    agent: str
+    status: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    duration_ms: float = 0.0
+    #: A failure kind, never an exception message.
+    error: str | None = None
+    created_at: datetime
+
+
+class TaskTimeline(BaseModel):
+    """The durable trail for one task: what ran, in what order, and at what cost.
+
+    Assembled from the tables the run wrote as it went, not reconstructed from a
+    final state. A run that crashed halfway is exactly the run whose timeline
+    matters, and a reconstruction would have nothing to reconstruct from.
+    """
+
+    steps: list[TimelineStep] = Field(default_factory=list)
+    tool_calls: list[TimelineToolCall] = Field(default_factory=list)
+    agent_runs: list[TimelineAgentRun] = Field(default_factory=list)
+
+
 class TaskRecord(BaseModel):
     """The client-visible state of one task.
 
@@ -186,6 +272,11 @@ class TaskRecord(BaseModel):
     #: graph after a human decides — and the later segment has to add to the
     #: earlier count rather than replace it.
     tool_call_count: int = 0
+    #: How many dispatch passes and replans the run consumed. Reported rather than
+    #: kept internal: a task that took four passes to finish is telling an operator
+    #: something about the plan it was given.
+    iteration_count: int = 0
+    retry_count: int = 0
     approval_status: ApprovalStatus = ApprovalStatus.NOT_REQUIRED
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -331,6 +422,25 @@ class TaskStore:
     ) -> None:
         """Append a tool call to the audit trail. No-op when not durable."""
 
+    async def record_agent_run(
+        self,
+        task_id: str,
+        *,
+        agent: str,
+        node: str | None = None,
+        status: str = "completed",
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+        duration_ms: float = 0.0,
+        error: str | None = None,
+    ) -> None:
+        """Record one agent invocation with its cost. No-op when not durable."""
+
+    async def timeline(self, task_id: str, *, limit: int = 200) -> TaskTimeline:
+        """Return a task's steps, tool calls, and agent runs. Empty when not durable."""
+        del task_id, limit
+        return TaskTimeline()
+
     async def counts(self) -> dict[str, int]:
         """Return task counts by status."""
         return {}
@@ -363,6 +473,8 @@ class PostgresTaskStore(TaskStore):
             failure_reason=task.failure_reason,
             route=task.route,
             tool_call_count=task.tool_call_count,
+            iteration_count=task.iteration_count,
+            retry_count=task.retry_count,
             approval_status=ApprovalStatus(task.approval_status),
             created_at=task.created_at,
             updated_at=task.updated_at,
@@ -570,6 +682,74 @@ class PostgresTaskStore(TaskStore):
                 duration_ms=duration_ms,
                 error=error,
             )
+
+    async def timeline(self, task_id: str, *, limit: int = 200) -> TaskTimeline:
+        """Return a task's trail, read from the tables the run wrote as it went.
+
+        One session for the three reads, so the three views belong to the same
+        moment: a timeline assembled from two transactions could show a step that
+        closed before the tool call it contains.
+
+        Args:
+            task_id: The task to describe.
+            limit: Ceiling per collection. A run's ceilings bound these in
+                practice, and a bounded read is what keeps it true if they change.
+
+        Returns:
+            The steps, tool calls, and agent runs. Empty for an unknown id rather
+            than an error: the caller has already checked ownership.
+        """
+        try:
+            key = uuid.UUID(task_id)
+        except ValueError:
+            return TaskTimeline()
+
+        async with self._database.session() as session:
+            steps = await TaskStepRepository(session).list_for_task(key, limit=limit)
+            calls = await ToolCallRepository(session).list_for_task(key, limit=limit)
+            runs = await AgentRunRepository(session).list_for_task(key, limit=limit)
+
+        return TaskTimeline(
+            steps=[
+                TimelineStep(
+                    subtask_id=step.subtask_id,
+                    agent=step.agent,
+                    status=step.status,
+                    summary=step.output,
+                    duration_ms=step.duration_ms,
+                    created_at=step.created_at,
+                    updated_at=step.updated_at,
+                )
+                for step in steps
+            ],
+            tool_calls=[
+                TimelineToolCall(
+                    tool=call.tool,
+                    agent=call.agent,
+                    ok=call.ok,
+                    risk_level=call.risk_level,
+                    approved=call.approved,
+                    approval_required=call.approval_required,
+                    failure_kind=call.failure_kind,
+                    duration_ms=call.duration_ms,
+                    created_at=call.created_at,
+                )
+                for call in calls
+            ],
+            agent_runs=[
+                TimelineAgentRun(
+                    agent=run.agent,
+                    status=run.status,
+                    prompt_tokens=run.prompt_tokens,
+                    completion_tokens=run.completion_tokens,
+                    total_tokens=run.total_tokens,
+                    duration_ms=run.duration_ms,
+                    error=run.error,
+                    created_at=run.created_at,
+                )
+                for run in runs
+            ],
+        )
 
     async def append_event(
         self, task_id: str, event_type: str, payload: dict[str, object] | None = None

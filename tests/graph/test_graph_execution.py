@@ -24,7 +24,7 @@ from app.graph.nodes import event_sink_for
 from app.graph.state import initial_state
 from app.models.tool import AccessMode
 from app.services.budget import BudgetedProvider, TokenBudget, token_budget
-from app.services.limits import RunLimits, run_limits
+from app.services.limits import RunLimits, limits_for, run_limits
 from app.services.llm import FakeLLMProvider, LLMProvider
 from app.tools.base import Tool, ToolContext
 from app.tools.registry import ToolRegistry
@@ -636,6 +636,90 @@ def test_resume_is_checkpointed_under_a_stable_thread() -> None:
 # --------------------------------------------------------------------------- #
 # State integrity
 # --------------------------------------------------------------------------- #
+
+
+# --------------------------------------------------------------------------- #
+# Concurrency
+# --------------------------------------------------------------------------- #
+
+
+def request_aware_responder() -> Any:
+    """Route on the request, so one graph can serve two different shapes of run."""
+    base = responder_for(route="research")
+
+    def responder(messages: Any) -> str:
+        joined = "\n".join(message.content for message in messages)
+        if "You route requests" in joined:
+            route = "research" if "compare" in joined else "direct"
+            return json.dumps(route_payload(route))
+        return base(messages)
+
+    return responder
+
+
+async def test_one_graph_serves_concurrent_runs_without_pooling_their_state() -> None:
+    """The compiled graph is shared by every request, so per-run state must not be.
+
+    Two runs are in flight against a single compiled graph, each with its own event
+    sink and its own token budget. Anything stored on the graph — the sink, the
+    budget, the counters — would show up here as events in the wrong stream or a
+    token total that belongs to both runs. This is the property the context
+    variables in :mod:`app.services.budget` and :mod:`app.graph.nodes` exist for,
+    and the only way to check it is to interleave two real runs.
+    """
+    # Budgeted, because the budget is charged by the decorator rather than by the
+    # graph: without it this test would assert that two runs spent the same zero.
+    graph = build(BudgetedProvider(FakeLLMProvider(responder=request_aware_responder())))
+
+    direct_state = initial_state("hello", iteration_limit=10, retry_limit=3)
+    planned_state = initial_state("compare two stores", iteration_limit=10, retry_limit=3)
+
+    direct_events: list[tuple[str, dict[str, Any]]] = []
+    planned_events: list[tuple[str, dict[str, Any]]] = []
+    direct_budget = TokenBudget(limit=1_000_000)
+    planned_budget = TokenBudget(limit=1_000_000)
+
+    async def run(
+        state: dict[str, Any],
+        events: list[tuple[str, dict[str, Any]]],
+        budget: TokenBudget,
+    ) -> dict[str, Any]:
+        async def sink(event_type: str, payload: dict[str, Any]) -> None:
+            events.append((event_type, payload))
+
+        with event_sink_for(sink), token_budget(budget), run_limits(limits_for(SETTINGS)):
+            # A yield point before the work starts, so both runs are genuinely in
+            # flight together rather than finishing one after the other.
+            await asyncio.sleep(0)
+            return await graph.ainvoke(state, thread_config(state["task_id"]))
+
+    direct_result, planned_result = await asyncio.gather(
+        run(direct_state, direct_events, direct_budget),
+        run(planned_state, planned_events, planned_budget),
+    )
+
+    # Each run answered its own request.
+    assert direct_result["route"].route.value == "direct"
+    assert planned_result["route"].route.value == "research"
+    assert direct_result.get("plan") is None
+    assert planned_result["plan"] is not None
+
+    # Each run's events went to its own stream: only the planned run plans, and
+    # only it dispatches. A shared sink would put both runs' events in both lists.
+    direct_kinds = {name for name, _ in direct_events}
+    planned_kinds = {name for name, _ in planned_events}
+    assert "task_planning" in planned_kinds
+    assert "task_planning" not in direct_kinds
+    assert "agent_started" in planned_kinds
+    assert "agent_started" not in direct_kinds
+
+    # And each run's spend is its own. A direct answer is two model calls; a plan
+    # with two workers, a critic, and a synthesizer is several more. Pooling would
+    # make them equal.
+    assert direct_budget.calls == 2
+    assert planned_budget.calls > direct_budget.calls
+    assert direct_budget.usage.total_tokens > 0
+    assert planned_budget.usage.total_tokens > direct_budget.usage.total_tokens
 
 
 def test_every_run_records_execution_metadata() -> None:
