@@ -71,13 +71,28 @@ NEXT PHASE:
 | 35 | Failure injection | **Complete** — 24 tests injecting faults at every seam: classification, retry, timeout, and degradation |
 | 36 | Evaluation harness | **Complete** — a 45-case labelled corpus split into core and adversarial sets, per-route precision/recall/F1, and a measured rule-based baseline |
 | 37 | Efficiency and optimization | **Complete** — a percentile timing harness with budget assertions, and a 4.8× speed-up in memory scoring |
-| 38-39 | Docker, migration verification | Blocked — no Docker on host |
-| 40-45 | CI/CD, documentation, dashboard, final reviews | Not started |
+| 38 | Container image and compose stack | **Unbuilt** — written and lint-checked; no container runtime on this host, so CI builds it instead |
+| 39 | Migration verification | **Complete** — applied to an empty database, reversed, and re-applied against real PostgreSQL 18.6; `alembic check` reports no drift; a suite compares the migrated catalog against the model metadata |
+| 40 | CI pipeline | **Complete** — lint, types, tests against real services, the evaluation, the asset check, and a container build |
+| 41 | Documentation | **Complete** — README, architecture, tech stack, plan, and the review record |
+| 42 | Operator console | **Complete** — disabled by default, strict CSP, no HTML built from user input |
+| 43-45 | Final security, performance, and architecture reviews | **Complete** — see `docs/REVIEWS.md` |
 
-**Blocked phases:** 38 and 39 only. They need a container runtime, and this host
-has none. Both will be written and lint-checked, and will be reported as
-unverified until a Docker daemon is available, because container work that has
-never been built cannot honestly be called complete.
+**Unbuilt, not unverified:** the container half of phase 38. The `Dockerfile`
+and `docker-compose.yml` are written and lint-checked, but this host has no
+container runtime, so neither has been executed. They stay labelled **unbuilt**
+rather than done, and CI builds the image on every push, so the first runner with
+a Docker daemon closes the gap. Container work that has never been built cannot
+honestly be called complete.
+
+The rest of phase 38–39 is not blocked, and waiting for Docker would have been
+the wrong reason to skip it. Migration verification ran here against real
+PostgreSQL 18.6 over the managed runtime in `.services/`: the revision applies to
+an empty database, reverses to base, re-applies, and `alembic check` reports no
+drift between the models and the migrated schema. A suite in
+`tests/integration/test_migration_drift.py` then compares the migrated catalog
+against the declared metadata — tables, columns, primary keys, and indexes —
+which is the half of containerisation that was never really about containers.
 
 Phases 3 and 4 were blocked for the same reason and are now complete: a
 self-contained runtime under `.services/` supplies a real PostgreSQL 18 and a

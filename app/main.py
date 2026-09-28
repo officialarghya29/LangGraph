@@ -35,6 +35,7 @@ from fastapi.responses import JSONResponse
 from app.api.middleware import RequestContextMiddleware, install_rate_limiting
 from app.api.routes.agents import router as discovery_router
 from app.api.routes.chat import router as chat_router
+from app.api.routes.dashboard import router as dashboard_router
 from app.api.routes.events import router as events_router
 from app.api.routes.health import router as health_router
 from app.api.routes.metrics import router as metrics_router
@@ -226,6 +227,13 @@ def create_app() -> FastAPI:
     Returns:
         A fully configured :class:`fastapi.FastAPI` application.
     """
+    # Withheld in production unless it was asked for: the schema is an inventory
+    # of every route, field, and error shape, which is useful while building
+    # against the API and unnecessary exposure once it is deployed. Passing
+    # ``None`` for ``openapi_url`` is what removes ``/openapi.json`` and, with it,
+    # the interactive docs page.
+    serve_docs = get_settings().serve_api_docs
+
     application = FastAPI(
         title="LangGraph Multi-Agent System",
         version="1.0.0",
@@ -234,9 +242,9 @@ def create_app() -> FastAPI:
             "durable checkpointing, human approval, and a least-privilege tool "
             "pipeline."
         ),
-        docs_url="/docs",
+        docs_url="/docs" if serve_docs else None,
         redoc_url=None,
-        openapi_url="/openapi.json",
+        openapi_url="/openapi.json" if serve_docs else None,
         lifespan=lifespan,
     )
 
@@ -254,6 +262,13 @@ def create_app() -> FastAPI:
     application.include_router(events_router)
     application.include_router(discovery_router)
     application.include_router(metrics_router)
+
+    # Registered unconditionally; each route returns 404 unless
+    # ``DASHBOARD_ENABLED`` is set. Deciding at request time rather than at
+    # startup keeps the route table identical between environments, so a test can
+    # assert both the enabled and the disabled behaviour without rebuilding the
+    # application.
+    application.include_router(dashboard_router)
 
     return application
 

@@ -1,0 +1,39 @@
+# Keep the build context small and keep secrets out of the image.
+#
+# `.env` matters most: it is gitignored, so it would silently become part of the
+# image if it were copied in, and the image would then carry real credentials.
+
+.git
+.github
+.gitignore
+.env
+.env.*
+!.env.example
+
+# Development environment and tooling state
+.venv
+venv
+.mypy_cache
+.ruff_cache
+.pytest_cache
+.freebuff
+.services
+
+# Tests, docs, and generated assets are not needed to run the service
+tests
+docs
+scripts
+migrations/__pycache__
+
+# Python build artefacts
+__pycache__
+*.py[cod]
+*.egg-info
+build
+dist
+
+# Editors and OS noise
+.vscode
+.idea
+.DS_Store
+*.log

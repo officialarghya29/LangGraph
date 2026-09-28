@@ -127,10 +127,22 @@ choice was made with the real constraints in view rather than in advance:
 | Authentication | 25 | JWT bearer tokens via PyJWT, with a trusted identity header allowed only in development |
 | Event streaming | 24 | Server-sent events, no broker. The durable event log is the source of truth, so a dropped connection is recoverable rather than lost |
 | Database tool target | 33 | A separate `DATABASE_TOOL_URL`; unset means the tool is not registered |
+| Metrics and tracing | 27 | A dependency-free metrics registry with a Prometheus endpoint, and OpenTelemetry-format span tracing behind a protocol. No agent or collector is required to run |
+| Control dashboard | 42 | Hand-written HTML, CSS, and JavaScript in the application, not a front-end framework. Three routes, no build step, and no dependency that needs its own supply chain |
+| Container topology | 38 | A two-stage image plus compose; PostgreSQL and Redis as separate services with health gating, migrations applied at start-up |
+| Quality evaluation | 36 | A labelled corpus in the repository with a measured rule-based baseline, so a score is always reported next to a floor |
 
 ## Still open
 
-- Metrics and tracing backends — Phase 27.
-- Container images and compose topology — Phase 38-39, blocked on a host with a
-  container runtime.
-- Frontend framework for the control dashboard — Phase 42.
+No phase remains open. Two things are unwritten rather than undecided, and both
+are stated where they would otherwise be assumed:
+
+- **The container image has never been built.** The files are complete and
+  lint-checked; this host has no container runtime. CI builds it.
+- **The real provider path has never been exercised end to end.** Every suite,
+  and every number in the README, comes from the deterministic fake provider. The
+  adapters for OpenAI and Anthropic are written against the same interface and are
+  covered by unit tests, but "covered by unit tests" and "has made a real call"
+  are different claims.
+- ~~Frontend framework for the control dashboard — Phase 42.~~ Settled: no
+  framework. See the table above.

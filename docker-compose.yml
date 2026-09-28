@@ -1,0 +1,90 @@
+# A local stack: PostgreSQL 18, Redis 8, and the API in front of both.
+#
+# NOTE: this file has not been run. This host has no container runtime, so it is
+# written and lint-checked but unverified. The service names, ports, and health
+# checks match the configuration the application reads, but "matches on paper" is
+# not "works" — build it once before relying on it.
+#
+# The defaults below are for local use. They are deliberately *not* a production
+# configuration, and the application refuses to start in production with them:
+#
+#   * APP_ENV=development allows AUTH_ENABLED=false and the trusted identity
+#     header, both of which the production validator rejects.
+#   * The credentials are literals in version control, which is fine for a
+#     throwaway local database and wrong for anything else.
+#
+# To run it as production, set APP_ENV=production and supply AUTH_ENABLED=true,
+# a real JWT_SECRET, TRUST_IDENTITY_HEADER=false, and secrets from the
+# environment rather than from this file. The validator will refuse to start
+# until every one of them is present.
+
+name: langgraph-multi-agent
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: langgraph
+      POSTGRES_PASSWORD: langgraph
+      POSTGRES_DB: langgraph
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # The application runs migrations on start, so it must not begin until the
+      # server accepts connections rather than merely having a listening socket.
+      test: ["CMD-SHELL", "pg_isready -U langgraph -d langgraph"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  redis:
+    image: redis:8-alpine
+    # Persistence is off: these keys are cache entries, rate-limit counters, and
+    # deduplication markers. Losing them costs some repeated work, never data.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      APP_ENV: development
+      DEBUG: "false"
+      DATABASE_URL: postgresql+asyncpg://langgraph:langgraph@postgres:5432/langgraph
+      REDIS_URL: redis://redis:6379/0
+      CHECKPOINT_BACKEND: postgres
+      AUTH_ENABLED: "false"
+      TRUST_IDENTITY_HEADER: "true"
+      # No isolation boundary exists in this image, so arbitrary code execution
+      # stays off. Enabling it here would be a security decision, not a config
+      # change, and the production validator refuses it for that reason.
+      PYTHON_EXECUTION_ENABLED: "false"
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Migrate before serving. Running it here rather than in the image keeps the
+    # schema change visible at start-up, where a failure is obvious, instead of
+    # hidden in a build step where it can succeed against the wrong database.
+    command:
+      - sh
+      - -c
+      - alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000
+    restart: unless-stopped
+
+volumes:
+  postgres-data:

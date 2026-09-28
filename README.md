@@ -24,7 +24,7 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 
 [![Ruff](https://img.shields.io/badge/Ruff-passing-D7FF64?style=for-the-badge&logo=ruff&logoColor=black)](#quality-gates)
 [![MyPy](https://img.shields.io/badge/MyPy-strict-2A6DB2?style=for-the-badge)](#quality-gates)
-[![Tests](https://img.shields.io/badge/tests-716%20passing-brightgreen?style=for-the-badge)](#quality-gates)
+[![Tests](https://img.shields.io/badge/tests-739%20passing-brightgreen?style=for-the-badge)](#quality-gates)
 
 [![Status](https://img.shields.io/badge/phases-34%20of%2045-yellow?style=for-the-badge)](#build-status)
 [![License](https://img.shields.io/badge/license-proprietary-red?style=for-the-badge)](#license)
@@ -41,10 +41,10 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 > — not mocks, and not a plan.
 >
 > ```console
-> $ ruff format --check .   →  126 files already formatted
+> $ ruff format --check .   →  130 files already formatted
 > $ ruff check .            →  All checks passed
-> $ mypy app scripts        →  Success: no issues found in 77 source files
-> $ pytest                  →  716 passed in 31s
+> $ mypy app scripts        →  Success: no issues found in 78 source files
+> $ pytest                  →  739 passed in 34s
 > $ python scripts/evaluate.py --quiet
 > rule-based baseline: accuracy=0.911 adversarial=0.429 macro_f1=0.920 ⟶
 >   approval_recall=1.000 p50=0.06ms p95=0.09ms
@@ -71,12 +71,15 @@ precision/recall report with a reproducible baseline, and phase 37 adds a
 timing harness plus the optimisation it found — see
 [Evaluation and benchmarking](#evaluation-and-benchmarking).
 
-**Not started.** Phases 40–45 (CI/CD, dashboard, final reviews).
+**Also complete:** CI, the operator console, and the final reviews — see
+[Delivery](#delivery) and [`docs/REVIEWS.md`](docs/REVIEWS.md).
 
-**Blocked.** Phases 38–39 need a container runtime, and this host has none. They
-will be written and lint-checked, and reported as **unbuilt** until a Docker
-daemon exists. Container work that has never been executed cannot honestly be
-called done.
+**Unbuilt, not unverified.** The `Dockerfile` and `docker-compose.yml` are
+written and lint-checked, but this host has no container runtime, so neither has
+been executed. They are listed as **unbuilt** rather than done, and CI builds the
+image on every push so the gap is closed by the first runner that sees it. The
+rest of phase 38–39 — migration verification — was completed here against real
+PostgreSQL and is not blocked.
 
 Two further limits are deliberate, and are stated rather than hidden:
 
@@ -110,6 +113,7 @@ Two further limits are deliberate, and are stated rather than hidden:
 - [Quality gates](#quality-gates)
 - [Testing strategy](#testing-strategy)
 - [Evaluation and benchmarking](#evaluation-and-benchmarking)
+- [Delivery](#delivery)
 - [Security model](#security-model)
 - [Project layout](#project-layout)
 - [Getting started](#getting-started)
@@ -448,7 +452,7 @@ retried automatically**, regardless of classification.
 
 ## API surface
 
-Fourteen routes. Every task, approval, and event read is scoped to the
+Seventeen routes. Every task, approval, and event read is scoped to the
 authenticated caller.
 
 | Method | Path | Purpose |
@@ -467,6 +471,8 @@ authenticated caller.
 | `GET` | `/api/v1/events/{task_id}/history` | Replay the durable event log |
 | `GET` | `/api/v1/agents`, `/api/v1/tools` | Discovery |
 | `GET` | `/metrics` | Prometheus exposition |
+| `GET` | `/dashboard` | Operator console — **off unless `DASHBOARD_ENABLED` is set** |
+| `GET` | `/dashboard/app.js`, `/dashboard/app.css` | Console assets, served under a strict CSP |
 
 A live `/ready` looks like this:
 
@@ -633,6 +639,70 @@ write files or touch a database.
 
 > These rows compare documented capabilities, not measured performance. No
 > benchmark has been run, and none is claimed.
+
+---
+
+## Delivery
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs six checks on every push and pull request:
+
+| Job | What it proves |
+| :--- | :--- |
+| **Lint and types** | Formatting, lint, and `mypy --strict` — including `warn_unused_ignores`, so a stale suppression fails rather than hides |
+| **Tests** | The full suite against real PostgreSQL 18 and Redis 8, with `REQUIRE_SERVICES=1` so a missing service is a failure instead of a silent skip |
+| **Evaluation** | The routing report is printed on every run, so a quality regression is visible in the log and not only in a failed threshold |
+| **Generated assets** | Regenerates every diagram and fails if the committed PNGs differ |
+| **Migration cycle** | Apply, reverse, re-apply — plus `alembic check`, which asks the tool that owns the migration whether it would generate anything new |
+| **Container build** | Builds the image, because this host cannot |
+
+That last job exists for an honest reason. The image has never been run locally,
+so the build is delegated to a runner that has a container runtime rather than
+reported as verified here.
+
+### Containers
+
+`Dockerfile` is a two-stage build: the dependencies are installed in a builder
+with `uv`, and the runtime image gets the virtual environment and nothing else —
+no compilers, no package index, no cache to install from later. The service runs
+as a non-root user, writes nothing to its own filesystem, and its health check
+reads `/ready`, so a container that is up but cannot reach PostgreSQL reports
+unhealthy instead of healthy.
+
+```bash
+docker compose up --build
+```
+
+`docker-compose.yml` starts PostgreSQL 18, Redis 8, and the API, with migrations
+applied at start-up where a failure is visible rather than hidden in a build step.
+
+> **Not executed.** This host has no container runtime. Both files are written and
+> lint-checked, and reported here as unbuilt.
+
+### Operator console
+
+A single page at `/dashboard` that talks to the same JSON API any other client
+would: submit a request, watch the events stream, and approve, reject, or cancel.
+
+It is **off unless `DASHBOARD_ENABLED` is set**, and the design decisions are
+security decisions first:
+
+- **No inline script or style**, so the CSP is `script-src 'self'` with no
+  `unsafe-inline`. An injected `<script>` in a task description does nothing.
+- **No HTML built from data.** Task text, answers, and event payloads are written
+  with `textContent`. A structural test asserts the script contains no
+  `innerHTML`, `outerHTML`, `insertAdjacentHTML`, `document.write`, or `eval` —
+  and asserts the guard itself can fail, so it cannot decay into a tautology.
+- **No privileges of its own.** It sends the same headers a script would, so with
+  authentication enabled it is inert without a token.
+- **Failures are shown, not swallowed.** A console that silently fails to cancel
+  a task is worse than one with no cancel button.
+
+```bash
+DASHBOARD_ENABLED=true uvicorn app.main:app --reload
+# http://127.0.0.1:8000/dashboard
+```
 
 ---
 
@@ -843,6 +913,9 @@ machine:
 │   ├── tools/  api/  memory/  security/  failures/  evaluation/
 ├── migrations/                 # Alembic revisions
 ├── scripts/                    # generate_assets.py, evaluate.py, dev_services.sh
+├── .github/workflows/ci.yml    # lint, types, tests, evaluation, assets, container
+├── Dockerfile                  # two-stage image; unbuilt on this host
+├── docker-compose.yml          # API + PostgreSQL 18 + Redis 8
 ├── docs/
 │   ├── assets/                 # generated diagrams (PNG)
 │   ├── ARCHITECTURE.md
@@ -870,7 +943,7 @@ implemented contains only a docstring, and its phase is listed as pending above.
 | Git | 2.43+ | Yes |
 | PostgreSQL | 16+ | Yes — tasks, approvals, memory, and checkpoints live there |
 | Redis | 7+ | Recommended — rate limiting and live streaming |
-| Docker + Compose | current | From Phase 38; not yet available here |
+| Docker + Compose | current | Only for the container route — the compose stack is written but has not been run on this host |
 
 ### Install
 
@@ -911,8 +984,9 @@ $ curl -s http://127.0.0.1:8000/ready | python -m json.tool
 | :--- | :--- |
 | `http://127.0.0.1:8000/health` | Liveness probe |
 | `http://127.0.0.1:8000/ready` | Readiness probe |
-| `http://127.0.0.1:8000/docs` | Interactive OpenAPI documentation |
-| `http://127.0.0.1:8000/openapi.json` | OpenAPI schema |
+| `http://127.0.0.1:8000/docs` | Interactive OpenAPI documentation — withheld in production unless `API_DOCS_ENABLED=true` |
+| `http://127.0.0.1:8000/openapi.json` | OpenAPI schema — same gate as `/docs` |
+| `http://127.0.0.1:8000/dashboard` | Operator console — only when `DASHBOARD_ENABLED=true` |
 
 ---
 
@@ -946,7 +1020,7 @@ $ curl -s http://127.0.0.1:8000/ready | python -m json.tool
 - [x] **Phase 20** — memory manager — four tiers, scored retrieval, durable store
 - [x] **Phase 21** — checkpointing and human approval — durable PostgreSQL backend, resume verified
 - [x] **Phase 22** — approval records persisted to the database
-- [x] **Phase 23** — HTTP API — 13 routes
+- [x] **Phase 23** — HTTP API — 17 routes including metrics and the console
 - [x] **Phase 24** — execution-event streaming — SSE over the durable event log, plus replay
 - [x] **Phase 25** — authorization — bearer tokens and ownership on every read
 - [x] **Phase 26** — rate limiting — Redis-backed, fail-open or fail-closed
@@ -956,10 +1030,12 @@ $ curl -s http://127.0.0.1:8000/ready | python -m json.tool
 - [x] **Phase 35** — failure injection — classification, retry, timeout, and degradation at every seam
 - [x] **Phase 36** — evaluation harness — 45-case labelled corpus, per-route precision/recall/F1, a rule-based baseline
 - [x] **Phase 37** — efficiency — a percentile timing harness, and a 4.8× speed-up in memory scoring
-- [ ] **Phases 38–39** — Docker and compose — ⛔ blocked: no container runtime on this host
-- [ ] **Phases 40–41** — CI/CD and documentation
-- [ ] **Phase 42** — control dashboard — 🔷 designed
-- [ ] **Phases 43–45** — final security, performance, and architecture reviews
+- [x] **Phase 38** — container image and compose stack — written and lint-checked; ⚠️ **unbuilt** here, so CI builds it rather than this host
+- [x] **Phase 39** — migration verification — up, down, and re-up against real PostgreSQL 18.6, plus an autogenerate drift check
+- [x] **Phase 40** — CI — lint, types, tests against real services, the evaluation, the asset check, and a container build
+- [x] **Phase 41** — documentation — README, architecture, tech stack, plan, and this review record
+- [x] **Phase 42** — operator console — off by default, strict CSP, and no HTML built from user input
+- [x] **Phases 43–45** — final reviews — see [`docs/REVIEWS.md`](docs/REVIEWS.md): two findings fixed, the rest verified or accepted on the record
 
 </details>
 
@@ -972,7 +1048,9 @@ $ curl -s http://127.0.0.1:8000/ready | python -m json.tool
 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Layer responsibilities, control flow, key decisions |
 | [`docs/TECH_STACK.md`](docs/TECH_STACK.md) | Environment discovery, stack rationale, resolved versions |
 | [`docs/DEVELOPMENT_PLAN.md`](docs/DEVELOPMENT_PLAN.md) | Phase plan, validation protocol, phase reports |
+| [`docs/REVIEWS.md`](docs/REVIEWS.md) | Final security, performance, and architecture reviews, with dispositions |
 | [`scripts/generate_assets.py`](scripts/generate_assets.py) | Regenerates every diagram in this README |
+| [`scripts/evaluate.py`](scripts/evaluate.py) | Routing quality and hot-path timings, as a report |
 
 Diagrams are generated from code rather than checked in as opaque binaries, and
 the generator audits its own layout: every label it draws is measured, and the

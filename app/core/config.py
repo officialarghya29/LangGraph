@@ -140,6 +140,26 @@ class Settings(BaseSettings):
     #: outcome — but a security-sensitive deployment should turn it on.
     rate_limit_fail_closed: bool = False
 
+    # --- API documentation ------------------------------------------------ #
+    # ``None`` means "decide from the environment": served outside production,
+    # withheld inside it. The OpenAPI schema is an inventory of every route,
+    # every field, and every error shape; that is a convenience while building
+    # against the API and a map of the attack surface once it is deployed.
+    # Setting this explicitly wins either way, so a deployment that deliberately
+    # fronts its docs with an authenticating gateway can still expose them.
+    api_docs_enabled: bool | None = None
+
+    # --- Operator console -------------------------------------------------- #
+    # Off by default, and deliberately so. The page it serves renders task text
+    # from the database and carries approve, reject, and cancel buttons: anyone
+    # who can reach it can drive the system. "Off unless asked for" is the only
+    # defensible default for a control surface, so local development opts in and
+    # a deployment has to make the same decision knowingly.
+    #
+    # Enabling it does not widen the API. The page authenticates exactly like any
+    # other client, so with ``auth_enabled`` set it is inert without a token.
+    dashboard_enabled: bool = False
+
     # --- Filesystem tool --------------------------------------------------- #
     # Comma-separated in the environment; exposed as resolved paths.
     filesystem_allowed_roots: str = "./workspace"
@@ -186,6 +206,18 @@ class Settings(BaseSettings):
     def is_production(self) -> bool:
         """Return whether the application is running in production."""
         return self.app_env == "production"
+
+    @property
+    def serve_api_docs(self) -> bool:
+        """Return whether ``/docs`` and ``/openapi.json`` are served.
+
+        Returns:
+            The explicit setting when one was given, otherwise ``True`` outside
+            production and ``False`` inside it.
+        """
+        if self.api_docs_enabled is not None:
+            return self.api_docs_enabled
+        return self.app_env != "production"
 
     @property
     def allowed_roots(self) -> tuple[Path, ...]:

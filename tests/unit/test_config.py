@@ -112,6 +112,33 @@ def test_is_production() -> None:
     assert make_settings().is_production is False
 
 
+def test_api_docs_are_served_outside_production() -> None:
+    """While building against the API, the schema is a convenience."""
+    assert make_settings(app_env="development").serve_api_docs is True
+    assert make_settings(app_env="staging").serve_api_docs is True
+
+
+def test_api_docs_are_withheld_in_production_by_default() -> None:
+    """Deployed, the schema describes the attack surface, not the product."""
+    assert safe_production().serve_api_docs is False
+
+
+def test_api_docs_can_be_enabled_explicitly_in_any_environment() -> None:
+    """A deployment that fronts its docs with a gateway can still expose them."""
+    assert safe_production(api_docs_enabled=True).serve_api_docs is True
+    assert make_settings(app_env="development", api_docs_enabled=False).serve_api_docs is False
+
+
+def test_the_operator_console_is_off_unless_it_is_asked_for() -> None:
+    """A control surface must not be one environment variable away from live.
+
+    The default is the shipped behaviour, so it is asserted directly rather than
+    inferred from whatever the developer's ``.env`` happens to contain.
+    """
+    assert make_settings().dashboard_enabled is False
+    assert make_settings(dashboard_enabled=True).dashboard_enabled is True
+
+
 # --------------------------------------------------------------------------- #
 # Production safety
 # --------------------------------------------------------------------------- #

@@ -1,0 +1,202 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push supersedes the run in flight. Nothing here inspects history, so
+# finishing a superseded run only spends minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  # ------------------------------------------------------------------------- #
+  # Static checks: formatting, lint, and types
+  # ------------------------------------------------------------------------- #
+  quality:
+    name: Lint and types
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      - name: Install
+        run: |
+          uv venv
+          uv pip install -e ".[dev]"
+
+      - name: Formatting
+        run: .venv/bin/ruff format --check .
+
+      - name: Lint
+        run: .venv/bin/ruff check .
+
+      # Strict mode with warn_unreachable and warn_unused_ignores, so a stale
+      # suppression fails the build instead of quietly hiding a real error.
+      - name: Types
+        run: .venv/bin/mypy app scripts
+
+  # ------------------------------------------------------------------------- #
+  # The suite, against real PostgreSQL and real Redis
+  # ------------------------------------------------------------------------- #
+  test:
+    name: Tests
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: langgraph
+          POSTGRES_PASSWORD: langgraph
+          POSTGRES_DB: langgraph
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U langgraph"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      DATABASE_URL: postgresql+asyncpg://langgraph:langgraph@127.0.0.1:5432/langgraph
+      REDIS_URL: redis://127.0.0.1:6379/0
+      APP_ENV: development
+      AUTH_ENABLED: "false"
+      CHECKPOINT_BACKEND: postgres
+      # Turns "service unavailable" from a skip into a failure. Without it the
+      # suite would pass here while testing nothing.
+      REQUIRE_SERVICES: "1"
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      - name: Install
+        run: |
+          uv venv
+          uv pip install -e ".[dev]"
+
+      # Runs the migration CLI the way an operator would, against a database the
+      # test fixtures have not touched. The suite builds and migrates its own
+      # throwaway database, so without this step a broken alembic.ini would only
+      # be caught by whoever next ran a deploy.
+      - name: Migrations apply to an empty database
+        run: .venv/bin/alembic upgrade head
+
+      # Alembic's own autogenerate comparison. This is a second, independent
+      # check that the models and the migrations describe one schema: the suite
+      # in tests/integration/test_migration_drift.py inspects the catalogue
+      # directly, and this asks the tool that owns the migration whether it would
+      # generate anything new.
+      - name: The models and the migrations agree
+        run: .venv/bin/alembic check
+
+      - name: Migrations reverse cleanly
+        run: |
+          .venv/bin/alembic downgrade base
+          .venv/bin/alembic upgrade head
+
+      - name: Tests
+        run: .venv/bin/python -m pytest -q
+
+  # ------------------------------------------------------------------------- #
+  # Routing quality and hot-path timings
+  # ------------------------------------------------------------------------- #
+  evaluation:
+    name: Evaluation
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      - name: Install
+        run: |
+          uv venv
+          uv pip install -e ".[dev]"
+
+      # The report is printed on every run so a regression is visible in the log
+      # rather than only in a failed test. The score itself is asserted by
+      # tests/evaluation/, which is where a threshold belongs.
+      - name: Report
+        run: .venv/bin/python scripts/evaluate.py --iterations 100
+
+  # ------------------------------------------------------------------------- #
+  # The committed diagrams must match the script that generates them
+  # ------------------------------------------------------------------------- #
+  assets:
+    name: Generated assets
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      - name: Install
+        run: |
+          uv venv
+          uv pip install -e ".[assets]"
+
+      # The asset script audits its own layout and exits non-zero on overlapping
+      # or overflowing labels, so this step fails for a drawing defect as well as
+      # for a stale PNG.
+      - name: Regenerate
+        run: .venv/bin/python scripts/generate_assets.py
+
+      - name: The committed PNGs are current
+        run: |
+          if ! git diff --quiet -- docs/assets; then
+            echo "docs/assets is out of date; run scripts/generate_assets.py and commit the result" >&2
+            git --no-pager diff --stat -- docs/assets
+            exit 1
+          fi
+
+  # ------------------------------------------------------------------------- #
+  # The image must build. It is never run here.
+  # ------------------------------------------------------------------------- #
+  container:
+    name: Container build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
