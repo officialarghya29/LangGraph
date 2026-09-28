@@ -33,7 +33,8 @@ import math
 import re
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Sequence, Set
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -51,6 +52,7 @@ __all__ = [
     "MemoryStore",
     "PostgresMemoryStore",
     "build_memory_manager",
+    "score_candidate",
 ]
 
 _WORD_PATTERN = re.compile(r"[a-z0-9]+")
@@ -106,21 +108,45 @@ def _tokens(text: str) -> set[str]:
     return {word for word in _WORD_PATTERN.findall(text.lower()) if word not in _STOP_WORDS}
 
 
-def _cosine(left: Sequence[float], right: Sequence[float]) -> float:
+def _vector_norm(vector: Sequence[float]) -> float:
+    """Return the Euclidean norm of ``vector``."""
+    return math.sqrt(sum(value * value for value in vector))
+
+
+def _cosine(embedding: Sequence[float], other: Sequence[float]) -> float:
     """Return cosine similarity, or ``0.0`` when it is undefined.
 
     Returns the negative part clipped to zero: two vectors pointing in opposite
     directions are unrelated for retrieval purposes, and letting a negative score
     through would let anti-correlated text displace genuinely relevant text.
     """
-    if len(left) != len(right) or not left:
+    return _cosine_prepared(embedding, _vector_norm(embedding), other)
+
+
+def _cosine_prepared(
+    embedding: Sequence[float], embedding_norm: float, other: Sequence[float]
+) -> float:
+    """Return cosine similarity when one side's norm is already known.
+
+    The query embedding is the same for every candidate in a scan, so its norm
+    is computed once and passed in rather than recomputed per row.
+
+    Args:
+        embedding: The first vector.
+        embedding_norm: The Euclidean norm of ``embedding``.
+        other: The second vector.
+
+    Returns:
+        Similarity in the range 0.0 to 1.0, or ``0.0`` when it is undefined —
+        mismatched dimensions, an empty vector, or a zero norm.
+    """
+    if len(embedding) != len(other) or not embedding:
         return 0.0
-    dot = sum(a * b for a, b in zip(left, right, strict=True))
-    left_norm = math.sqrt(sum(a * a for a in left))
-    right_norm = math.sqrt(sum(b * b for b in right))
-    if left_norm == 0.0 or right_norm == 0.0:
+    other_norm = _vector_norm(other)
+    if embedding_norm == 0.0 or other_norm == 0.0:
         return 0.0
-    return max(0.0, dot / (left_norm * right_norm))
+    dot = sum(a * b for a, b in zip(embedding, other, strict=True))
+    return max(0.0, dot / (embedding_norm * other_norm))
 
 
 def _jaccard(left: str, right: str) -> float:
@@ -130,10 +156,92 @@ def _jaccard(left: str, right: str) -> float:
     configured is still worth finding, and scoring it at zero would make it
     permanently invisible instead of merely ranked lower.
     """
-    left_tokens, right_tokens = _tokens(left), _tokens(right)
-    if not left_tokens or not right_tokens:
+    return _jaccard_tokens(frozenset(_tokens(left)), _tokens(right))
+
+
+def _jaccard_tokens(left: frozenset[str], right: Set[str]) -> float:
+    """Return overlap between two pre-tokenised sets.
+
+    Split out from :func:`_jaccard` so the query side can be tokenised once per
+    scan instead of once per candidate.
+    """
+    if not left or not right:
         return 0.0
-    return len(left_tokens & right_tokens) / len(left_tokens | right_tokens)
+    return len(left & right) / len(left | right)
+
+
+@dataclass(frozen=True, slots=True)
+class _QueryContext:
+    """The parts of a query that do not change as candidates are scored.
+
+    Tokenising the query text, taking the norm of its embedding, and reading the
+    clock are each invariant across a scan. Retrieval scans up to
+    ``memory_scan_limit`` rows, so leaving them inside the per-row loop turns a
+    constant amount of work into linear work for no gain. This holds them so the
+    loop body only does the part that genuinely differs per candidate.
+    """
+
+    text: str
+    tokens: frozenset[str]
+    vector: tuple[float, ...] | None
+    norm: float
+    now: datetime
+
+
+def _prepare_query(
+    text: str, embedding: Sequence[float] | None, *, now: datetime | None = None
+) -> _QueryContext:
+    """Return the invariant scoring context for a query.
+
+    Args:
+        text: The query text.
+        embedding: The query embedding, or ``None`` when embeddings are absent.
+        now: The instant to measure recency against. Injectable so tests can pin
+            the clock instead of tolerating drift.
+
+    Returns:
+        A context reusable across every candidate of this query.
+    """
+    vector = tuple(embedding) if embedding else None
+    return _QueryContext(
+        text=text,
+        tokens=frozenset(_tokens(text)),
+        vector=vector,
+        norm=_vector_norm(vector) if vector else 0.0,
+        now=now or datetime.now(UTC),
+    )
+
+
+def score_candidate(
+    context: _QueryContext, item: MemoryItem, embedding: Sequence[float] | None
+) -> float:
+    """Blend similarity, importance, and recency into one comparable score.
+
+    Args:
+        context: The prepared query context. May be reused across candidates.
+        item: The stored memory being scored.
+        embedding: The candidate's embedding, or ``None`` when it has none.
+
+    Returns:
+        A score comparable only against other scores from the same context.
+    """
+    if context.vector is not None and embedding is not None:
+        similarity = _cosine_prepared(context.vector, context.norm, embedding)
+    else:
+        # One side has no vector. Lexical overlap is a weaker signal than cosine
+        # similarity, so it is discounted rather than treated as equivalent.
+        similarity = 0.8 * _jaccard_tokens(context.tokens, _tokens(item.content))
+
+    age_days = max(0.0, (context.now - item.created_at).total_seconds() / 86_400)
+    # Annotated because ``float.__pow__`` is typed as returning ``Any``: an
+    # exponent may produce a complex number for some operand combinations.
+    recency: float = 0.5 ** (age_days / _RECENCY_HALF_LIFE_DAYS)
+
+    return (
+        _SIMILARITY_WEIGHT * similarity
+        + _IMPORTANCE_WEIGHT * item.importance
+        + _RECENCY_WEIGHT * recency
+    )
 
 
 def estimate_importance(content: str, *, base: float = 0.5) -> float:
@@ -569,25 +677,12 @@ class MemoryManager:
         embedding: list[float] | None,
         query_embedding: list[float] | None,
     ) -> float:
-        """Blend similarity, importance, and recency into one comparable score."""
-        if query_embedding is not None and embedding is not None:
-            similarity = _cosine(query_embedding, embedding)
-        else:
-            # One side has no vector. Lexical overlap is a weaker signal than
-            # cosine similarity, so it is discounted rather than treated as
-            # equivalent.
-            similarity = 0.8 * _jaccard(query.text, item.content)
+        """Score one candidate.
 
-        age_days = max(0.0, (datetime.now(UTC) - item.created_at).total_seconds() / 86_400)
-        # Annotated because ``float.__pow__`` is typed as returning ``Any``: an
-        # exponent may produce a complex number for some operand combinations.
-        recency: float = 0.5 ** (age_days / _RECENCY_HALF_LIFE_DAYS)
-
-        return (
-            _SIMILARITY_WEIGHT * similarity
-            + _IMPORTANCE_WEIGHT * item.importance
-            + _RECENCY_WEIGHT * recency
-        )
+        Kept for callers scoring a single row; :meth:`recall` uses
+        :func:`score_candidate` directly so the query is prepared once.
+        """
+        return score_candidate(_prepare_query(query.text, query_embedding), item, embedding)
 
     async def recall(self, query: MemoryQuery) -> list[MemoryItem]:
         """Return the memories most relevant to a query, best first.
@@ -608,9 +703,11 @@ class MemoryManager:
             return []
 
         query_embedding = await self._embed(query.text)
+        # One tokenisation, one vector norm, and one clock reading for the whole
+        # scan: all three are properties of the query, not of the candidate.
+        context = _prepare_query(query.text, query_embedding)
         scored = [
-            (self._score(query, item, embedding, query_embedding), item)
-            for item, embedding in candidates
+            (score_candidate(context, item, embedding), item) for item, embedding in candidates
         ]
         scored.sort(key=lambda pair: pair[0], reverse=True)
 

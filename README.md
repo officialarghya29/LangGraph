@@ -24,7 +24,7 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 
 [![Ruff](https://img.shields.io/badge/Ruff-passing-D7FF64?style=for-the-badge&logo=ruff&logoColor=black)](#quality-gates)
 [![MyPy](https://img.shields.io/badge/MyPy-strict-2A6DB2?style=for-the-badge)](#quality-gates)
-[![Tests](https://img.shields.io/badge/tests-672%20passing-brightgreen?style=for-the-badge)](#quality-gates)
+[![Tests](https://img.shields.io/badge/tests-716%20passing-brightgreen?style=for-the-badge)](#quality-gates)
 
 [![Status](https://img.shields.io/badge/phases-34%20of%2045-yellow?style=for-the-badge)](#build-status)
 [![License](https://img.shields.io/badge/license-proprietary-red?style=for-the-badge)](#license)
@@ -41,10 +41,14 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 > — not mocks, and not a plan.
 >
 > ```console
-> $ ruff format --check .   →  110 files already formatted
+> $ ruff format --check .   →  126 files already formatted
 > $ ruff check .            →  All checks passed
-> $ mypy app scripts        →  Success: no issues found in 70 source files
-> $ pytest                  →  672 passed in 46s
+> $ mypy app scripts        →  Success: no issues found in 77 source files
+> $ pytest                  →  716 passed in 31s
+> $ python scripts/evaluate.py --quiet
+> rule-based baseline: accuracy=0.911 adversarial=0.429 macro_f1=0.920 ⟶
+>   approval_recall=1.000 p50=0.06ms p95=0.09ms
+> memory scoring over 500 candidates: 4.84x faster than baseline
 > ```
 
 **Complete and verified (phases 0–33).** Typed configuration; the LLM and
@@ -57,15 +61,17 @@ the database; the four-tier memory manager; the HTTP API with ownership enforced
 on every read, bearer-token authentication, rate limiting, and server-sent event
 streaming over a durable event log.
 
-**Complete and verified (phases 0–35).** Phase 27 adds a metrics registry with a
+**Complete and verified (phases 0–37).** Phase 27 adds a metrics registry with a
 Prometheus `/metrics` endpoint, per-route request counts and latency histograms,
-task-outcome counters, and span tracing over the run. Phase 28–33 harden each
+task-outcome counters, and span tracing over the run. Phases 28–33 harden each
 tool at its own boundary; phase 34 asserts those boundaries as a matrix; phase 35
 injects faults at every seam and checks that failures are contained and visible
-rather than hidden.
+rather than hidden. Phase 36 adds a labelled routing corpus and a
+precision/recall report with a reproducible baseline, and phase 37 adds a
+timing harness plus the optimisation it found — see
+[Evaluation and benchmarking](#evaluation-and-benchmarking).
 
-**Not started.** Phases 36–37 (evaluation harness, efficiency work), 40–45
-(CI/CD, dashboard, final reviews).
+**Not started.** Phases 40–45 (CI/CD, dashboard, final reviews).
 
 **Blocked.** Phases 38–39 need a container runtime, and this host has none. They
 will be written and lint-checked, and reported as **unbuilt** until a Docker
@@ -103,6 +109,7 @@ Two further limits are deliberate, and are stated rather than hidden:
 - [How it compares](#how-it-compares)
 - [Quality gates](#quality-gates)
 - [Testing strategy](#testing-strategy)
+- [Evaluation and benchmarking](#evaluation-and-benchmarking)
 - [Security model](#security-model)
 - [Project layout](#project-layout)
 - [Getting started](#getting-started)
@@ -671,6 +678,7 @@ one is failing.
 | **Graph** | Simple, complex, parallel, critic pass/fail, retry, replan, approval, rejection, resume, recovery | The real compiled graph against deterministic fake providers |
 | **API** | Health, readiness, chat, task creation, status, approve, reject, cancel, events, discovery | FastAPI test client, with durability read back over a separate connection |
 | **Security** | Path traversal, prompt injection, unauthorised tools, cross-user access, SSRF, unsafe SQL, secret leakage | Adversarial cases |
+| **Evaluation** | Routing quality against a labelled corpus, and the hot-path timings | Per-route precision and recall, a rule-based baseline, and a percentile timing harness |
 | **Assets** | The generated diagrams | An audit that measures every drawn label and fails on overlap or overflow |
 
 Two testing decisions are worth calling out, because both were found by getting
@@ -687,6 +695,106 @@ them wrong first:
 
 All LLM calls are replaced by deterministic fakes in unit and graph tests, so the
 suite runs offline and produces stable results.
+
+---
+
+## Evaluation and benchmarking
+
+A test suite answers "does this still hold?" It cannot answer "is this any good?"
+Those are different questions, and conflating them is how a system accumulates
+hundreds of green tests and no idea whether it improved. So correctness lives in
+`pytest`, and quality lives in an evaluation that can be re-run and compared.
+
+```bash
+python scripts/evaluate.py                 # the full report
+python scripts/evaluate.py --json out.json # the same numbers, machine-readable
+```
+
+### Why accuracy is not the headline
+
+The router picks one of seven routes. Six of them are rare relative to the
+others, so a router that answered `direct` to everything would look respectable
+on a blended average while being useless for every request that mattered. Three
+choices follow from that:
+
+- **Precision, recall, and F1 are reported per route.** A route that is never
+  selected has a precision of zero, and that is stated rather than hidden behind
+  a mean.
+- **Macro F1, not micro.** Averaging over cases would let the common routes carry
+the score. Averaging over *routes* means one broken route is one seventh of the
+headline, whether it is 30% of the traffic or 3%.
+- **Approval is measured separately, on the flag rather than the route.** Missing
+  an approval gate destroys data; picking the wrong specialist wastes work. A
+  single accuracy number treats those as the same size of mistake, and they are
+  not the same size of mistake.
+
+### Why the corpus is split in two
+
+The 45 labelled cases fall into a **core** set — the ordinary shapes a router must
+handle — and an **adversarial** set where the surface wording points the wrong
+way: a destructive verb inside a question, statistics vocabulary in a request for
+code, a design question with no jargon at all.
+
+They are scored separately because a blended number lets excellence on easy
+shapes pay for weakness on hard ones. A corpus the baseline already saturates
+also has no room left to detect a regression, which is precisely the trap: an
+evaluation that only ever reports 100% is not measuring anything.
+
+### The baseline, and why it is in the repo
+
+`RuleBasedRouter` is part of the shipped code, not test scaffolding. It encodes
+the same guidance the model router is given, resolves irreversible requests
+first, and guards against the commonest keyword false positive — a destructive
+verb describing what a *test* does rather than asking for a change.
+
+It is here because a score needs a floor. It is measured, not assumed:
+
+| Metric | Value | Reading |
+| :--- | ---: | :--- |
+| Accuracy | 0.911 | 41 of 45 cases |
+| Core accuracy | 1.000 | every ordinary shape is handled |
+| Adversarial accuracy | 0.429 | 3 of 7 — the headroom a model has to earn |
+| Approval recall | 1.000 | no irreversible request is ever left ungated |
+| Approval precision | < 1.000 | it over-gates: "how do I delete a row?" reads as a request to delete one |
+| Latency | p50 0.06 ms | the cost a model router has to justify |
+
+The four failures are recorded by name in the test suite. If a later change fixes
+one, the test fails and says so, rather than letting a number in this table go
+quietly stale.
+
+### What the benchmark found
+
+The timing harness reports percentiles rather than a single delta, disables
+cyclic GC for the measured region so an unrelated collection cannot land inside a
+sample, and pairs the two implementations in one process so the ratio does not
+depend on how fast the host is.
+
+Scoring a candidate memory needs three things that do not vary across a scan: the
+tokenisation of the query, the norm of the query embedding, and the current time.
+All three were being recomputed for every row. Hoisting them out of the loop
+makes scoring **4.8× faster** over a 500-candidate scan — 10.3 ms down to 2.2 ms
+— and the harness asserts the change is *equivalent* as well as faster: scores
+agree to within `1e-6`, and the best-scoring memory is unchanged.
+
+That tolerance is not a fudge. Reading the clock once instead of once per
+candidate shifts each recency term by about a nanosecond, which is four orders of
+magnitude below the smallest score gap a ranking could depend on. Exact equality
+would have reported a false alarm and, worse, taught everyone to ignore the
+check. Two embeddings in the sample data are *exactly* tied by construction, so
+the harness also refuses to assert an order between tied rows — the contract is
+about the ranking, not about which of two equal rows came first.
+
+Measured on the development host, with budgets in the test suite set an order of
+magnitude above these so they fail on a real regression rather than on a busy
+machine:
+
+| Operation | Mean | Throughput |
+| :--- | ---: | ---: |
+| Tokenise a request | 0.012 ms | ~81,000/s |
+| Estimate importance | 0.025 ms | ~41,000/s |
+| Prepare a query context | 0.018 ms | ~55,000/s |
+| Score 500 candidates (vectors) | 2.15 ms | ~465/s |
+| Score 500 candidates (lexical fallback) | 3.37 ms | ~297/s |
 
 ---
 
@@ -728,12 +836,13 @@ suite runs offline and produces stable results.
 │   ├── schemas/                # requests, responses, plans, events
 │   ├── services/               # llm, embeddings, execution, memory, cache, task_store
 │   ├── database/               # connection, models, repositories, sql_executor
+│   ├── evaluation/             # corpus, metrics, harness, benchmarks
 │   └── observability/          # tracing, metrics, events
 ├── tests/
 │   ├── unit/  integration/  graph/  agents/
-│   ├── tools/  api/  memory/
+│   ├── tools/  api/  memory/  security/  failures/  evaluation/
 ├── migrations/                 # Alembic revisions
-├── scripts/                    # generate_assets.py, dev_services.sh
+├── scripts/                    # generate_assets.py, evaluate.py, dev_services.sh
 ├── docs/
 │   ├── assets/                 # generated diagrams (PNG)
 │   ├── ARCHITECTURE.md
@@ -845,7 +954,8 @@ $ curl -s http://127.0.0.1:8000/ready | python -m json.tool
 - [x] **Phases 28–33** — prompt injection, SSRF, filesystem, execution sandbox, database and GitHub hardening
 - [x] **Phase 34** — security test matrix — path resolution, SSRF, per-tool policy, approval gating
 - [x] **Phase 35** — failure injection — classification, retry, timeout, and degradation at every seam
-- [ ] **Phases 36–37** — evaluation harness, efficiency
+- [x] **Phase 36** — evaluation harness — 45-case labelled corpus, per-route precision/recall/F1, a rule-based baseline
+- [x] **Phase 37** — efficiency — a percentile timing harness, and a 4.8× speed-up in memory scoring
 - [ ] **Phases 38–39** — Docker and compose — ⛔ blocked: no container runtime on this host
 - [ ] **Phases 40–41** — CI/CD and documentation
 - [ ] **Phase 42** — control dashboard — 🔷 designed

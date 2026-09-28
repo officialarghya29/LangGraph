@@ -69,8 +69,8 @@ NEXT PHASE:
 | 28-33 | Prompt injection, SSRF, filesystem, sandbox, database and GitHub policy | **Complete** — enforced per tool, not per call site |
 | 34 | Security test matrix | **Complete** — path resolution, SSRF, per-tool policy, and approval gating asserted as a matrix |
 | 35 | Failure injection | **Complete** — 24 tests injecting faults at every seam: classification, retry, timeout, and degradation |
-| 36 | Evaluation harness | Not started |
-| 37 | Efficiency and optimization | Not started |
+| 36 | Evaluation harness | **Complete** — a 45-case labelled corpus split into core and adversarial sets, per-route precision/recall/F1, and a measured rule-based baseline |
+| 37 | Efficiency and optimization | **Complete** — a percentile timing harness with budget assertions, and a 4.8× speed-up in memory scoring |
 | 38-39 | Docker, migration verification | Blocked — no Docker on host |
 | 40-45 | CI/CD, documentation, dashboard, final reviews | Not started |
 
