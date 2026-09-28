@@ -24,7 +24,7 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 
 [![Ruff](https://img.shields.io/badge/Ruff-passing-D7FF64?style=for-the-badge&logo=ruff&logoColor=black)](#quality-gates)
 [![MyPy](https://img.shields.io/badge/MyPy-strict-2A6DB2?style=for-the-badge)](#quality-gates)
-[![Tests](https://img.shields.io/badge/tests-592%20passing-brightgreen?style=for-the-badge)](#quality-gates)
+[![Tests](https://img.shields.io/badge/tests-672%20passing-brightgreen?style=for-the-badge)](#quality-gates)
 
 [![Status](https://img.shields.io/badge/phases-34%20of%2045-yellow?style=for-the-badge)](#build-status)
 [![License](https://img.shields.io/badge/license-proprietary-red?style=for-the-badge)](#license)
@@ -43,8 +43,8 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 > ```console
 > $ ruff format --check .   →  110 files already formatted
 > $ ruff check .            →  All checks passed
-> $ mypy app scripts        →  Success: no issues found in 71 source files
-> $ pytest                  →  592 passed in 30s
+> $ mypy app scripts        →  Success: no issues found in 70 source files
+> $ pytest                  →  672 passed in 46s
 > ```
 
 **Complete and verified (phases 0–33).** Typed configuration; the LLM and
@@ -57,12 +57,15 @@ the database; the four-tier memory manager; the HTTP API with ownership enforced
 on every read, bearer-token authentication, rate limiting, and server-sent event
 streaming over a durable event log.
 
-**Complete and verified (phases 0–33 + 15, 27).** Phase 27 adds a metrics
-registry with a Prometheus `/metrics` endpoint, per-route request counts and
-latency histograms, task-outcome counters, and span tracing over the run.
+**Complete and verified (phases 0–35).** Phase 27 adds a metrics registry with a
+Prometheus `/metrics` endpoint, per-route request counts and latency histograms,
+task-outcome counters, and span tracing over the run. Phase 28–33 harden each
+tool at its own boundary; phase 34 asserts those boundaries as a matrix; phase 35
+injects faults at every seam and checks that failures are contained and visible
+rather than hidden.
 
-**Not started.** Phases 34–37 (failure injection, evaluation, efficiency work),
-38–45 (containers, CI/CD, dashboard, final reviews).
+**Not started.** Phases 36–37 (evaluation harness, efficiency work), 40–45
+(CI/CD, dashboard, final reviews).
 
 **Blocked.** Phases 38–39 need a container runtime, and this host has none. They
 will be written and lint-checked, and reported as **unbuilt** until a Docker
@@ -840,7 +843,9 @@ $ curl -s http://127.0.0.1:8000/ready | python -m json.tool
 - [x] **Phase 26** — rate limiting — Redis-backed, fail-open or fail-closed
 - [x] **Phase 27** — observability — structured logs, correlation ids, events, Prometheus metrics, span tracing
 - [x] **Phases 28–33** — prompt injection, SSRF, filesystem, execution sandbox, database and GitHub hardening
-- [ ] **Phases 34–37** — security test matrix, failure injection, evaluation harness, efficiency
+- [x] **Phase 34** — security test matrix — path resolution, SSRF, per-tool policy, approval gating
+- [x] **Phase 35** — failure injection — classification, retry, timeout, and degradation at every seam
+- [ ] **Phases 36–37** — evaluation harness, efficiency
 - [ ] **Phases 38–39** — Docker and compose — ⛔ blocked: no container runtime on this host
 - [ ] **Phases 40–41** — CI/CD and documentation
 - [ ] **Phase 42** — control dashboard — 🔷 designed
