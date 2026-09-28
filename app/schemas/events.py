@@ -46,6 +46,9 @@ class EventType(StrEnum):
     APPROVAL_REQUIRED = "approval_required"
     APPROVAL_RECEIVED = "approval_received"
 
+    MEMORY_RECALLED = "memory_recalled"
+    MEMORY_WRITTEN = "memory_written"
+
 
 #: Every event type is safe to stream. The constant exists so that any future
 #: internal-only event type has to be named explicitly to be excluded.

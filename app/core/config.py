@@ -74,6 +74,26 @@ class Settings(BaseSettings):
     database_statement_timeout_ms: int = Field(default=5000, ge=100, le=60_000)
     database_max_rows: int = Field(default=500, ge=1, le=10_000)
 
+    # --- Memory ------------------------------------------------------------ #
+    #: Whether runs read from and write to the memory tiers. On by default: the
+    #: point of a memory manager is that it is used, and it degrades to a no-op
+    #: rather than failing when its store is unavailable.
+    memory_enabled: bool = True
+    #: Minimum estimated importance for a *durable* memory to be written at all.
+    #: Volatile tiers are never thresholded: a short-term note that is not worth
+    #: keeping loses nothing by not being kept, whereas a long-term store that
+    #: accepts everything becomes unusable.
+    memory_importance_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
+    #: How many candidate rows a retrieval may consider before ranking. Exact
+    #: scoring in Python is correct but linear, so the read is bounded explicitly.
+    memory_scan_limit: int = Field(default=500, ge=1, le=10_000)
+    #: Memories below this blended score are not injected into a prompt. Ranking
+    #: a whole store and returning the best of a bad set would feed the model
+    #: irrelevant text and invite it to use it.
+    memory_min_score: float = Field(default=0.15, ge=0.0, le=1.0)
+    #: Volatile memories older than this are structurally unsound to keep.
+    memory_volatile_ttl_seconds: int = Field(default=86_400, ge=60)
+
     # --- Checkpointing ----------------------------------------------------- #
     # "postgres" is durable: a run survives a restart and can be resumed by
     # another worker. "memory" is volatile and exists for tests. The default is

@@ -56,6 +56,7 @@ from app.graph.builder import build_all_agents, build_graph
 from app.graph.checkpoints import CheckpointHandle, open_checkpointer
 from app.services.cache import build_cache
 from app.services.llm import build_llm_provider
+from app.services.memory import build_memory_manager
 from app.services.task_store import PostgresTaskStore
 from app.tools.registry import build_default_registry
 
@@ -139,6 +140,15 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
 
     application.state.task_store = PostgresTaskStore(database)
 
+    try:
+        application.state.memory = build_memory_manager(settings, database=database)
+    except ConfigurationError as exc:
+        # A missing embedding credential degrades memory rather than the whole
+        # application: memory contributes optional context, so losing it must
+        # not take down task execution.
+        application.state.memory = None
+        logger.warning("startup.memory_unavailable", extra={"reason": exc.message})
+
     registry = build_default_registry(settings)
     application.state.tool_registry = registry
 
@@ -161,7 +171,11 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         application.state.provider = provider
         application.state.provider_error = None
         application.state.graph = build_graph(
-            settings, provider, registry, checkpointer=checkpoint.saver
+            settings,
+            provider,
+            registry,
+            checkpointer=checkpoint.saver,
+            memory=getattr(application.state, "memory", None),
         )
         application.state.agents = build_all_agents(provider, registry)
         logger.info("startup.graph_ready", extra={"agents": len(application.state.agents)})

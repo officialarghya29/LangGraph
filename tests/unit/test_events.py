@@ -28,6 +28,8 @@ def test_every_documented_event_type_exists() -> None:
         "verification_completed",
         "approval_required",
         "approval_received",
+        "memory_recalled",
+        "memory_written",
     }
 
     assert {member.value for member in EventType} == expected

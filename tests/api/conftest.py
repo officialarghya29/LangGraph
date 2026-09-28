@@ -163,6 +163,9 @@ def harness(sql: Callable[..., list[tuple]]) -> Iterator[ApiHarness]:
             provider,
             app.state.tool_registry,
             checkpointer=app.state.checkpointer.saver,
+            # The real, PostgreSQL-backed manager, so a recalled memory in a test
+            # is a row that was genuinely written and read back.
+            memory=getattr(app.state, "memory", None),
         )
         app.state.agents = build_all_agents(provider, app.state.tool_registry)
 

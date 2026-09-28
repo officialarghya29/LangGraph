@@ -36,6 +36,7 @@ from app.models.agent import VerificationResult
 from app.models.approval import ApprovalStatus
 from app.schemas.plans import Plan, Route
 from app.services.llm import LLMProvider
+from app.services.memory import MemoryManager
 from app.tools.registry import ToolRegistry
 
 __all__ = [
@@ -124,6 +125,9 @@ def build_dependencies(
     settings: Settings,
     provider: LLMProvider,
     registry: ToolRegistry,
+    *,
+    memory: MemoryManager | None = None,
+    event_sink: Any | None = None,
 ) -> GraphDependencies:
     """Assemble the graph's collaborators."""
     return GraphDependencies(
@@ -136,6 +140,8 @@ def build_dependencies(
         synthesizer=SynthesizerAgent(provider, registry),
         executor=ExecutorAgent(provider, registry),
         workers=build_workforce(provider, registry),
+        memory=memory,
+        event_sink=event_sink,
     )
 
 
@@ -238,6 +244,8 @@ def build_graph(
     registry: ToolRegistry,
     *,
     checkpointer: BaseCheckpointSaver[Any] | None = None,
+    memory: MemoryManager | None = None,
+    event_sink: Any | None = None,
 ) -> CompiledStateGraph[Any, Any, Any, Any]:
     """Build and compile the orchestration graph.
 
@@ -246,16 +254,20 @@ def build_graph(
         provider: The LLM provider used by the router and all agents.
         registry: Tool registry the agents resolve allow-lists against.
         checkpointer: Optional checkpoint saver. Defaults to the configured one.
+        memory: Optional memory manager. Absent means the run neither recalls
+            nor records a memory.
+        event_sink: Optional sink for client-safe execution events.
 
     Returns:
         A compiled graph ready for ``ainvoke``.
     """
-    deps = build_dependencies(settings, provider, registry)
+    deps = build_dependencies(settings, provider, registry, memory=memory, event_sink=event_sink)
     nodes = GraphNodes(deps)
 
     graph = StateGraph(AgentState)
 
     graph.add_node("validate_input", nodes.validate_input)
+    graph.add_node("recall_memory", nodes.recall_memory)
     graph.add_node("route_request", nodes.route_request)
     graph.add_node("direct_response", nodes.direct_response)
     graph.add_node("planner", nodes.plan)
@@ -270,14 +282,16 @@ def build_graph(
     graph.add_node("execute_approved_action", nodes.execute_approved_action)
     graph.add_node("cancel_task", nodes.cancel_task)
     graph.add_node("fail_task", nodes.fail_task)
+    graph.add_node("record_memory", nodes.record_memory)
     graph.add_node("finalize", nodes.finalize)
 
     graph.add_edge(START, "validate_input")
     graph.add_conditional_edges(
         "validate_input",
         route_after_validation,
-        {"continue": "route_request", "fail": "fail_task"},
+        {"continue": "recall_memory", "fail": "fail_task"},
     )
+    graph.add_edge("recall_memory", "route_request")
     graph.add_conditional_edges(
         "route_request",
         route_after_routing,
@@ -306,16 +320,20 @@ def build_graph(
     graph.add_conditional_edges(
         "risk_check",
         route_after_risk,
-        {"approval": "human_approval", "finalize": "finalize"},
+        {"approval": "human_approval", "finalize": "record_memory"},
     )
     graph.add_conditional_edges(
         "human_approval",
         route_after_approval,
         {"execute": "execute_approved_action", "cancel": "cancel_task"},
     )
-    graph.add_edge("execute_approved_action", "finalize")
-    graph.add_edge("cancel_task", "finalize")
-    graph.add_edge("fail_task", "finalize")
+    # Every terminal branch funnels through the memory write before finalising,
+    # so a cancel or a reported failure is finalised exactly like a success and
+    # the recording step cannot be skipped by adding a new branch.
+    graph.add_edge("execute_approved_action", "record_memory")
+    graph.add_edge("cancel_task", "record_memory")
+    graph.add_edge("fail_task", "record_memory")
+    graph.add_edge("record_memory", "finalize")
     graph.add_edge("finalize", END)
 
     saver = checkpointer if checkpointer is not None else build_checkpointer(settings)

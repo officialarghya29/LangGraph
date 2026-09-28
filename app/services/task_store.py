@@ -36,6 +36,7 @@ from app.database.repositories import (
     UserRepository,
 )
 from app.graph.checkpoints import thread_config
+from app.graph.nodes import event_sink_for
 from app.graph.state import initial_state
 from app.models.approval import ApprovalStatus
 from app.models.execution import TaskStatus
@@ -511,7 +512,14 @@ async def execute_task_with_store(
             iteration_limit=settings.max_agent_iterations,
             retry_limit=settings.max_retries,
         )
-        result = await graph.ainvoke(state, thread_config(task_id))
+
+        async def publish(event_type: str, payload: dict[str, object]) -> None:
+            await store.append_event(task_id, event_type, payload)
+
+        # Bound to this run, not to the shared compiled graph, so two concurrent
+        # tasks never write into each other's event history.
+        with event_sink_for(publish):
+            result = await graph.ainvoke(state, thread_config(task_id))
     except Exception as exc:
         # The class name only. An exception string can carry a prompt fragment,
         # a URL, or a credential.

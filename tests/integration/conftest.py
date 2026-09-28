@@ -46,8 +46,27 @@ def database(test_database_url: str) -> Iterator[Database]:
         asyncio.run(instance.dispose())
 
 
+@pytest.fixture(autouse=True)
+async def _empty_tables(database: Database) -> None:
+    """Empty every table before each test in this package.
+
+    Autouse and dependent on ``database`` rather than on ``session`` because not
+    every test here wants a session: the memory tests build their own stores and
+    open their own connections. Truncating per test — rather than only for tests
+    that happen to request a session — is what keeps one test's rows from being
+    read back as another's, which is an isolation bug that shows up as an
+    assertion about counts or ordering rather than as an obvious crash.
+
+    Truncation is chosen over a rolled-back transaction because some behaviour
+    under test — a cascade, a unique violation — only becomes visible once a
+    statement has actually committed.
+    """
+    async with database.session() as purge:
+        await purge.execute(text(TRUNCATE_ALL))
+
+
 @pytest_asyncio.fixture
-async def session(database: Database) -> AsyncIterator[AsyncSession]:
+async def session(database: Database, _empty_tables: None) -> AsyncIterator[AsyncSession]:
     """Yield a session against a database emptied of the previous test's rows.
 
     The session is rolled back rather than committed on teardown. A test that
@@ -56,9 +75,6 @@ async def session(database: Database) -> AsyncIterator[AsyncSession]:
     an otherwise passing test. A test that needs its writes to outlive the
     session — because another connection must see them — commits explicitly.
     """
-    async with database.session() as purge:
-        await purge.execute(text(TRUNCATE_ALL))
-
     active = database.session_factory()
     try:
         yield active

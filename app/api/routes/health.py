@@ -103,6 +103,14 @@ async def ready(request: Request) -> ReadyResponse:
         cache_ok, cache_detail = await cache.ping()
         checks["cache"] = "ok" if cache_ok else f"{cache_detail} (rate limiting bypassed)"
 
+    memory = getattr(state, "memory", None)
+    if memory is None:
+        checks["memory"] = "unavailable"
+    elif not settings.memory_enabled:
+        checks["memory"] = "disabled by configuration"
+    else:
+        checks["memory"] = f"ok ({memory.store_name})"
+
     checks["authentication"] = "enabled" if settings.auth_enabled else "disabled"
     checks["python_execution"] = (
         "enabled" if settings.python_execution_enabled else "disabled (no sandbox configured)"
