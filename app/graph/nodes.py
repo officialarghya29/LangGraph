@@ -12,7 +12,9 @@ bad step degrades the run instead of destroying it.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -31,11 +33,17 @@ from app.models.agent import AgentOutput, VerificationResult
 from app.models.approval import ApprovalStatus
 from app.models.execution import ExecutionError, ExecutionMetadata
 from app.models.tool import AccessMode
+from app.schemas.events import EventType
 from app.schemas.plans import Plan, Subtask
 from app.services.llm import LLMProvider, Message, Role
 from app.tools.registry import ToolRegistry
 
-__all__ = ["GraphDependencies", "GraphNodes"]
+__all__ = ["EventSink", "GraphDependencies", "GraphNodes"]
+
+logger = logging.getLogger(__name__)
+
+#: Signature of an execution-event sink: ``(event_type, payload)``.
+EventSink = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 
 @dataclass(slots=True)
@@ -55,6 +63,10 @@ class GraphDependencies:
     synthesizer: SynthesizerAgent
     executor: ExecutorAgent
     workers: dict[str, BaseAgent[Any, Any]] = field(default_factory=dict)
+    #: Optional sink for client-safe execution events. Injected rather than
+    #: imported so the graph knows nothing about persistence, and so a test can
+    #: collect events without a database.
+    event_sink: EventSink | None = None
 
 
 def _error(
@@ -91,6 +103,23 @@ class GraphNodes:
 
     def __init__(self, deps: GraphDependencies) -> None:
         self.deps = deps
+
+    async def _emit(self, event_type: EventType, **payload: Any) -> None:
+        """Publish a client-safe execution event.
+
+        A failing sink is logged and swallowed. Observability must never be able
+        to break the run it is observing: a full disk or a dead event log would
+        otherwise turn a working task into a failed one.
+        """
+        if self.deps.event_sink is None:
+            return
+        try:
+            await self.deps.event_sink(str(event_type), payload)
+        except Exception as exc:
+            logger.warning(
+                "graph.event_sink_failed",
+                extra={"event": str(event_type), "error": type(exc).__name__},
+            )
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -155,6 +184,12 @@ class GraphNodes:
                 "errors": [_error("route_request", "routing failed", exc.failure_kind)],
             }
 
+        await self._emit(
+            EventType.TASK_ROUTING,
+            route=decision.route.value,
+            complexity=decision.complexity.value,
+            requires_approval=decision.requires_approval,
+        )
         return {
             "route": decision,
             "intent": decision.intent,
@@ -195,6 +230,7 @@ class GraphNodes:
     async def plan(self, state: AgentState) -> dict[str, Any]:
         """Produce a validated plan for a complex request."""
         request = state.get("user_request") or ""
+        await self._emit(EventType.TASK_PLANNING)
         try:
             payload = PlannerInput(
                 user_request=request,
@@ -205,10 +241,17 @@ class GraphNodes:
         except AppError as exc:
             # Covers both a planning failure and an unresolvable agent tool set;
             # either way the run degrades to a reported failure, not a crash.
+            await self._emit(EventType.TASK_FAILED, node="planner", reason=exc.failure_kind.value)
             return {
                 "plan": None,
                 "errors": [_error("planner", "planning failed", exc.failure_kind)],
             }
+        await self._emit(
+            EventType.TASK_PLANNING,
+            stage="complete",
+            subtasks=len(plan.subtasks),
+            objective=plan.objective[:200],
+        )
         return {"plan": plan, "subtasks": list(plan.subtasks)}
 
     async def validate_plan(self, state: AgentState) -> dict[str, Any]:
@@ -271,6 +314,12 @@ class GraphNodes:
                     )
                 ],
             }
+        await self._emit(
+            EventType.TASK_PLANNING,
+            stage="validated",
+            subtasks=len(plan.subtasks),
+            agents=sorted({task.agent for task in plan.subtasks}),
+        )
         return {}
 
     # ------------------------------------------------------------------ #
@@ -310,22 +359,51 @@ class GraphNodes:
                         f"no agent registered as {subtask.agent!r}",
                         FailureKind.PERMANENT,
                     )
+                await self._emit(
+                    EventType.AGENT_STARTED,
+                    agent=subtask.agent,
+                    subtask=subtask.id,
+                    description=subtask.description[:200],
+                )
                 started = time.perf_counter()
                 try:
                     payload = _subtask_payload(agent.input_model, subtask, context_text)
                     output = await agent.run(payload, context)
                 except AppError as exc:
+                    await self._emit(
+                        EventType.AGENT_COMPLETED,
+                        agent=subtask.agent,
+                        subtask=subtask.id,
+                        status="failed",
+                        reason=exc.failure_kind.value,
+                    )
                     return None, _error(
                         "agent_execution", f"{subtask.id}: {exc.message}", exc.failure_kind
                     )
                 except Exception as exc:
+                    await self._emit(
+                        EventType.AGENT_COMPLETED,
+                        agent=subtask.agent,
+                        subtask=subtask.id,
+                        status="failed",
+                        reason=type(exc).__name__,
+                    )
                     return None, _error(
                         "agent_execution",
                         f"{subtask.id}: agent raised unexpectedly",
                         FailureKind.UNKNOWN,
                         detail=type(exc).__name__,
                     )
-                output.duration_ms = round((time.perf_counter() - started) * 1000, 3)
+                duration_ms = round((time.perf_counter() - started) * 1000, 3)
+                output.duration_ms = duration_ms
+                await self._emit(
+                    EventType.AGENT_COMPLETED,
+                    agent=subtask.agent,
+                    subtask=subtask.id,
+                    status="completed",
+                    duration_ms=duration_ms,
+                    summary=(output.summary or output.content[:200]),
+                )
                 return output, None
 
         outcomes = await asyncio.gather(*(run_one(subtask) for subtask in ready))
@@ -362,6 +440,7 @@ class GraphNodes:
             success_criteria=list(plan.success_criteria) if isinstance(plan, Plan) else [],
             agent_outputs=[output.content for output in outputs],
         )
+        await self._emit(EventType.VERIFICATION_STARTED, outputs=len(outputs))
         try:
             verdict = await self.deps.critic.run(payload, self._agent_context(state))
         except AppError as exc:
@@ -372,7 +451,21 @@ class GraphNodes:
                 issues=["verification could not be completed"],
                 verification_summary=f"verification unavailable: {exc.message}",
             )
+            await self._emit(
+                EventType.VERIFICATION_COMPLETED,
+                passed=False,
+                confidence=0.0,
+                issues=1,
+                unavailable=True,
+            )
             return {"verification_result": verdict}
+        await self._emit(
+            EventType.VERIFICATION_COMPLETED,
+            passed=verdict.passed,
+            confidence=verdict.confidence,
+            issues=len(verdict.issues),
+            missing_requirements=len(verdict.missing_requirements),
+        )
         return {"verification_result": verdict}
 
     async def retry_or_replan(self, state: AgentState) -> dict[str, Any]:
@@ -381,8 +474,12 @@ class GraphNodes:
         The rejected outputs are dropped rather than accumulated, so a retry
         does not re-verify work already known to be wrong.
         """
+        attempt = (state.get("retry_count") or 0) + 1
+        verdict = state.get("verification_result")
+        issues = verdict.issues if isinstance(verdict, VerificationResult) else []
+        await self._emit(EventType.TASK_RETRY, attempt=attempt, issues=list(issues)[:5])
         return {
-            "retry_count": (state.get("retry_count") or 0) + 1,
+            "retry_count": attempt,
             "completed_subtasks": [],
             "agent_outputs": [],
         }
@@ -428,6 +525,12 @@ class GraphNodes:
         required = bool(state.get("requires_human_approval")) or (
             getattr(decision, "requires_approval", False) is True
         )
+        if required:
+            await self._emit(
+                EventType.APPROVAL_REQUIRED,
+                risk_level="HIGH",
+                requested_action=(state.get("user_request") or "")[:200],
+            )
         return {
             "requires_human_approval": required,
             "approval_status": ApprovalStatus.PENDING if required else ApprovalStatus.NOT_REQUIRED,
@@ -450,6 +553,10 @@ class GraphNodes:
             }
         )
         approved = str(decision).strip().lower() in {"approve", "approved", "true", "yes"}
+        await self._emit(
+            EventType.APPROVAL_RECEIVED,
+            decision="approve" if approved else "reject",
+        )
         return {
             "requires_human_approval": False,
             "approval_status": ApprovalStatus.APPROVED if approved else ApprovalStatus.REJECTED,
@@ -552,4 +659,13 @@ class GraphNodes:
         if not isinstance(metadata, ExecutionMetadata):
             metadata = ExecutionMetadata()
         metadata.finish(duration_ms=0.0)
+
+        errors = state.get("errors") or []
+        await self._emit(
+            EventType.TASK_COMPLETED if not errors else EventType.TASK_FAILED,
+            stage="finalize",
+            errors=len(errors),
+            iterations=state.get("iteration_count") or 0,
+            retries=state.get("retry_count") or 0,
+        )
         return {"execution_metadata": metadata}

@@ -26,10 +26,12 @@ __all__ = [
     "NotFoundError",
     "PermissionDeniedError",
     "ProviderError",
+    "RateLimitExceededError",
     "StructuredOutputError",
     "ToolError",
     "ToolPermissionError",
     "ToolTimeoutError",
+    "UsageLimitExceededError",
     "classify_exception",
 ]
 
@@ -98,6 +100,28 @@ class AuthenticationError(AppError):
 
 class ApprovalRequiredError(AppError):
     """The action is gated behind human approval and cannot proceed."""
+
+    failure_kind = FailureKind.PERMANENT
+
+
+class RateLimitExceededError(AppError):
+    """The caller exceeded a configured request rate.
+
+    Retryable, but only after the window resets, so the retry policy must not
+    immediately reissue the request. The remaining-time hint is carried in
+    ``detail`` so a client can wait rather than guess.
+    """
+
+    failure_kind = FailureKind.RATE_LIMIT
+
+
+class UsageLimitExceededError(AppError):
+    """A per-task execution ceiling was reached.
+
+    Distinct from a rate limit: this is the system refusing to do more work on
+    one task, not refusing the caller. It is permanent for that request, because
+    retrying without changing the request would hit the same ceiling.
+    """
 
     failure_kind = FailureKind.PERMANENT
 

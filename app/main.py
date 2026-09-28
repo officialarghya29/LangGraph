@@ -4,10 +4,22 @@ Exposes an application factory rather than a module-level singleton so tests can
 build isolated instances. The module-level ``app`` object is the ASGI target
 that uvicorn imports (``uvicorn app.main:app``).
 
-Expensive collaborators — the LLM provider, the tool registry, the agent
-workforce, and the compiled graph — are built once in the lifespan and stored on
-``app.state``. Building the graph per request would rebuild every agent each
-time and would discard the checkpointer's value entirely.
+Expensive collaborators — the database, the cache, the checkpoint backend, the
+LLM provider, the tool registry, the agent workforce, and the compiled graph —
+are built once in the lifespan and stored on ``app.state``. Building the graph
+per request would rebuild every agent each time and would discard the
+checkpointer's value entirely.
+
+Startup policy, which is the interesting decision here:
+
+- A **missing LLM credential** is not fatal. The process still starts, ``/health``
+  still reports liveness, and ``/ready`` explains what is missing. Refusing to
+  boot would make a configuration gap look like a crash loop and would take the
+  discovery endpoints down for no reason.
+- A **missing database or checkpoint backend** *is* fatal. Every task, approval,
+  and memory lives there, and the durability guarantee is the point of the
+  system. Starting without them would mean serving requests that silently cannot
+  be resumed, which is worse than not starting.
 """
 
 from __future__ import annotations
@@ -20,8 +32,10 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from app.api.middleware import RequestContextMiddleware, install_rate_limiting
 from app.api.routes.agents import router as discovery_router
 from app.api.routes.chat import router as chat_router
+from app.api.routes.events import router as events_router
 from app.api.routes.health import router as health_router
 from app.api.routes.tasks import router as tasks_router
 from app.core.config import get_settings
@@ -33,11 +47,16 @@ from app.core.exceptions import (
     InputValidationError,
     NotFoundError,
     PermissionDeniedError,
+    RateLimitExceededError,
+    UsageLimitExceededError,
 )
 from app.core.logging import configure_logging
+from app.database.connection import Database
 from app.graph.builder import build_all_agents, build_graph
+from app.graph.checkpoints import CheckpointHandle, open_checkpointer
+from app.services.cache import build_cache
 from app.services.llm import build_llm_provider
-from app.services.tasks import InMemoryTaskStore
+from app.services.task_store import PostgresTaskStore
 from app.tools.registry import build_default_registry
 
 __all__ = ["app", "create_app"]
@@ -51,6 +70,8 @@ _ERROR_STATUS: tuple[tuple[type[AppError], int], ...] = (
     (PermissionDeniedError, 403),
     (AuthenticationError, 401),
     (ApprovalRequiredError, 409),
+    (RateLimitExceededError, 429),
+    (UsageLimitExceededError, 429),
 )
 
 
@@ -76,20 +97,57 @@ async def app_error_handler(request: Request, exc: Exception) -> JSONResponse:
 
 @asynccontextmanager
 async def lifespan(application: FastAPI) -> AsyncIterator[None]:
-    """Build application singletons on startup.
-
-    A missing credential is *not* fatal. The process still starts, ``/health``
-    still reports liveness, and ``/ready`` explains what is missing. Refusing to
-    boot would make a configuration problem look like a crash loop, and it would
-    make the discovery endpoints unreachable for no reason.
-    """
+    """Build application singletons on startup and release them on shutdown."""
     settings = get_settings()
     configure_logging(settings)
+    logger.info(
+        "startup.begin",
+        extra={"app": settings.app_name, "env": settings.app_env},
+    )
 
-    application.state.task_store = InMemoryTaskStore()
+    database = Database(
+        settings.database_url,
+        pool_size=settings.database_pool_size,
+        max_overflow=settings.database_max_overflow,
+        echo=settings.database_echo,
+    )
+    application.state.database = database
+
+    ready, detail = await database.ping()
+    if not ready:
+        # Refusing to start is deliberate. Every task, approval, and memory is
+        # durable state; serving without it would mean accepting work that
+        # cannot be recorded.
+        await database.dispose()
+        raise ConfigurationError("the database is unreachable", detail=detail)
+    logger.info("startup.database_ready")
+
+    cache = build_cache(
+        settings.redis_url,
+        prefix=settings.redis_key_prefix,
+        default_ttl=settings.cache_default_ttl_seconds,
+    )
+    application.state.cache = cache
+    cache_ready, cache_detail = await cache.ping()
+    if cache_ready:
+        logger.info("startup.cache_ready")
+    else:
+        # Not fatal. Redis holds no durable state, so the application degrades:
+        # rate limiting is bypassed and live streaming falls back to the durable
+        # event log, both of which are reported by /ready.
+        logger.warning("startup.cache_unavailable", extra={"reason": cache_detail})
+
+    application.state.task_store = PostgresTaskStore(database)
+
     registry = build_default_registry(settings)
     application.state.tool_registry = registry
-    logger.info("startup.tools_registered", extra={"count": len(registry)})
+
+    checkpoint: CheckpointHandle = await open_checkpointer(settings)
+    application.state.checkpointer = checkpoint
+    if not checkpoint.durable:
+        # Only reachable when the memory backend was chosen explicitly; a failed
+        # durable backend raises above rather than degrading silently.
+        logger.warning("startup.volatile_checkpoints")
 
     try:
         provider = build_llm_provider(settings)
@@ -102,11 +160,22 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     else:
         application.state.provider = provider
         application.state.provider_error = None
-        application.state.graph = build_graph(settings, provider, registry)
+        application.state.graph = build_graph(
+            settings, provider, registry, checkpointer=checkpoint.saver
+        )
         application.state.agents = build_all_agents(provider, registry)
         logger.info("startup.graph_ready", extra={"agents": len(application.state.agents)})
 
-    yield
+    logger.info("startup.complete")
+
+    try:
+        yield
+    finally:
+        logger.info("shutdown.begin")
+        await checkpoint.close()
+        await cache.close()
+        await database.dispose()
+        logger.info("shutdown.complete")
 
 
 def create_app() -> FastAPI:
@@ -117,8 +186,12 @@ def create_app() -> FastAPI:
     """
     application = FastAPI(
         title="LangGraph Multi-Agent System",
-        version="0.1.0",
-        description="Production-oriented multi-agent orchestration over LangGraph.",
+        version="1.0.0",
+        description=(
+            "Production-oriented multi-agent orchestration over LangGraph, with "
+            "durable checkpointing, human approval, and a least-privilege tool "
+            "pipeline."
+        ),
         docs_url="/docs",
         redoc_url=None,
         openapi_url="/openapi.json",
@@ -127,9 +200,16 @@ def create_app() -> FastAPI:
 
     application.add_exception_handler(AppError, app_error_handler)
 
+    # Order matters: correlation ids are assigned first so every later log line
+    # and error response carries one, and rate limiting runs before any handler
+    # body does work.
+    application.add_middleware(RequestContextMiddleware)
+    install_rate_limiting(application)
+
     application.include_router(health_router)
     application.include_router(chat_router)
     application.include_router(tasks_router)
+    application.include_router(events_router)
     application.include_router(discovery_router)
 
     return application

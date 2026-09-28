@@ -90,8 +90,25 @@ def test_secrets_are_not_exposed_by_repr() -> None:
     assert "super-secret-value" not in repr(settings)
 
 
+def safe_production(**overrides: object) -> Settings:
+    """Build a production configuration that satisfies every safety invariant.
+
+    Each production test below changes exactly one value, so a failure names the
+    invariant that broke rather than an unrelated one that happened to be
+    defaulted wrong.
+    """
+    base: dict[str, object] = {
+        "app_env": "production",
+        "auth_enabled": True,
+        "trust_identity_header": False,
+        "jwt_secret": "strong-value",
+    }
+    base.update(overrides)
+    return make_settings(**base)
+
+
 def test_is_production() -> None:
-    assert make_settings(app_env="production", jwt_secret="x").is_production is True
+    assert safe_production().is_production is True
     assert make_settings().is_production is False
 
 
@@ -102,23 +119,42 @@ def test_is_production() -> None:
 
 def test_production_rejects_debug() -> None:
     with pytest.raises(ConfigurationError, match="DEBUG"):
-        make_settings(app_env="production", debug=True, jwt_secret="x")
+        safe_production(debug=True)
 
 
 def test_production_rejects_disabled_auth() -> None:
     with pytest.raises(ConfigurationError, match="AUTH_ENABLED"):
-        make_settings(app_env="production", auth_enabled=False, jwt_secret="x")
+        safe_production(auth_enabled=False)
 
 
 def test_production_requires_a_jwt_secret() -> None:
     with pytest.raises(ConfigurationError, match="JWT_SECRET"):
-        Settings(_env_file=None, app_env="production")
+        make_settings(app_env="production", trust_identity_header=False)
+
+
+def test_production_rejects_a_trusted_identity_header() -> None:
+    """A self-asserted identity header would defeat every ownership check."""
+    with pytest.raises(ConfigurationError, match="TRUST_IDENTITY_HEADER"):
+        safe_production(trust_identity_header=True)
+
+
+def test_production_rejects_execution_without_a_sandbox() -> None:
+    with pytest.raises(ConfigurationError, match="sandbox"):
+        safe_production(python_execution_enabled=True)
+
+
+def test_no_environment_offers_a_code_execution_sandbox() -> None:
+    """The property must not be optimistic in any environment."""
+    assert make_settings().execution_sandbox_available is False
+    assert safe_production().execution_sandbox_available is False
 
 
 def test_production_accepts_a_safe_configuration() -> None:
-    settings = make_settings(app_env="production", jwt_secret="strong-value")
+    settings = safe_production()
 
     assert settings.is_production is True
+    assert settings.auth_enabled is True
+    assert settings.trust_identity_header is False
 
 
 def test_development_tolerates_unsafe_settings() -> None:

@@ -498,6 +498,21 @@ class FakeLLMProvider(LLMProvider):
         """How many scripted responses remain unconsumed."""
         return len(self._queue)
 
+    @property
+    def responder(self) -> Callable[[Sequence[Message]], str] | None:
+        """The callable that produces responses once the queue is empty.
+
+        Exposed as a property so a caller can swap the behaviour of a provider
+        that is already wired into a compiled graph. Replacing the provider
+        object would not work: the graph holds a reference to this one.
+        """
+        return self._responder
+
+    @responder.setter
+    def responder(self, value: Callable[[Sequence[Message]], str] | None) -> None:
+        """Replace the fallback responder."""
+        self._responder = value
+
     def queue_response(self, content: str) -> None:
         """Append a scripted response."""
         self._queue.append(content)

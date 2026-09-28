@@ -10,12 +10,12 @@ needed. It contains no reasoning, no prompt, and no tool arguments.
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Any
 
-from fastapi import APIRouter, Header, HTTPException, status
+from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
-from app.api.dependencies import GraphDep, SettingsDep, require_configured
+from app.api.dependencies import GraphDep, PrincipalDep, SettingsDep, require_configured
 from app.graph.checkpoints import thread_config
 from app.graph.state import initial_state
 from app.models.approval import ApprovalStatus
@@ -49,7 +49,7 @@ async def chat(
     payload: ChatRequest,
     graph: GraphDep,
     settings: SettingsDep,
-    x_user_id: Annotated[str, Header()] = "anonymous",
+    principal: PrincipalDep,
 ) -> ChatResponse:
     """Answer a request synchronously.
 
@@ -57,8 +57,7 @@ async def chat(
         payload: The message and optional conversation to continue.
         graph: The compiled orchestration graph.
         settings: Application settings, for the execution ceilings.
-        x_user_id: Caller identity. Real authentication arrives in Phase 25;
-            ownership is nonetheless enforced everywhere a record is read.
+        principal: The resolved caller, whose identity scopes the run.
 
     Returns:
         The answer and coarse execution metadata.
@@ -71,7 +70,7 @@ async def chat(
 
     state = initial_state(
         payload.message,
-        user_id=x_user_id,
+        user_id=principal.user_id,
         conversation_id=payload.conversation_id,
         iteration_limit=settings.max_agent_iterations,
         retry_limit=settings.max_retries,

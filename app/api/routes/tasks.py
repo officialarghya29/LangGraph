@@ -3,23 +3,36 @@
 ``POST /api/v1/tasks`` returns immediately with a task id and runs the graph in
 the background. ``GET`` endpoints report progress. The approval endpoints resume
 a suspended graph with a human's decision.
+
+Every handler takes a :class:`~app.core.auth.Principal` rather than reading an
+identity header itself. Identity is resolved in exactly one place, so a handler
+cannot accidentally trust a caller-supplied value.
 """
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Any
 
-from fastapi import APIRouter, BackgroundTasks, Header, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, status
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import SQLAlchemyError
 
-from app.api.dependencies import GraphDep, SettingsDep, TaskStoreDep, require_configured
+from app.api.dependencies import (
+    GraphDep,
+    PrincipalDep,
+    SettingsDep,
+    TaskStoreDep,
+    require_configured,
+)
+from app.core.exceptions import DatabaseError
 from app.graph.checkpoints import thread_config
 from app.models.approval import ApprovalDecision, ApprovalStatus
 from app.models.execution import TaskStatus
-from app.services.tasks import TaskRecord, execute_task
+from app.services.task_store import TaskRecord, execute_task_with_store
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
 
+#: Mirrors the request schema, so an oversized body is rejected before the graph.
 MAX_REQUEST_LENGTH = 20_000
 
 
@@ -27,11 +40,15 @@ class CreateTaskRequest(BaseModel):
     """A task to run asynchronously."""
 
     request: str = Field(min_length=1, max_length=MAX_REQUEST_LENGTH)
-    conversation_id: str | None = None
+    conversation_id: str | None = Field(default=None, max_length=64)
 
 
 class TaskResponse(BaseModel):
-    """The client-visible state of a task."""
+    """The client-visible state of a task.
+
+    Carries no prompt beyond the request the caller supplied, no reasoning, and no
+    tool arguments.
+    """
 
     task_id: str
     request: str
@@ -83,31 +100,25 @@ class ApprovalResponse(BaseModel):
     answer: str | None = None
 
 
-def _route_name(decision: object) -> str | None:
-    """Return a routing decision's route name, if the run got as far as routing.
-
-    The decision arrives from graph state as an object rather than a typed value,
-    so this reads it defensively instead of assuming routing succeeded.
-    """
-    route = getattr(decision, "route", None)
-    if route is None:
-        return None
-    value = getattr(route, "value", route)
-    return str(value)
-
-
 async def _owned_task(store: TaskStoreDep, task_id: str, user_id: str) -> TaskRecord:
     """Fetch a task, enforcing ownership.
 
     Raises:
-        HTTPException: 404, whether the task is absent or owned by somebody
-            else. Distinguishing the two would confirm that another user's task
-            exists.
+        HTTPException: 404, whether the task is absent or owned by somebody else.
+            Distinguishing the two would confirm that another user's task exists.
     """
     record = await store.get_for_user(task_id, user_id)
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no such task")
     return record
+
+
+def _storage_unavailable(exc: Exception) -> HTTPException:
+    """Translate a storage failure into a service-unavailable response."""
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=f"task storage is unavailable ({type(exc).__name__})",
+    )
 
 
 @router.post("", response_model=TaskResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -117,20 +128,26 @@ async def create_task(
     store: TaskStoreDep,
     graph: GraphDep,
     settings: SettingsDep,
-    x_user_id: Annotated[str, Header()] = "anonymous",
+    principal: PrincipalDep,
 ) -> TaskResponse:
     """Create a task and start it in the background.
 
     Returns 202 as soon as the task is recorded, so the caller is not held open
     for the duration of a multi-agent run.
+
+    Raises:
+        HTTPException: 503 if the provider is unconfigured or storage is down.
     """
     require_configured(settings)
 
-    record = TaskRecord(request=payload.request, user_id=x_user_id)
-    await store.create(record)
+    record = TaskRecord(request=payload.request, user_id=principal.user_id)
+    try:
+        await store.create(record)
+    except (DatabaseError, SQLAlchemyError) as exc:
+        raise _storage_unavailable(exc) from exc
 
     background.add_task(
-        execute_task,
+        execute_task_with_store,
         record.task_id,
         graph=graph,
         store=store,
@@ -140,24 +157,39 @@ async def create_task(
     return TaskResponse.from_record(record)
 
 
+@router.get("", response_model=list[TaskResponse])
+async def list_tasks(
+    store: TaskStoreDep,
+    principal: PrincipalDep,
+    limit: int = 50,
+) -> list[TaskResponse]:
+    """List the caller's own tasks, newest first.
+
+    Scoped to the caller with no opt-out: there is no parameter that widens this
+    to another principal's tasks.
+    """
+    records = await store.list(user_id=principal.user_id, limit=max(1, min(limit, 200)))
+    return [TaskResponse.from_record(record) for record in records]
+
+
 @router.get("/{task_id}", response_model=TaskResponse)
 async def get_task(
     task_id: str,
     store: TaskStoreDep,
-    x_user_id: Annotated[str, Header()] = "anonymous",
+    principal: PrincipalDep,
 ) -> TaskResponse:
     """Fetch a task's full visible state."""
-    return TaskResponse.from_record(await _owned_task(store, task_id, x_user_id))
+    return TaskResponse.from_record(await _owned_task(store, task_id, principal.user_id))
 
 
 @router.get("/{task_id}/status", response_model=TaskStatusResponse)
 async def get_task_status(
     task_id: str,
     store: TaskStoreDep,
-    x_user_id: Annotated[str, Header()] = "anonymous",
+    principal: PrincipalDep,
 ) -> TaskStatusResponse:
     """Fetch just a task's status."""
-    record = await _owned_task(store, task_id, x_user_id)
+    record = await _owned_task(store, task_id, principal.user_id)
     return TaskStatusResponse(
         task_id=record.task_id,
         status=record.status.value,
@@ -171,12 +203,17 @@ async def _decide(
     task_id: str,
     decision: ApprovalDecision,
     note: str | None,
-    user_id: str,
+    principal_user: str,
     graph: Any,
     store: Any,
 ) -> ApprovalResponse:
-    """Record a human decision and resume the suspended graph."""
-    record = await store.get_for_user(task_id, user_id)
+    """Record a human decision and resume the suspended graph.
+
+    The decision is written to the durable record *before* the graph is resumed.
+    If the resume then fails, the audit trail still shows who decided what and
+    when, which is the fact that cannot be reconstructed.
+    """
+    record = await store.get_for_user(task_id, principal_user)
     if record is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="no such task")
 
@@ -185,6 +222,13 @@ async def _decide(
             status_code=status.HTTP_409_CONFLICT,
             detail="this task is not awaiting approval",
         )
+
+    await store.decide_approval(
+        task_id,
+        decision=decision.value,
+        decided_by=principal_user,
+        note=note,
+    )
 
     from langgraph.types import Command
 
@@ -223,14 +267,19 @@ async def approve_task(
     payload: ApprovalRequest,
     graph: GraphDep,
     store: TaskStoreDep,
-    x_user_id: Annotated[str, Header()] = "anonymous",
+    principal: PrincipalDep,
 ) -> ApprovalResponse:
-    """Approve a gated action and resume the run."""
+    """Approve a gated action and resume the run.
+
+    Raises:
+        HTTPException: 404 if the task is absent or not the caller's, 409 if it
+            is not awaiting a decision.
+    """
     return await _decide(
         task_id=task_id,
         decision=ApprovalDecision.APPROVE,
         note=payload.note,
-        user_id=x_user_id,
+        principal_user=principal.user_id,
         graph=graph,
         store=store,
     )
@@ -242,14 +291,19 @@ async def reject_task(
     payload: ApprovalRequest,
     graph: GraphDep,
     store: TaskStoreDep,
-    x_user_id: Annotated[str, Header()] = "anonymous",
+    principal: PrincipalDep,
 ) -> ApprovalResponse:
-    """Reject a gated action. The action is never performed."""
+    """Reject a gated action. The action is never performed.
+
+    Raises:
+        HTTPException: 404 if the task is absent or not the caller's, 409 if it
+            is not awaiting a decision.
+    """
     return await _decide(
         task_id=task_id,
         decision=ApprovalDecision.REJECT,
         note=payload.note,
-        user_id=x_user_id,
+        principal_user=principal.user_id,
         graph=graph,
         store=store,
     )
@@ -258,18 +312,22 @@ async def reject_task(
 @router.post("/{task_id}/cancel", response_model=TaskResponse)
 async def cancel_task(
     task_id: str,
-    request: Request,
     store: TaskStoreDep,
-    x_user_id: Annotated[str, Header()] = "anonymous",
+    principal: PrincipalDep,
 ) -> TaskResponse:
     """Mark a task as cancelled.
 
-    Limitation: this marks the record. It does not interrupt a graph run that is
-    already executing, because the run holds the event loop rather than polling
-    a cancellation token. Cooperative cancellation arrives with the durable
-    checkpoint store.
+    Limitation, stated rather than hidden: this cancels the record. It cannot
+    interrupt a graph run that is already executing, because the run holds the
+    event loop rather than polling a cancellation token. Cooperative
+    cancellation is a separate piece of work, and :mod:`docs/DEVELOPMENT_PLAN.md`
+    tracks it.
+
+    Raises:
+        HTTPException: 404 if the task is absent or not the caller's, 409 if it
+            has already finished.
     """
-    record = await _owned_task(store, task_id, x_user_id)
+    record = await _owned_task(store, task_id, principal.user_id)
 
     if record.status.is_terminal:
         raise HTTPException(

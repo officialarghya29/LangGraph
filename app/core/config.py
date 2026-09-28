@@ -62,6 +62,9 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/langgraph"
     database_pool_size: int = Field(default=10, ge=1, le=100)
     database_max_overflow: int = Field(default=5, ge=0, le=100)
+    #: Log every statement. Off outside debugging: a logged statement can carry a
+    #: prompt or a credential value.
+    database_echo: bool = False
 
     # --- Database tool ----------------------------------------------------- #
     # Read-only by default. Writes and destructive statements each need an
@@ -71,8 +74,21 @@ class Settings(BaseSettings):
     database_statement_timeout_ms: int = Field(default=5000, ge=100, le=60_000)
     database_max_rows: int = Field(default=500, ge=1, le=10_000)
 
+    # --- Checkpointing ----------------------------------------------------- #
+    # "postgres" is durable: a run survives a restart and can be resumed by
+    # another worker. "memory" is volatile and exists for tests. The default is
+    # durable, because a silent downgrade to a volatile backend would remove the
+    # resume guarantee without anyone noticing.
+    checkpoint_backend: Literal["postgres", "memory"] = "postgres"
+    checkpoint_pool_size: int = Field(default=10, ge=1, le=100)
+    checkpoint_open_timeout_seconds: float = Field(default=10.0, gt=0, le=120)
+
     # --- Redis ------------------------------------------------------------- #
     redis_url: str = "redis://localhost:6379/0"
+    #: Namespace prefix for every cache key, so one Redis instance can host
+    #: several environments without them reading each other's keys.
+    redis_key_prefix: str = "langgraph"
+    cache_default_ttl_seconds: int = Field(default=300, ge=1)
 
     # --- Execution limits -------------------------------------------------- #
     # Every loop in the system is bounded by one of these.
@@ -86,8 +102,19 @@ class Settings(BaseSettings):
     # --- Security ---------------------------------------------------------- #
     auth_enabled: bool = True
     jwt_secret: SecretStr | None = None
+    jwt_algorithm: str = "HS256"
+    jwt_audience: str | None = None
+    jwt_issuer: str | None = None
+    #: Development convenience only: trust the caller's ``X-User-Id`` header as
+    #: identity when authentication is disabled. Refused when ``APP_ENV`` is
+    #: ``production``, because it lets any caller claim any identity.
+    trust_identity_header: bool = True
     rate_limit_requests: int = Field(default=60, ge=1)
     rate_limit_window_seconds: int = Field(default=60, ge=1)
+    #: Fail closed when the rate limiter cannot reach its store. Off by default,
+    #: since a cache outage taking the whole API down is usually the worse
+    #: outcome — but a security-sensitive deployment should turn it on.
+    rate_limit_fail_closed: bool = False
 
     # --- Filesystem tool --------------------------------------------------- #
     # Comma-separated in the environment; exposed as resolved paths.
@@ -165,7 +192,31 @@ class Settings(BaseSettings):
         if self.jwt_secret is None:
             raise ConfigurationError("JWT_SECRET is required when APP_ENV=production")
 
+        if self.trust_identity_header:
+            # The header is self-asserted. Trusting it in production would let any
+            # caller act as any user, which defeats every ownership check built
+            # on top of it.
+            raise ConfigurationError("TRUST_IDENTITY_HEADER must be false when APP_ENV=production")
+
+        if self.python_execution_enabled and not self.execution_sandbox_available:
+            raise ConfigurationError(
+                "PYTHON_EXECUTION_ENABLED requires a sandbox, and none is configured"
+            )
+
         return self
+
+    @property
+    def execution_sandbox_available(self) -> bool:
+        """Return whether an isolation boundary for arbitrary code exists.
+
+        Always false today. Arbitrary execution is only safe behind a real
+        boundary — a container, a jailed worker with its own kernel namespace —
+        and this project has not been given one. The property exists so the
+        answer is a single explicit fact rather than a scattered assumption, and
+        so enabling execution without a sandbox fails loudly instead of
+        pretending.
+        """
+        return False
 
 
 @lru_cache(maxsize=1)

@@ -23,13 +23,33 @@ from sqlalchemy.ext.asyncio import (
 
 from app.core.exceptions import DatabaseError
 
-__all__ = ["Database", "build_engine"]
+__all__ = ["Database", "build_engine", "plain_dsn"]
 
 logger = logging.getLogger(__name__)
 
 #: Only these drivers are accepted. A synchronous driver in an async application
 #: blocks the event loop on every query, which is a defect that hides until load.
 _ASYNC_DRIVERS = ("postgresql+asyncpg", "sqlite+aiosqlite")
+
+
+def plain_dsn(url: str) -> str:
+    """Return ``url`` without its SQLAlchemy driver suffix.
+
+    SQLAlchemy writes the driver into the scheme (``postgresql+asyncpg``);
+    libpq-based clients such as psycopg do not recognise that form and reject
+    the DSN. Stripping it here lets one configured URL serve both without a
+    second copy of the credential.
+
+    Args:
+        url: A SQLAlchemy database URL.
+
+    Returns:
+        The same URL in plain ``postgresql://`` form.
+    """
+    scheme, separator, rest = url.partition("://")
+    if not separator:
+        return url
+    return f"{scheme.split('+', 1)[0]}://{rest}"
 
 
 def build_engine(

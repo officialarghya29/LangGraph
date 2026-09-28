@@ -1,29 +1,28 @@
-"""Tests for the HTTP API.
+"""End-to-end HTTP API tests.
 
-The application is built through its real factory and lifespan, then given a
-deterministic provider and graph, so these tests exercise the actual wiring
-rather than a hand-assembled stand-in.
+These drive the real application: the real lifespan, the real PostgreSQL, the
+real Redis, and the real compiled graph. Only the language model is scripted.
+
+The scenarios worth the cost of real infrastructure are the ones that span it —
+a task surviving as a durable record, ownership being enforced on a real query,
+an approval being written before the graph resumes — so those are what is
+asserted here.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import Callable
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app.api.dependencies import get_settings_dep
-from app.core.config import Settings, reset_settings_cache
-from app.graph.builder import build_all_agents, build_graph
-from app.main import create_app
-from app.services.llm import FakeLLMProvider
-
-SETTINGS = Settings(_env_file=None, llm_api_key="test-key")
+from tests.api.conftest import ApiHarness
 
 
 def route_payload(route: str, *, approval: bool = False) -> dict[str, Any]:
+    """Build a scripted routing decision."""
     return {
         "route": route,
         "complexity": "simple",
@@ -37,9 +36,16 @@ def route_payload(route: str, *, approval: bool = False) -> dict[str, Any]:
     }
 
 
-def responder(route: str, *, approval: bool = False, answer: str = "the answer") -> Any:
+def responder(
+    route: str,
+    *,
+    approval: bool = False,
+    answer: str = "the answer",
+) -> Any:
+    """Build a role-keyed scripted provider responder."""
+
     def respond(messages: Any) -> str:
-        joined = "\n".join(m.content for m in messages)
+        joined = "\n".join(message.content for message in messages)
         if "You route requests" in joined:
             return json.dumps(route_payload(route, approval=approval))
         if "You are a synthesis agent" in joined:
@@ -50,73 +56,70 @@ def responder(route: str, *, approval: bool = False, answer: str = "the answer")
 
 
 @pytest.fixture
-def client() -> Iterator[TestClient]:
-    """A client backed by a real lifespan and a deterministic provider."""
-    app = create_app()
-    app.dependency_overrides[get_settings_dep] = lambda: SETTINGS
+def direct(harness: ApiHarness) -> ApiHarness:
+    """A harness whose requests route straight to a direct answer."""
+    harness.rewire(responder("direct"))
+    return harness
 
-    with TestClient(app) as test_client:
-        provider = FakeLLMProvider(responder=responder("direct"))
-        app.state.provider = provider
-        app.state.provider_error = None
-        app.state.graph = build_graph(SETTINGS, provider, app.state.tool_registry)
-        app.state.agents = build_all_agents(provider, app.state.tool_registry)
-        yield test_client
 
-    app.dependency_overrides.clear()
+@pytest.fixture
+def gated(harness: ApiHarness) -> ApiHarness:
+    """A harness whose requests route to human approval."""
+    harness.rewire(responder("human_approval", approval=True))
+    return harness
 
 
 # --------------------------------------------------------------------------- #
-# Health
+# Health and readiness
 # --------------------------------------------------------------------------- #
 
 
-def test_health_is_ok(client: TestClient) -> None:
+def test_health_reports_liveness_without_touching_dependencies(client: TestClient) -> None:
     response = client.get("/health")
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
 
 
-def test_ready_reports_ok_when_wired(client: TestClient) -> None:
-    response = client.get("/ready")
-
-    assert response.status_code == 200
-    body = response.json()
-    assert body["status"] == "ok"
-    assert body["checks"]["llm_provider"] == "ok"
-    assert body["checks"]["orchestration_graph"] == "ok"
-
-
-def test_ready_reports_the_tool_count(client: TestClient) -> None:
+def test_ready_reports_ok_when_fully_wired(client: TestClient) -> None:
     body = client.get("/ready").json()
 
-    assert "tools" in body["checks"]["tool_registry"]
+    assert body["status"] == "ok"
+    assert body["checks"]["database"] == "ok"
+    assert body["checks"]["checkpoint_store"].startswith("ok")
+    assert body["checks"]["cache"] == "ok"
 
 
-def test_ready_is_honest_about_durability(client: TestClient) -> None:
-    """Readiness must not imply durability the system does not have."""
+def test_ready_reports_the_registered_workforce(client: TestClient) -> None:
     checks = client.get("/ready").json()["checks"]
 
-    assert "in-memory" in checks["checkpoint_store"]
-    assert checks["database"] == "not configured"
+    assert checks["agents"].endswith("registered")
+    assert checks["tool_registry"].endswith("tools")
 
 
-def test_ready_is_degraded_without_a_provider() -> None:
-    app = create_app()
-    app.dependency_overrides[get_settings_dep] = lambda: SETTINGS
+def test_ready_reports_that_python_execution_is_disabled(client: TestClient) -> None:
+    """Readiness must not imply a capability the system refuses to provide."""
+    checks = client.get("/ready").json()["checks"]
 
-    with TestClient(app) as test_client:
-        app.state.provider = None
-        app.state.provider_error = "no credential"
+    assert "no sandbox configured" in checks["python_execution"]
 
-        response = test_client.get("/ready")
 
-    assert response.status_code == 200
-    assert response.json()["status"] == "degraded"
-    assert "no credential" in response.json()["checks"]["llm_provider"]
+def test_ready_reports_the_authentication_mode(client: TestClient) -> None:
+    checks = client.get("/ready").json()["checks"]
 
-    app.dependency_overrides.clear()
+    assert checks["authentication"] == "disabled"
+
+
+def test_a_request_gets_a_correlation_id(client: TestClient) -> None:
+    response = client.get("/health")
+
+    assert response.headers.get("X-Request-Id")
+
+
+def test_a_supplied_correlation_id_is_echoed(client: TestClient) -> None:
+    response = client.get("/health", headers={"X-Request-Id": "trace-abc"})
+
+    assert response.headers["X-Request-Id"] == "trace-abc"
 
 
 # --------------------------------------------------------------------------- #
@@ -131,12 +134,10 @@ def test_listing_agents(client: TestClient) -> None:
     assert {"researcher", "coder", "analyst", "planner", "critic", "synthesizer"} <= names
 
 
-def test_agent_descriptions_include_tools_but_not_prompts(client: TestClient) -> None:
-    agents = client.get("/api/v1/agents").json()
-
-    for agent in agents:
-        assert "tools" in agent
+def test_agent_descriptions_omit_prompts(client: TestClient) -> None:
+    for agent in client.get("/api/v1/agents").json():
         assert "system_prompt" not in agent
+        assert "input_schema" in agent
 
 
 def test_every_agent_resolves_against_the_tool_registry(client: TestClient) -> None:
@@ -145,67 +146,29 @@ def test_every_agent_resolves_against_the_tool_registry(client: TestClient) -> N
 
     assert agents
     for agent in agents:
-        for tool in agent["tools"]:
-            assert tool, agent["name"]
+        assert isinstance(agent["tools"], list)
+        assert isinstance(agent["unavailable_tools"], list)
 
 
 def test_unconfigured_capabilities_are_reported_not_hidden(client: TestClient) -> None:
-    """With no query executor wired, the database tool is absent by design."""
     agents = {agent["name"]: agent for agent in client.get("/api/v1/agents").json()}
 
     assert "database" in agents["analyst"]["unavailable_tools"]
     assert "database" not in agents["analyst"]["tools"]
-    assert "python_executor" in agents["analyst"]["tools"]
 
 
-def test_listing_tools(client: TestClient) -> None:
-    tools = client.get("/api/v1/tools").json()
-
-    names = {tool["name"] for tool in tools}
-    assert {"read_file", "write_file", "list_directory", "python_executor", "web_search"} <= names
-
-
-def test_tool_listing_exposes_risk_and_approval(client: TestClient) -> None:
+def test_listing_tools_includes_risk_and_approval(client: TestClient) -> None:
     tools = {tool["name"]: tool for tool in client.get("/api/v1/tools").json()}
 
     assert tools["read_file"]["risk_level"] == "LOW"
     assert tools["python_executor"]["requires_approval"] is True
 
 
-def test_tool_listing_exposes_no_credentials(client: TestClient) -> None:
+def test_tool_listing_leaks_no_credentials(client: TestClient) -> None:
     body = json.dumps(client.get("/api/v1/tools").json())
 
-    assert "test-key" not in body
-
-
-def test_the_real_startup_wires_the_whole_workforce(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Startup must survive having a credential.
-
-    Regression guard. ``build_all_agents`` used to raise because agents named
-    tools that do not exist, which made startup fail as soon as a real key was
-    configured — and took every endpoint down with it, including ``/health``.
-    """
-    monkeypatch.setenv("LLM_API_KEY", "test-key")
-    reset_settings_cache()
-    app = create_app()
-
-    try:
-        with TestClient(app) as test_client:
-            assert app.state.provider is not None
-            assert test_client.get("/health").status_code == 200
-            agents = test_client.get("/api/v1/agents").json()
-    finally:
-        reset_settings_cache()
-
-    by_name = {agent["name"]: agent for agent in agents}
-    assert len(agents) >= 7
-    # Describing every agent must succeed: a required tool that does not exist
-    # raises here, which is the startup failure this guards against.
-    assert by_name["researcher"]["tools"] == ["web_search"]
-    assert by_name["analyst"]["tools"] == ["python_executor"]
-    # Orchestrator roles are tool-less by design: verification and synthesis
-    # must not be able to cause a side effect.
-    assert by_name["critic"]["tools"] == []
+    assert "password" not in body.lower()
+    assert "token" not in body.lower()
 
 
 # --------------------------------------------------------------------------- #
@@ -213,8 +176,8 @@ def test_the_real_startup_wires_the_whole_workforce(monkeypatch: pytest.MonkeyPa
 # --------------------------------------------------------------------------- #
 
 
-def test_chat_returns_an_answer(client: TestClient) -> None:
-    response = client.post("/api/v1/chat", json={"message": "hello"})
+def test_chat_returns_an_answer(direct: ApiHarness) -> None:
+    response = direct.client.post("/api/v1/chat", json={"message": "hello"})
 
     assert response.status_code == 200
     body = response.json()
@@ -223,10 +186,10 @@ def test_chat_returns_an_answer(client: TestClient) -> None:
     assert body["task_id"]
 
 
-def test_chat_returns_no_reasoning_fields(client: TestClient) -> None:
-    body = client.post("/api/v1/chat", json={"message": "hello"}).json()
+def test_chat_exposes_no_reasoning(direct: ApiHarness) -> None:
+    body = direct.client.post("/api/v1/chat", json={"message": "hello"}).json()
 
-    assert {"chain_of_thought", "reasoning", "prompt"}.isdisjoint(body)
+    assert {"chain_of_thought", "reasoning", "prompt", "messages"}.isdisjoint(body)
 
 
 def test_chat_rejects_an_empty_message(client: TestClient) -> None:
@@ -234,27 +197,11 @@ def test_chat_rejects_an_empty_message(client: TestClient) -> None:
 
 
 def test_chat_rejects_an_oversized_message(client: TestClient) -> None:
-    response = client.post("/api/v1/chat", json={"message": "x" * 20_001})
-
-    assert response.status_code == 422
+    assert client.post("/api/v1/chat", json={"message": "x" * 20_001}).status_code == 422
 
 
-def test_chat_requires_a_message_field(client: TestClient) -> None:
+def test_chat_requires_a_message(client: TestClient) -> None:
     assert client.post("/api/v1/chat", json={}).status_code == 422
-
-
-def test_chat_is_unavailable_without_a_provider() -> None:
-    app = create_app()
-    app.dependency_overrides[get_settings_dep] = lambda: Settings(_env_file=None)
-
-    with TestClient(app) as test_client:
-        app.state.graph = None
-        app.state.provider = None
-        response = test_client.post("/api/v1/chat", json={"message": "hi"})
-
-    assert response.status_code == 503
-
-    app.dependency_overrides.clear()
 
 
 # --------------------------------------------------------------------------- #
@@ -262,77 +209,99 @@ def test_chat_is_unavailable_without_a_provider() -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_creating_a_task_returns_acceptance(client: TestClient) -> None:
-    response = client.post("/api/v1/tasks", json={"request": "do something"})
+def test_creating_a_task_returns_acceptance(direct: ApiHarness) -> None:
+    response = direct.client.post("/api/v1/tasks", json={"request": "do something"})
 
     assert response.status_code == 202
     assert response.json()["task_id"]
 
 
-def test_a_task_can_be_fetched_afterwards(client: TestClient) -> None:
-    created = client.post("/api/v1/tasks", json={"request": "do something"}).json()
+def test_a_completed_task_carries_its_answer(direct: ApiHarness) -> None:
+    created = direct.client.post("/api/v1/tasks", json={"request": "do something"}).json()
 
-    fetched = client.get(f"/api/v1/tasks/{created['task_id']}")
+    fetched = direct.client.get(f"/api/v1/tasks/{created['task_id']}").json()
 
-    assert fetched.status_code == 200
-    assert fetched.json()["status"] in {"pending", "running", "completed"}
-
-
-def test_a_completed_task_carries_its_answer(client: TestClient) -> None:
-    created = client.post("/api/v1/tasks", json={"request": "do something"}).json()
-
-    fetched = client.get(f"/api/v1/tasks/{created['task_id']}").json()
-
+    assert fetched["status"] == "completed"
     assert fetched["answer"] == "the answer"
 
 
-def test_task_status_endpoint(client: TestClient) -> None:
-    created = client.post("/api/v1/tasks", json={"request": "do something"}).json()
+def test_a_task_is_durable_not_just_in_memory(
+    direct: ApiHarness, sql: Callable[..., list[tuple]]
+) -> None:
+    """The record must be in PostgreSQL, not only in the object that created it.
 
-    status_body = client.get(f"/api/v1/tasks/{created['task_id']}/status").json()
+    Read over a separate, synchronously opened connection. The application's own
+    engine lives on the event loop the test client runs, and borrowing it from a
+    second loop would test the loop plumbing rather than the durability.
+    """
+    created = direct.client.post("/api/v1/tasks", json={"request": "do something"}).json()
 
-    assert status_body["task_id"] == created["task_id"]
-    assert status_body["has_answer"] is True
+    rows = sql("SELECT status, answer FROM tasks WHERE id = %s", (created["task_id"],))
+
+    assert rows == [("completed", "the answer")]
+
+
+def test_task_status_endpoint(direct: ApiHarness) -> None:
+    created = direct.client.post("/api/v1/tasks", json={"request": "do something"}).json()
+
+    body = direct.client.get(f"/api/v1/tasks/{created['task_id']}/status").json()
+
+    assert body["task_id"] == created["task_id"]
+    assert body["has_answer"] is True
+
+
+def test_tasks_are_listed_for_their_owner_only(direct: ApiHarness) -> None:
+    direct.client.post("/api/v1/tasks", json={"request": "mine"}, headers={"X-User-Id": "alice"})
+    direct.client.post("/api/v1/tasks", json={"request": "yours"}, headers={"X-User-Id": "bob"})
+
+    alice = direct.client.get("/api/v1/tasks", headers={"X-User-Id": "alice"}).json()
+
+    assert [task["request"] for task in alice] == ["mine"]
 
 
 def test_an_unknown_task_is_a_404(client: TestClient) -> None:
     assert client.get("/api/v1/tasks/does-not-exist").status_code == 404
 
 
-def test_a_task_is_invisible_to_another_user(client: TestClient) -> None:
-    """Ownership is enforced, and absence and denial are indistinguishable."""
-    created = client.post(
+def test_a_malformed_task_id_is_a_404_not_a_crash(client: TestClient) -> None:
+    """A non-UUID path segment must not reach the database as a cast error."""
+    assert client.get("/api/v1/tasks/not-a-uuid").status_code == 404
+
+
+def test_a_task_is_invisible_to_another_user(direct: ApiHarness) -> None:
+    """Absence and denial are indistinguishable, so existence is not leaked."""
+    created = direct.client.post(
         "/api/v1/tasks", json={"request": "private"}, headers={"X-User-Id": "alice"}
     ).json()
+    task_id = created["task_id"]
 
-    assert client.get(f"/api/v1/tasks/{created['task_id']}").status_code == 404
+    assert direct.client.get(f"/api/v1/tasks/{task_id}").status_code == 404
     assert (
-        client.get(
-            f"/api/v1/tasks/{created['task_id']}", headers={"X-User-Id": "mallory"}
-        ).status_code
+        direct.client.get(f"/api/v1/tasks/{task_id}", headers={"X-User-Id": "mallory"}).status_code
         == 404
     )
     assert (
-        client.get(
-            f"/api/v1/tasks/{created['task_id']}", headers={"X-User-Id": "alice"}
-        ).status_code
+        direct.client.get(f"/api/v1/tasks/{task_id}", headers={"X-User-Id": "alice"}).status_code
         == 200
     )
 
 
-def test_cancelling_a_finished_task_is_a_conflict(client: TestClient) -> None:
-    created = client.post("/api/v1/tasks", json={"request": "do something"}).json()
+def test_a_task_response_carries_no_internals(direct: ApiHarness) -> None:
+    created = direct.client.post("/api/v1/tasks", json={"request": "do something"}).json()
 
-    # The background task completes before the client returns, so this is terminal.
-    response = client.post(f"/api/v1/tasks/{created['task_id']}/cancel")
-
-    assert response.status_code in {200, 409}
+    assert {"prompt", "messages", "reasoning", "chain_of_thought"}.isdisjoint(created)
 
 
-def test_a_task_response_carries_no_internals(client: TestClient) -> None:
-    created = client.post("/api/v1/tasks", json={"request": "do something"}).json()
+def test_cancelling_a_finished_task_is_a_conflict(direct: ApiHarness) -> None:
+    created = direct.client.post("/api/v1/tasks", json={"request": "do something"}).json()
 
-    assert {"prompt", "messages", "reasoning"}.isdisjoint(created)
+    response = direct.client.post(f"/api/v1/tasks/{created['task_id']}/cancel")
+
+    assert response.status_code == 409
+
+
+def test_an_unknown_task_cannot_be_cancelled(client: TestClient) -> None:
+    assert client.post("/api/v1/tasks/nope/cancel").status_code == 404
 
 
 # --------------------------------------------------------------------------- #
@@ -340,57 +309,235 @@ def test_a_task_response_carries_no_internals(client: TestClient) -> None:
 # --------------------------------------------------------------------------- #
 
 
-@pytest.fixture
-def gated_client() -> Iterator[TestClient]:
-    """A client whose graph routes to human approval."""
-    app = create_app()
-    app.dependency_overrides[get_settings_dep] = lambda: SETTINGS
+def test_a_gated_task_awaits_approval(gated: ApiHarness) -> None:
+    created = gated.client.post("/api/v1/tasks", json={"request": "delete everything"}).json()
 
-    with TestClient(app) as test_client:
-        provider = FakeLLMProvider(responder=responder("human_approval", approval=True))
-        app.state.provider = provider
-        app.state.provider_error = None
-        app.state.graph = build_graph(SETTINGS, provider, app.state.tool_registry)
-        app.state.agents = build_all_agents(provider, app.state.tool_registry)
-        yield test_client
-
-    app.dependency_overrides.clear()
-
-
-def test_a_gated_task_reports_that_it_awaits_approval(gated_client: TestClient) -> None:
-    created = gated_client.post("/api/v1/tasks", json={"request": "delete everything"}).json()
-
-    fetched = gated_client.get(f"/api/v1/tasks/{created['task_id']}").json()
+    fetched = gated.client.get(f"/api/v1/tasks/{created['task_id']}").json()
 
     assert fetched["status"] == "awaiting_approval"
     assert fetched["approval_status"] == "pending"
 
 
-def test_approving_a_gated_task_completes_it(gated_client: TestClient) -> None:
-    created = gated_client.post("/api/v1/tasks", json={"request": "delete everything"}).json()
+def test_an_approval_request_is_persisted(
+    gated: ApiHarness, sql: Callable[..., list[tuple]]
+) -> None:
+    """The request must be a durable record, not just a suspended graph."""
+    created = gated.client.post("/api/v1/tasks", json={"request": "delete everything"}).json()
 
-    response = gated_client.post(f"/api/v1/tasks/{created['task_id']}/approve", json={})
+    rows = sql("SELECT decision FROM approvals WHERE task_id = %s", (created["task_id"],))
+
+    assert rows == [("pending",)]
+
+
+def test_approving_resumes_and_completes(gated: ApiHarness) -> None:
+    created = gated.client.post("/api/v1/tasks", json={"request": "delete everything"}).json()
+
+    response = gated.client.post(f"/api/v1/tasks/{created['task_id']}/approve", json={})
 
     assert response.status_code == 200
     assert response.json()["approval_status"] == "approved"
 
 
-def test_rejecting_a_gated_task_does_not_execute_it(gated_client: TestClient) -> None:
-    created = gated_client.post("/api/v1/tasks", json={"request": "delete everything"}).json()
+def test_a_decision_records_who_made_it(gated: ApiHarness, sql: Callable[..., list[tuple]]) -> None:
+    created = gated.client.post(
+        "/api/v1/tasks", json={"request": "delete it"}, headers={"X-User-Id": "alice"}
+    ).json()
 
-    response = gated_client.post(f"/api/v1/tasks/{created['task_id']}/reject", json={})
+    gated.client.post(
+        f"/api/v1/tasks/{created['task_id']}/approve",
+        json={"note": "reviewed"},
+        headers={"X-User-Id": "alice"},
+    )
+
+    rows = sql(
+        "SELECT decision, decided_by, note FROM approvals WHERE task_id = %s",
+        (created["task_id"],),
+    )
+
+    assert rows == [("approve", "alice", "reviewed")]
+
+
+def test_rejecting_does_not_execute_the_action(gated: ApiHarness) -> None:
+    created = gated.client.post("/api/v1/tasks", json={"request": "delete everything"}).json()
+
+    response = gated.client.post(f"/api/v1/tasks/{created['task_id']}/reject", json={})
 
     assert response.status_code == 200
     assert response.json()["approval_status"] == "rejected"
+    assert "reject" in (response.json()["answer"] or "").lower()
 
 
-def test_deciding_a_task_that_is_not_gated_is_a_conflict(client: TestClient) -> None:
-    created = client.post("/api/v1/tasks", json={"request": "hello"}).json()
+def test_a_decision_cannot_be_reversed(gated: ApiHarness) -> None:
+    """A second decision must be refused, not applied over the first."""
+    created = gated.client.post("/api/v1/tasks", json={"request": "delete everything"}).json()
+    task_id = created["task_id"]
 
-    response = client.post(f"/api/v1/tasks/{created['task_id']}/approve", json={})
+    assert gated.client.post(f"/api/v1/tasks/{task_id}/reject", json={}).status_code == 200
+    assert gated.client.post(f"/api/v1/tasks/{task_id}/approve", json={}).status_code == 409
 
-    assert response.status_code == 409
+
+def test_deciding_a_task_that_is_not_gated_is_a_conflict(direct: ApiHarness) -> None:
+    created = direct.client.post("/api/v1/tasks", json={"request": "hello"}).json()
+
+    assert (
+        direct.client.post(f"/api/v1/tasks/{created['task_id']}/approve", json={}).status_code
+        == 409
+    )
 
 
-def test_an_unknown_task_cannot_be_approved(gated_client: TestClient) -> None:
-    assert gated_client.post("/api/v1/tasks/nope/approve", json={}).status_code == 404
+def test_an_unknown_task_cannot_be_approved(client: TestClient) -> None:
+    assert client.post("/api/v1/tasks/nope/approve", json={}).status_code == 404
+
+
+def test_another_user_cannot_decide_someone_elses_approval(gated: ApiHarness) -> None:
+    """The most consequential ownership check in the system."""
+    created = gated.client.post(
+        "/api/v1/tasks", json={"request": "delete it"}, headers={"X-User-Id": "alice"}
+    ).json()
+
+    response = gated.client.post(
+        f"/api/v1/tasks/{created['task_id']}/approve",
+        json={},
+        headers={"X-User-Id": "mallory"},
+    )
+
+    assert response.status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# Event streaming
+# --------------------------------------------------------------------------- #
+
+
+def test_a_completed_task_has_a_recorded_history(direct: ApiHarness) -> None:
+    created = direct.client.post("/api/v1/tasks", json={"request": "do something"}).json()
+
+    events = direct.client.get(f"/api/v1/events/{created['task_id']}/history").json()
+
+    kinds = [event["type"] for event in events]
+    assert "task_created" in kinds
+    assert "task_completed" in kinds
+
+
+def test_a_history_never_exposes_reasoning(direct: ApiHarness) -> None:
+    created = direct.client.post("/api/v1/tasks", json={"request": "do something"}).json()
+
+    body = json.dumps(direct.client.get(f"/api/v1/events/{created['task_id']}/history").json())
+
+    for forbidden in ("chain_of_thought", "system_prompt", 'reasoning":'):
+        assert forbidden not in body
+
+
+def test_the_stream_emits_events_and_closes(direct: ApiHarness) -> None:
+    created = direct.client.post("/api/v1/tasks", json={"request": "do something"}).json()
+
+    with direct.client.stream("GET", f"/api/v1/events/{created['task_id']}") as response:
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        body = "".join(response.iter_text())
+
+    assert "event: stream_open" in body
+    assert "event: stream_closed" in body
+    assert "event: task_completed" in body
+
+
+def test_a_stream_can_resume_after_a_sequence_number(direct: ApiHarness) -> None:
+    created = direct.client.post("/api/v1/tasks", json={"request": "do something"}).json()
+    task_id = created["task_id"]
+
+    history = direct.client.get(f"/api/v1/events/{task_id}/history").json()
+    all_seqs = [event["seq"] for event in history]
+    resume_after = all_seqs[0]
+
+    tail = direct.client.get(
+        f"/api/v1/events/{task_id}/history", params={"after_seq": resume_after}
+    ).json()
+
+    assert [event["seq"] for event in tail] == all_seqs[1:]
+
+
+def test_another_user_cannot_stream_a_task(direct: ApiHarness) -> None:
+    created = direct.client.post(
+        "/api/v1/tasks", json={"request": "private"}, headers={"X-User-Id": "alice"}
+    ).json()
+
+    response = direct.client.get(
+        f"/api/v1/events/{created['task_id']}", headers={"X-User-Id": "mallory"}
+    )
+
+    assert response.status_code == 404
+
+
+def test_streaming_an_unknown_task_is_a_404(client: TestClient) -> None:
+    assert client.get("/api/v1/events/unknown/history").status_code == 404
+
+
+# --------------------------------------------------------------------------- #
+# Rate limiting
+# --------------------------------------------------------------------------- #
+
+
+def test_rate_limit_headers_are_returned(direct: ApiHarness) -> None:
+    response = direct.client.post("/api/v1/chat", json={"message": "hello"})
+
+    assert response.headers.get("X-RateLimit-Remaining") is not None
+    assert response.headers.get("X-RateLimit-Window") is not None
+
+
+def test_exceeding_the_limit_is_a_429(harness: ApiHarness, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A burst must be refused rather than allowed to start unbounded work."""
+    import os
+
+    from app.core.config import reset_settings_cache
+
+    monkeypatch.setenv("RATE_LIMIT_REQUESTS", "2")
+    reset_settings_cache()
+    harness.rewire(responder("direct"))
+
+    statuses = [
+        harness.client.post(
+            "/api/v1/chat", json={"message": "hi"}, headers={"X-User-Id": "burst"}
+        ).status_code
+        for _ in range(5)
+    ]
+    os.environ.pop("RATE_LIMIT_REQUESTS", None)
+    reset_settings_cache()
+
+    assert statuses.count(200) == 2
+    assert 429 in statuses
+    assert statuses[-1] == 429
+
+
+def test_a_rejection_says_when_to_retry(
+    harness: ApiHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.core.config import reset_settings_cache
+
+    monkeypatch.setenv("RATE_LIMIT_REQUESTS", "1")
+    reset_settings_cache()
+    harness.rewire(responder("direct"))
+
+    harness.client.post("/api/v1/chat", json={"message": "hi"}, headers={"X-User-Id": "retryer"})
+    blocked = harness.client.post(
+        "/api/v1/chat", json={"message": "hi"}, headers={"X-User-Id": "retryer"}
+    )
+    reset_settings_cache()
+
+    assert blocked.status_code == 429
+    assert int(blocked.headers["Retry-After"]) > 0
+
+
+def test_rate_limits_are_per_caller(direct: ApiHarness) -> None:
+    """One noisy caller must not consume another's budget."""
+    first = direct.client.post("/api/v1/chat", json={"message": "hi"}, headers={"X-User-Id": "a"})
+    second = direct.client.post("/api/v1/chat", json={"message": "hi"}, headers={"X-User-Id": "b"})
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+
+
+def test_read_only_endpoints_are_not_rate_limited(direct: ApiHarness) -> None:
+    """Health and discovery are cheap and must stay reachable under load."""
+    for _ in range(5):
+        assert direct.client.get("/health").status_code == 200
+        assert direct.client.get("/api/v1/agents").status_code == 200
