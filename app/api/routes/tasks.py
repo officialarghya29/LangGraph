@@ -19,9 +19,11 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.api.dependencies import (
     GraphDep,
+    MetricsDep,
     PrincipalDep,
     SettingsDep,
     TaskStoreDep,
+    TracerDep,
     require_configured,
 )
 from app.core.exceptions import DatabaseError
@@ -129,6 +131,8 @@ async def create_task(
     graph: GraphDep,
     settings: SettingsDep,
     principal: PrincipalDep,
+    tracer: TracerDep,
+    metrics: MetricsDep,
 ) -> TaskResponse:
     """Create a task and start it in the background.
 
@@ -152,6 +156,11 @@ async def create_task(
         graph=graph,
         store=store,
         settings=settings,
+        # Captured here because a background task outlives the request that
+        # started it: reading them from ``request`` later would read a scope
+        # that no longer exists.
+        tracer=tracer,
+        metrics=metrics,
     )
 
     return TaskResponse.from_record(record)

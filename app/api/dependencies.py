@@ -17,6 +17,8 @@ from fastapi import Depends, HTTPException, Request, status
 
 from app.core.auth import Principal, PrincipalDep, SettingsDep, get_settings_dep
 from app.database.connection import Database
+from app.observability.metrics import MetricRegistry
+from app.observability.tracing import Tracer
 from app.services.cache import Cache
 from app.services.task_store import PostgresTaskStore
 from app.services.tasks import InMemoryTaskStore
@@ -25,18 +27,22 @@ __all__ = [
     "CacheDep",
     "DatabaseDep",
     "GraphDep",
+    "MetricsDep",
     "Principal",
     "PrincipalDep",
     "RegistryDep",
     "SettingsDep",
     "TaskStoreDep",
+    "TracerDep",
     "get_cache",
     "get_database",
     "get_graph",
+    "get_metrics",
     "get_provider",
     "get_registry",
     "get_settings_dep",
     "get_task_store",
+    "get_tracer",
     "require_configured",
 ]
 
@@ -104,11 +110,25 @@ def get_graph(request: Request) -> Any:
     return graph
 
 
+def get_metrics(request: Request) -> MetricRegistry | None:
+    """Return the application's metrics registry, if one was built."""
+    metrics: MetricRegistry | None = getattr(request.app.state, "metrics", None)
+    return metrics
+
+
+def get_tracer(request: Request) -> Tracer | None:
+    """Return the application's tracer, if one was built."""
+    tracer: Tracer | None = getattr(request.app.state, "tracer", None)
+    return tracer
+
+
 TaskStoreDep = Annotated[AnyTaskStore, Depends(get_task_store)]
 CacheDep = Annotated[Cache, Depends(get_cache)]
 DatabaseDep = Annotated[Database, Depends(get_database)]
 GraphDep = Annotated[Any, Depends(get_graph)]
 RegistryDep = Annotated[Any, Depends(get_registry)]
+MetricsDep = Annotated[MetricRegistry | None, Depends(get_metrics)]
+TracerDep = Annotated[Tracer | None, Depends(get_tracer)]
 
 
 def require_configured(settings: SettingsDep) -> None:

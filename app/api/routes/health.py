@@ -116,6 +116,20 @@ async def ready(request: Request) -> ReadyResponse:
         "enabled" if settings.python_execution_enabled else "disabled (no sandbox configured)"
     )
 
+    # Observability is reported but never part of ``serving``: losing metrics
+    # degrades how well the system can be understood, not whether it can do the
+    # work it was asked to do.
+    metrics = getattr(state, "metrics", None)
+    if not settings.metrics_enabled:
+        checks["metrics"] = "disabled by configuration"
+    elif metrics is None:
+        checks["metrics"] = "unavailable"
+    else:
+        checks["metrics"] = f"ok ({metrics.series_count} series)"
+
+    tracer = getattr(state, "tracer", None)
+    checks["tracing"] = f"ok ({tracer.service_name})" if tracer is not None else "unavailable"
+
     # Serving means the things a task cannot do without. A missing cache degrades
     # performance; a missing database or checkpointer means work would be
     # accepted and silently lost.

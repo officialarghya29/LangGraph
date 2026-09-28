@@ -25,6 +25,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from app.core.auth import ANONYMOUS_USER_ID, AUTHORIZATION_HEADER, IDENTITY_HEADER, decode_token
 from app.core.config import Settings, get_settings
 from app.core.exceptions import CacheError
+from app.observability.metrics import MetricRegistry
 from app.services.cache import Cache
 
 __all__ = ["RateLimitMiddleware", "RequestContextMiddleware", "install_rate_limiting"]
@@ -38,6 +39,10 @@ REQUEST_ID_HEADER = "X-Request-Id"
 RATE_LIMIT_REMAINING_HEADER = "X-RateLimit-Remaining"
 #: Header carrying the window length, so a client can back off sensibly.
 RATE_LIMIT_WINDOW_HEADER = "X-RateLimit-Window"
+
+#: Metric label used for a request that matched no route. A constant, because
+#: the alternative is a label value the caller chooses.
+UNMATCHED_ROUTE = "<unmatched>"
 
 
 class RequestContextMiddleware:
@@ -75,6 +80,7 @@ class RequestContextMiddleware:
             await self.app(scope, receive, send_with_context)
         finally:
             elapsed_ms = round((time.perf_counter() - started) * 1000, 3)
+            status = status_holder.get("status", 500)
             # Never log the query string or the body: either can carry a token,
             # a prompt, or a user identifier that does not belong in a log line.
             logger.info(
@@ -83,10 +89,50 @@ class RequestContextMiddleware:
                     "request_id": request_id,
                     "method": scope.get("method"),
                     "path": scope.get("path"),
-                    "status": status_holder.get("status", 500),
+                    "status": status,
                     "duration_ms": elapsed_ms,
                 },
             )
+            self._record(scope, status, elapsed_ms / 1000)
+
+    @staticmethod
+    def _record(scope: Scope, status: int, seconds: float) -> None:
+        """Record the request's count and duration.
+
+        The route *template* is used where Starlette has resolved one, so
+        ``/api/v1/tasks/{task_id}`` is one series rather than one series per id.
+        That is the difference between a useful metric and a cardinality
+        explosion, and it is why the path is read from the route rather than
+        from the raw request.
+
+        A request that matched no route is bucketed under a single constant. An
+        unmatched path is attacker-chosen, so labelling by it would let anyone
+        mint unbounded series and take down the metrics backend — a denial of
+        service against monitoring rather than against the service, which is
+        exactly the kind of failure that is noticed too late.
+        """
+        metrics: MetricRegistry | None = getattr(
+            getattr(scope.get("app"), "state", None), "metrics", None
+        )
+        if metrics is None:
+            return
+
+        route = scope.get("route")
+        path = getattr(route, "path", None) or UNMATCHED_ROUTE
+        # The status class, not the exact code: 4xx vs 5xx is the distinction an
+        # alert acts on, and the code itself is already in the access log.
+        metrics.increment(
+            "http_requests_total",
+            method=str(scope.get("method", "")),
+            path=path,
+            status=f"{status // 100}xx",
+        )
+        metrics.observe(
+            "http_request_duration_seconds",
+            seconds,
+            method=str(scope.get("method", "")),
+            path=path,
+        )
 
 
 #: Which paths are limited, and how. A prefix match keeps this readable and

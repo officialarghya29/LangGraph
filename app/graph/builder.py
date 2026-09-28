@@ -22,6 +22,7 @@ from app.agents.analyst import DataAnalysisAgent
 from app.agents.base import BaseAgent
 from app.agents.coder import CodingAgent
 from app.agents.critic import CriticAgent
+from app.agents.document import DocumentAgent
 from app.agents.executor import ExecutorAgent
 from app.agents.planner import PlannerAgent
 from app.agents.researcher import ResearchAgent
@@ -86,6 +87,7 @@ def build_workforce(
         ResearchAgent(provider, registry),
         CodingAgent(provider, registry),
         DataAnalysisAgent(provider, registry),
+        DocumentAgent(provider, registry),
     ]
 
     missing = sorted(

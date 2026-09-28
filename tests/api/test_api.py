@@ -541,3 +541,67 @@ def test_read_only_endpoints_are_not_rate_limited(direct: ApiHarness) -> None:
     for _ in range(5):
         assert direct.client.get("/health").status_code == 200
         assert direct.client.get("/api/v1/agents").status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# Observability
+# --------------------------------------------------------------------------- #
+
+
+def test_metrics_are_served_in_the_prometheus_format(direct: ApiHarness) -> None:
+    direct.client.get("/health")
+
+    response = direct.client.get("/metrics")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    assert "http_requests_total" in response.text
+
+
+def test_a_request_is_counted_against_its_route_template(direct: ApiHarness) -> None:
+    """The id must not become a label, or cardinality grows with traffic."""
+    direct.client.get("/api/v1/agents")
+
+    body = direct.client.get("/metrics").text
+
+    assert 'path="/api/v1/agents"' in body
+
+
+def test_an_unmatched_path_is_bucketed_under_a_constant(direct: ApiHarness) -> None:
+    """An unmatched path is caller-chosen, so it must never become a label."""
+    attacker_controlled = "/definitely/not/a/route/9f3a1c"
+    direct.client.get(attacker_controlled)
+
+    body = direct.client.get("/metrics").text
+
+    assert attacker_controlled not in body
+    assert 'path="<unmatched>"' in body
+
+
+def test_startup_gauges_describe_the_running_application(direct: ApiHarness) -> None:
+    body = direct.client.get("/metrics").text
+
+    assert "registered_agents 8" in body
+    assert "registered_tools 7" in body
+
+
+def test_a_task_outcome_is_counted(direct: ApiHarness) -> None:
+    """The span covers the run, and its outcome lands in a fixed set of buckets."""
+    created = direct.client.post("/api/v1/tasks", json={"request": "say hi"}).json()
+    assert direct.client.get(f"/api/v1/tasks/{created['task_id']}").json()["status"] == (
+        "completed"
+    )
+
+    body = direct.client.get("/metrics").text
+
+    assert 'tasks_total{outcome="completed"} 1' in body
+    assert 'spans_total{span="task.execute",status="ok"} 1' in body
+
+
+def test_a_metrics_scrape_is_not_itself_an_event_source(direct: ApiHarness) -> None:
+    """Scraping twice must be idempotent for every series but the scrape's own."""
+    first = direct.client.get("/metrics").text
+    second = direct.client.get("/metrics").text
+
+    assert "registered_agents 8" in first
+    assert "registered_agents 8" in second

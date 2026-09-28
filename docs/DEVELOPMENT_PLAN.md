@@ -53,7 +53,7 @@ NEXT PHASE:
 | 12 | Base agent contract | **Complete** |
 | 13 | Planner agent | **Complete** |
 | 14 | Structured intent routing | **Complete** |
-| 15 | Specialist agents | Partial — research, coding, analysis, executor done; document agent pending |
+| 15 | Specialist agents | **Complete** — research, coding, analysis, document, and executor |
 | 16 | LangGraph orchestration graph | **Complete** |
 | 17 | Bounded parallel dispatch | **Complete** |
 | 18 | Failure classification and retry policy | **Complete** |
@@ -65,7 +65,7 @@ NEXT PHASE:
 | 24 | Execution-event streaming | **Complete** — SSE over the durable event log, with a replay endpoint |
 | 25 | Authorization and ownership | **Complete** — every read is scoped to the caller; cross-user access is refused |
 | 26 | Rate limiting | **Complete** — fixed-window counters in Redis, with a configurable fail-open or fail-closed posture |
-| 27 | Observability | Partial — structured logging, correlation ids, and a durable event log; metrics and tracing pending |
+| 27 | Observability | **Complete** — structured logging, correlation ids, the durable event log, Prometheus metrics, and span tracing |
 | 28-33 | Prompt injection, SSRF, filesystem, sandbox, database and GitHub policy | **Complete** — enforced per tool, not per call site |
 | 34-37 | Testing, failure injection, evaluation, optimization | Not started |
 | 38-39 | Docker, migration verification | Blocked — no Docker on host |

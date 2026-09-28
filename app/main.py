@@ -37,6 +37,7 @@ from app.api.routes.agents import router as discovery_router
 from app.api.routes.chat import router as chat_router
 from app.api.routes.events import router as events_router
 from app.api.routes.health import router as health_router
+from app.api.routes.metrics import router as metrics_router
 from app.api.routes.tasks import router as tasks_router
 from app.core.config import get_settings
 from app.core.exceptions import (
@@ -55,6 +56,8 @@ from app.database.connection import Database
 from app.database.sql_executor import SqlQueryExecutor
 from app.graph.builder import build_all_agents, build_graph
 from app.graph.checkpoints import CheckpointHandle, open_checkpointer
+from app.observability.metrics import MetricRegistry
+from app.observability.tracing import build_tracer
 from app.services.cache import build_cache
 from app.services.llm import build_llm_provider
 from app.services.memory import build_memory_manager
@@ -106,6 +109,10 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         "startup.begin",
         extra={"app": settings.app_name, "env": settings.app_env},
     )
+
+    # Built first: the request middleware reads it from the application state to
+    # record every request, including the ones that fail during startup work.
+    application.state.metrics = MetricRegistry()
 
     database = Database(
         settings.database_url,
@@ -166,6 +173,9 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
     registry = build_default_registry(settings, query_executor=sql_executor)
     application.state.tool_registry = registry
 
+    application.state.tracer = build_tracer(settings, metrics=application.state.metrics)
+    application.state.metrics.set_gauge("registered_tools", len(registry.list()))
+
     checkpoint: CheckpointHandle = await open_checkpointer(settings)
     application.state.checkpointer = checkpoint
     if not checkpoint.durable:
@@ -192,6 +202,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
             memory=getattr(application.state, "memory", None),
         )
         application.state.agents = build_all_agents(provider, registry)
+        application.state.metrics.set_gauge("registered_agents", len(application.state.agents))
         logger.info("startup.graph_ready", extra={"agents": len(application.state.agents)})
 
     logger.info("startup.complete")
@@ -242,6 +253,7 @@ def create_app() -> FastAPI:
     application.include_router(tasks_router)
     application.include_router(events_router)
     application.include_router(discovery_router)
+    application.include_router(metrics_router)
 
     return application
 

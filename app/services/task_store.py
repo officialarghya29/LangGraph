@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from typing import Any
 
@@ -40,6 +41,8 @@ from app.graph.nodes import event_sink_for
 from app.graph.state import initial_state
 from app.models.approval import ApprovalStatus
 from app.models.execution import TaskStatus
+from app.observability.metrics import MetricRegistry
+from app.observability.tracing import Tracer
 
 __all__ = ["PostgresTaskStore", "TaskRecord", "TaskStore", "execute_task_with_store"]
 
@@ -483,6 +486,8 @@ async def execute_task_with_store(
     graph: Any,
     store: TaskStore,
     settings: Settings,
+    tracer: Tracer | None = None,
+    metrics: MetricRegistry | None = None,
 ) -> None:
     """Run one task through the graph and record the outcome durably.
 
@@ -495,6 +500,35 @@ async def execute_task_with_store(
         graph: The compiled orchestration graph.
         store: Where to record progress.
         settings: Application settings, for the execution ceilings.
+        tracer: Optional tracer. The span covers the whole run, so its duration
+            is the number that matters when a task feels slow.
+        metrics: Optional registry for task outcomes.
+    """
+
+    def record_outcome(outcome: str) -> None:
+        """Count a terminal outcome. Only three exist, so cardinality is fixed."""
+        if metrics is not None:
+            metrics.increment("tasks_total", outcome=outcome)
+
+    span_context = tracer.span("task.execute", task_id=task_id) if tracer else nullcontext()
+    with span_context:
+        await _execute_task(
+            task_id, graph=graph, store=store, settings=settings, record_outcome=record_outcome
+        )
+
+
+async def _execute_task(
+    task_id: str,
+    *,
+    graph: Any,
+    store: TaskStore,
+    settings: Settings,
+    record_outcome: Callable[[str], None],
+) -> None:
+    """Carry out one run and record its outcome.
+
+    Split from :func:`execute_task_with_store` so the span and the work have the
+    same lifetime without the whole body being indented under a ``with``.
     """
     record = await store.get(task_id)
     if record is None:  # pragma: no cover - defensive
@@ -532,6 +566,7 @@ async def execute_task_with_store(
             finished_at=datetime.now(UTC),
         )
         await store.append_event(task_id, "task_failed", {"reason": reason})
+        record_outcome("failed")
         return
 
     approval_status = result.get("approval_status")
@@ -552,6 +587,7 @@ async def execute_task_with_store(
             risk_level="HIGH",
         )
         await store.append_event(task_id, "approval_required", {"route": route_name})
+        record_outcome("awaiting_approval")
         return
 
     metadata = result.get("execution_metadata")
@@ -569,3 +605,4 @@ async def execute_task_with_store(
         ),
     )
     await store.append_event(task_id, "task_completed", {"route": route_name})
+    record_outcome("completed")

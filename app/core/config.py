@@ -170,6 +170,13 @@ class Settings(BaseSettings):
     # --- Observability ----------------------------------------------------- #
     otel_exporter_otlp_endpoint: str | None = None
     otel_service_name: str = "langgraph-multi-agent"
+    #: Serve ``GET /metrics`` in the Prometheus text format. On by default, and
+    #: deliberately not authenticated: the endpoint exposes operation names,
+    #: statuses, and timings, never a prompt, a task id, or a credential. If it
+    #: ever would, the fix is to stop recording that label, not to hide the page.
+    metrics_enabled: bool = True
+    #: How many completed spans the tracer keeps for introspection.
+    trace_history_size: int = Field(default=200, ge=0, le=10_000)
 
     # ------------------------------------------------------------------ #
     # Derived values

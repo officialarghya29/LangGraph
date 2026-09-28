@@ -24,7 +24,7 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 
 [![Ruff](https://img.shields.io/badge/Ruff-passing-D7FF64?style=for-the-badge&logo=ruff&logoColor=black)](#quality-gates)
 [![MyPy](https://img.shields.io/badge/MyPy-strict-2A6DB2?style=for-the-badge)](#quality-gates)
-[![Tests](https://img.shields.io/badge/tests-559%20passing-brightgreen?style=for-the-badge)](#quality-gates)
+[![Tests](https://img.shields.io/badge/tests-592%20passing-brightgreen?style=for-the-badge)](#quality-gates)
 
 [![Status](https://img.shields.io/badge/phases-34%20of%2045-yellow?style=for-the-badge)](#build-status)
 [![License](https://img.shields.io/badge/license-proprietary-red?style=for-the-badge)](#license)
@@ -41,25 +41,25 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 > — not mocks, and not a plan.
 >
 > ```console
-> $ ruff format --check .   →  105 files already formatted
+> $ ruff format --check .   →  110 files already formatted
 > $ ruff check .            →  All checks passed
-> $ mypy app scripts        →  Success: no issues found in 67 source files
-> $ pytest                  →  559 passed in 21s
+> $ mypy app scripts        →  Success: no issues found in 71 source files
+> $ pytest                  →  592 passed in 30s
 > ```
 
 **Complete and verified (phases 0–33).** Typed configuration; the LLM and
 embedding provider abstractions; typed graph state; the structured execution
 event model; the tool framework with its security pipeline; seven tools behind
-per-tool policy; seven agents; the router, planner, critic, and synthesizer; the
+per-tool policy; eight agents; the router, planner, critic, and synthesizer; the
 orchestration graph with bounded parallel dispatch and classified retries;
 durable PostgreSQL checkpointing with interrupt/resume; approvals persisted to
 the database; the four-tier memory manager; the HTTP API with ownership enforced
 on every read, bearer-token authentication, rate limiting, and server-sent event
 streaming over a durable event log.
 
-**Partial.** Phase 15 — the document agent is not written, so no intent routes to
-it. Phase 27 — structured logging, correlation ids, and the event log exist;
-metrics and tracing do not.
+**Complete and verified (phases 0–33 + 15, 27).** Phase 27 adds a metrics
+registry with a Prometheus `/metrics` endpoint, per-route request counts and
+latency histograms, task-outcome counters, and span tracing over the run.
 
 **Not started.** Phases 34–37 (failure injection, evaluation, efficiency work),
 38–45 (containers, CI/CD, dashboard, final reviews).
@@ -264,7 +264,7 @@ runtime directly.
 | :--- | :--- | :--- |
 | **Edge / API** | HTTP surface, request validation, middleware, route handlers. Contains no business logic. | ✅ |
 | **Orchestration** | Task lifecycle, LangGraph runtime, intent routing, planning, dispatch, criticism, synthesis. | ✅ |
-| **Agents** | Research, coding, analysis, executor, planner, critic, synthesizer behind one base contract. Document agent pending. | 🔶 |
+| **Agents** | Research, coding, analysis, document, executor, planner, critic, synthesizer behind one base contract. | ✅ |
 | **Capability** | Tool registry, memory manager, checkpoint store, LLM and embedding abstractions. | ✅ |
 | **Infrastructure** | PostgreSQL for durability, Redis for cache and rate limiting, event log for audit. | ✅ |
 
@@ -280,6 +280,7 @@ runtime directly.
 | `app/services/` | Capability | 4–6, 18 |
 | `app/database/` | Infrastructure | 3 |
 | `app/observability/` | Cross-cutting | 27 |
+| `app/agents/document.py` | Agents | 15 |
 | `app/core/` | Cross-cutting | 2 |
 
 ---
@@ -301,8 +302,8 @@ every terminal path funnels through `record_memory` before `finalize`.
 | `CODING` | Code generation or debugging | Router → planner → coding agent → critic → synthesizer |
 | `DATA_ANALYSIS` | Computation over data | Router → planner → analysis agent → critic → synthesizer |
 | `MULTI_AGENT` | Spans several capabilities | Router → planner → parallel agents → aggregator → critic → synthesizer |
+| `DOCUMENT` | Extraction from documents | Router → planner → document agent → critic → synthesizer |
 | `HUMAN_APPROVAL` | Risky or destructive action | Risk check → interrupt → human decision → resume |
-| `DOCUMENT` | Extraction from documents | 🔷 designed only — no document agent (Phase 15) |
 
 ### Node reference
 
@@ -394,13 +395,14 @@ happen *before* execution, and every call emits an audit event.
 > not exist. It is also the one tool whose read-only posture is enforced by
 > PostgreSQL rather than by this codebase.
 
-### The seven agents and their tools
+### The eight agents and their tools
 
 | Agent | Registered as | Granted tools |
 | :--- | :--- | :--- |
 | Research | `researcher` | `web_search` |
 | Coding | `coder` | `read_file`, `list_directory`, `write_file` |
 | Analysis | `analyst` | `python_executor` |
+| Document | `document` | `read_file`, `list_directory` |
 | Executor | `executor` | `read_file`, `list_directory`, `write_file`, `python_executor` — plus `database`, `github_repository`, and `github_create_issue` when those are configured |
 | Planner, Critic, Synthesizer | `planner`, `critic`, `synthesizer` | None — they reason over artifacts |
 
@@ -436,7 +438,7 @@ retried automatically**, regardless of classification.
 
 ## API surface
 
-Thirteen routes. Every task, approval, and event read is scoped to the
+Fourteen routes. Every task, approval, and event read is scoped to the
 authenticated caller.
 
 | Method | Path | Purpose |
@@ -454,6 +456,7 @@ authenticated caller.
 | `GET` | `/api/v1/events/{task_id}` | Stream execution events (SSE) |
 | `GET` | `/api/v1/events/{task_id}/history` | Replay the durable event log |
 | `GET` | `/api/v1/agents`, `/api/v1/tools` | Discovery |
+| `GET` | `/metrics` | Prometheus exposition |
 
 A live `/ready` looks like this:
 
@@ -464,16 +467,23 @@ A live `/ready` looks like this:
     "llm_provider": "ok",
     "orchestration_graph": "ok",
     "tool_registry": "7 tools",
-    "agents": "7 registered",
+    "agents": "8 registered",
     "database": "ok",
     "checkpoint_store": "ok (postgres)",
     "cache": "ok",
     "memory": "ok (PostgresMemoryStore)",
     "authentication": "disabled",
-    "python_execution": "disabled (no sandbox configured)"
+    "python_execution": "disabled (no sandbox configured)",
+    "metrics": "ok (12 series)",
+    "tracing": "ok (langgraph-multi-agent)"
   }
 }
 ```
+
+`GET /metrics` serves the Prometheus text format: `http_requests_total` and
+`http_request_duration_seconds` per **route template** (never per id — an
+unmatched path is bucketed under a constant so a caller cannot mint unbounded
+series), `tasks_total` by outcome, and `spans_total` / `span_duration_seconds`.
 
 Streaming exposes execution events only: `task_started`, `task_routing`,
 `task_planning`, `task_retry`, `task_completed`, `task_failed`,
@@ -708,7 +718,7 @@ suite runs offline and produces stable results.
 │   ├── core/                   # config, logging, exceptions, auth, constants
 │   ├── graph/                  # state, nodes, edges, router, checkpoints, builder
 │   ├── agents/                 # base, planner, researcher, coder, analyst,
-│   │                           # executor, critic, synthesizer
+│   │                           # document, executor, critic, synthesizer
 │   ├── tools/                  # base, registry, web_search, filesystem,
 │   │                           # python_executor, database, github
 │   ├── models/                 # task, execution, agent, tool, approval, memory
@@ -816,7 +826,7 @@ $ curl -s http://127.0.0.1:8000/ready | python -m json.tool
 - [x] **Phase 12** — base agent contract
 - [x] **Phase 13** — planner agent
 - [x] **Phase 14** — structured intent routing
-- [ ] **Phase 15** — specialist agents — research, coding, analysis, executor done; 🔶 document agent pending
+- [x] **Phase 15** — specialist agents — research, coding, analysis, document, executor
 - [x] **Phase 16** — LangGraph orchestration graph
 - [x] **Phase 17** — bounded parallel dispatch
 - [x] **Phase 18** — failure classification and retry policy
@@ -828,7 +838,7 @@ $ curl -s http://127.0.0.1:8000/ready | python -m json.tool
 - [x] **Phase 24** — execution-event streaming — SSE over the durable event log, plus replay
 - [x] **Phase 25** — authorization — bearer tokens and ownership on every read
 - [x] **Phase 26** — rate limiting — Redis-backed, fail-open or fail-closed
-- [ ] **Phase 27** — observability — 🔶 logging, correlation ids, and events done; metrics and tracing pending
+- [x] **Phase 27** — observability — structured logs, correlation ids, events, Prometheus metrics, span tracing
 - [x] **Phases 28–33** — prompt injection, SSRF, filesystem, execution sandbox, database and GitHub hardening
 - [ ] **Phases 34–37** — security test matrix, failure injection, evaluation harness, efficiency
 - [ ] **Phases 38–39** — Docker and compose — ⛔ blocked: no container runtime on this host
