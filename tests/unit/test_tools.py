@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 
 import pytest
+from pydantic import BaseModel
+
 from app.core.config import Settings
 from app.core.constants import FailureKind
 from app.core.exceptions import NotFoundError, ToolError
 from app.models.tool import AccessMode, RiskLevel
 from app.tools.base import Tool, ToolContext, ToolRequest
 from app.tools.registry import ToolRegistry
-from pydantic import BaseModel
 
 # --------------------------------------------------------------------------- #
 # Fixtures: concrete tools

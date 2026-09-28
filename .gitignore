@@ -37,6 +37,16 @@ logs/
 *.sqlite3
 *.db
 
+# --- Local verification services ------------------------------------------- #
+# PostgreSQL, Redis, and the micromamba runtime used to verify this project on
+# a host without root access. Real services, but entirely reproducible from
+# scripts/dev_services.sh, so nothing here is committed.
+.services/
+
+# --- Agent workspace ------------------------------------------------------- #
+# The scratch directory the filesystem tools are confined to at runtime.
+workspace/
+
 # --- Editors / OS ---------------------------------------------------------- #
 .idea/
 .vscode/

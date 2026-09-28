@@ -5,9 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
+
 from app.core.config import Settings, get_settings, reset_settings_cache
 from app.core.exceptions import ConfigurationError
-from pydantic import ValidationError
 
 
 def make_settings(**overrides: object) -> Settings:

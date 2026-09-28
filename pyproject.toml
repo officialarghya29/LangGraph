@@ -47,7 +47,7 @@ packages = ["app"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-src = ["app", "tests"]
+src = ["app", "tests", "migrations"]
 
 [tool.ruff.lint]
 select = [
@@ -71,13 +71,30 @@ ignore = [
     "D107",   # constructor semantics are documented by the class docstring
 ]
 
+[tool.ruff.lint.isort]
+# Stated explicitly rather than inferred: without it, ruff cannot tell that
+# `app` is this project, and every module that imports it gets sorted as though
+# the dependency came from PyPI.
+known-first-party = ["app", "tests", "migrations"]
+
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
 # Test doubles use obvious placeholder values (which trip the secret heuristics)
 # and are not a public API, so their docstrings are not enforced.
-"tests/**" = ["S101", "S105", "S106", "S107", "D100", "D101", "D102", "D103"]
+"tests/**" = [
+    "S101", # asserts are the assertions in a test
+    "S105", # obvious placeholder credential values
+    "S106",
+    "S107",
+    "D100", # tests are not a public API, so docstrings are not enforced
+    "D101",
+    "D102",
+    "D103",
+    "S608", # allows "SELECT count(*) FROM {table}" over a fixed tuple of
+    #         literal table names, which is not user input
+]
 
 # --------------------------------------------------------------------------- #
 # MyPy
@@ -102,6 +119,12 @@ minversion = "8.0"
 pythonpath = ["."]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# One event loop for the whole session. An async database engine pools
+# connections bound to the loop that created them, so a session-scoped engine
+# used from a per-test loop fails with "attached to a different loop". Sharing
+# the loop keeps the fixture scopes and the engine's lifetime consistent.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 addopts = "-ra --strict-markers --strict-config"
 markers = [
     "integration: requires external services (PostgreSQL, Redis)",

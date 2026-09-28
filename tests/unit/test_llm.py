@@ -6,6 +6,8 @@ import json
 
 import httpx
 import pytest
+from pydantic import BaseModel
+
 from app.core.config import Settings
 from app.core.exceptions import (
     ConfigurationError,
@@ -23,7 +25,6 @@ from app.services.llm import (
     _extract_json,
     build_llm_provider,
 )
-from pydantic import BaseModel
 
 
 class Verdict(BaseModel):

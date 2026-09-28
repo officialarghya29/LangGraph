@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+
 from app.core.config import Settings
 from app.core.exceptions import ToolError
 from app.tools.base import ToolContext, ToolRequest

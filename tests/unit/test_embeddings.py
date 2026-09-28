@@ -7,6 +7,7 @@ import math
 
 import httpx
 import pytest
+
 from app.core.config import Settings
 from app.core.exceptions import ConfigurationError, EmbeddingError
 from app.services.embeddings import (

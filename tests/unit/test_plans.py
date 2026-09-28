@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import pytest
-from app.schemas.plans import Complexity, Plan, Route, RouteDecision, Subtask
 from pydantic import ValidationError
+
+from app.schemas.plans import Complexity, Plan, Route, RouteDecision, Subtask
 
 
 def subtask(

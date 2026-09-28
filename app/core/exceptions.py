@@ -14,7 +14,9 @@ __all__ = [
     "AppError",
     "ApprovalRequiredError",
     "AuthenticationError",
+    "CacheError",
     "ConfigurationError",
+    "DatabaseError",
     "EmbeddingError",
     "ExecutionLimitError",
     "InputValidationError",
@@ -139,6 +141,28 @@ class StructuredOutputError(LLMError):
 
 class EmbeddingError(ProviderError):
     """The embedding provider failed."""
+
+
+# --------------------------------------------------------------------------- #
+# Infrastructure
+# --------------------------------------------------------------------------- #
+
+
+class DatabaseError(AppError):
+    """The database is unavailable or rejected the operation."""
+
+    failure_kind = FailureKind.DATABASE_FAILURE
+
+
+class CacheError(AppError):
+    """The cache or coordination store is unavailable.
+
+    Separate from :class:`DatabaseError` because the two have different
+    consequences: a cache outage degrades performance, a database outage loses
+    correctness. Nothing durable is stored only in the cache.
+    """
+
+    failure_kind = FailureKind.TRANSIENT
 
 
 # --------------------------------------------------------------------------- #

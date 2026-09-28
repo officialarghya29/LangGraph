@@ -12,12 +12,13 @@ from collections.abc import Iterator
 from typing import Any
 
 import pytest
+from fastapi.testclient import TestClient
+
 from app.api.dependencies import get_settings_dep
 from app.core.config import Settings, reset_settings_cache
 from app.graph.builder import build_all_agents, build_graph
 from app.main import create_app
 from app.services.llm import FakeLLMProvider
-from fastapi.testclient import TestClient
 
 SETTINGS = Settings(_env_file=None, llm_api_key="test-key")
 

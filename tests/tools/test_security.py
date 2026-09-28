@@ -7,6 +7,7 @@ cases are deliberately adversarial.
 from __future__ import annotations
 
 import pytest
+
 from app.core.exceptions import PermissionDeniedError
 from app.core.security import redact, validate_outbound_url
 

@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 
 import pytest
+from pydantic import BaseModel
+
 from app.graph.state import AgentState, initial_state
 from app.models.approval import ApprovalStatus
 from app.services.llm import Role
-from pydantic import BaseModel
 
 
 def test_initial_state_populates_every_key() -> None:

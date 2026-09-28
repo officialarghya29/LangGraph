@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+
 from app.schemas.events import SAFE_EVENT_TYPES, EventType, ExecutionEvent
 
 

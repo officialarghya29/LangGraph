@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+
 from app.core.constants import (
     MAX_BACKOFF_SECONDS,
     FailureKind,

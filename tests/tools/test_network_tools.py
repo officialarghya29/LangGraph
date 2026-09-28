@@ -6,6 +6,7 @@ import json
 
 import httpx
 import pytest
+
 from app.core.config import Settings
 from app.tools.base import ToolContext, ToolRequest
 from app.tools.github import GitHubClient, GitHubCreateIssueTool, GitHubRepositoryTool

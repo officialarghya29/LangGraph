@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 
 import pytest
+from pydantic import BaseModel, ConfigDict
+
 from app.agents.analyst import DataAnalysisAgent
 from app.agents.base import AgentContext
 from app.agents.coder import CodingAgent
@@ -19,7 +21,6 @@ from app.models.tool import AccessMode
 from app.services.llm import FakeLLMProvider
 from app.tools.base import Tool, ToolContext
 from app.tools.registry import ToolRegistry
-from pydantic import BaseModel, ConfigDict
 
 SETTINGS = Settings(_env_file=None)
 
