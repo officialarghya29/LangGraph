@@ -1,0 +1,71 @@
+PROPRIETARY LICENSE — ALL RIGHTS RESERVED
+
+Copyright (c) 2026 Arghya Bose. All rights reserved.
+
+================================================================================
+OWNERSHIP
+================================================================================
+
+This software, including all source code, documentation, architecture,
+designs, diagrams, assets, configuration, and any associated materials
+(collectively, the "Software"), is the exclusive property of Arghya Bose
+(the "Author").
+
+All right, title, and interest in and to the Software, including all
+intellectual property rights therein, are and shall remain vested solely in
+the Author.
+
+================================================================================
+NO LICENSE GRANTED
+================================================================================
+
+No license, right, or permission of any kind is granted to any person or
+entity by the availability of the Software, whether made available publicly
+or privately, in source or compiled form.
+
+Without the prior express written permission of the Author, you may NOT:
+
+  1.  copy, reproduce, or duplicate the Software or any portion of it;
+  2.  modify, adapt, translate, or create derivative works from the Software;
+  3.  distribute, publish, sublicense, sell, rent, lease, or otherwise make
+      the Software available to any third party;
+  4.  use the Software, in whole or in part, for any commercial purpose;
+  5.  use the Software to develop, train, fine-tune, or improve any machine
+      learning or artificial intelligence model or system;
+  6.  deploy, operate, or incorporate the Software into any product or
+      service;
+  7.  remove, obscure, or alter this license or any copyright, trademark, or
+      other proprietary notice contained in the Software.
+
+Viewing the Software does not confer any license or right of use.
+
+================================================================================
+NO WARRANTY
+================================================================================
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT. IN NO EVENT
+SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF,
+OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+THIRD-PARTY COMPONENTS
+================================================================================
+
+The Software depends on third-party open-source packages. Those packages
+remain under their own respective licenses, which govern their use. This
+license governs only the original work authored by Arghya Bose. A list of
+dependencies is maintained in `pyproject.toml` and `docs/TECH_STACK.md`.
+
+================================================================================
+ENFORCEMENT AND CONTACT
+================================================================================
+
+Unauthorized use, reproduction, or distribution of the Software is a
+violation of applicable copyright law and may result in civil and criminal
+penalties.
+
+For licensing inquiries or written permission requests, contact the Author.

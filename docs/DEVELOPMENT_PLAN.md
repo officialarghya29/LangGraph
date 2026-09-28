@@ -10,7 +10,7 @@ the full local gate, and no phase begins while the previous one is failing.
 ```bash
 ruff format .        # format
 ruff check .         # lint
-mypy app             # strict type check
+mypy app scripts     # strict type check (application + tooling)
 pytest               # tests
 ```
 
@@ -153,3 +153,68 @@ The empty structural packages under `app/` (`core`, `graph`, `agents`, `tools`,
 `memory`, `models`, `schemas`, `services`, `database`, `observability`) contain
 only a package docstring. They are placeholders for the directory layout, not
 stub implementations, and Phase 16 onward fills them in.
+
+---
+
+## Documentation, artwork, and licensing pass (post-Phase 1)
+
+```
+PHASE:              1 (addendum — documentation and branding)
+STATUS:             Complete
+FILES CREATED:      scripts/generate_assets.py, LICENSE,
+                    docs/assets/{banner,logo,architecture,graph-flow,
+                    tool-security,memory,roadmap}.png
+FILES MODIFIED:     README.md, pyproject.toml, docs/DEVELOPMENT_PLAN.md
+DEPENDENCIES:       pillow 12.3.0 (build-time only, not a runtime dependency);
+                    pip-audit (development tooling, not declared in the manifest)
+COMMANDS RUN:       python scripts/generate_assets.py
+                    ruff format . && ruff check .
+                    mypy app scripts
+                    pytest
+                    pip-audit
+TESTS RUN:          tests/api/test_health.py (2 tests)
+TEST RESULTS:       PASS — ruff clean (23 files formatted), mypy clean
+                    (16 source files), 2 tests passed, pip-audit reports no
+                    known vulnerabilities. All 7 README image references and
+                    all local documentation links resolve.
+ISSUES FOUND:       1. Ruff flagged 7 issues in the new asset script: two
+                       S101 asserts, one unused local, four over-long string
+                       literals.
+                    2. MyPy flagged two real typing problems in the script:
+                       a **kwargs dict passed to Image.save, and a union-typed
+                       getextrema() return value.
+                    3. The graph-flow diagram overflowed its canvas: the END
+                       node was clipped, and the simple-request path drew
+                       straight through the approval boxes.
+ISSUES FIXED:       1. Replaced both asserts with real logic (a putdata-based
+                       gradient with no pixel-access handle, and a documented
+                       default font), removed the unused local, and split the
+                       string literals.
+                    2. Replaced the **kwargs with an explicit optimize flag,
+                       and computed the blank-canvas guard from a histogram so
+                       no union type is involved.
+                    3. Enlarged the canvas and routed the simple path down a
+                       dedicated right-hand channel clear of the approval
+                       branch.
+KNOWN LIMITATIONS:  The asset generator depends on Ubuntu system fonts at
+                    /usr/share/fonts/truetype/ubuntu. On a host without them
+                    the script fails loudly rather than rendering a fallback.
+NEXT PHASE:         2 (typed configuration)
+```
+
+### Licensing decision
+
+The project was initially declared MIT in `pyproject.toml`. It is now released
+under a proprietary all-rights-reserved license (`LICENSE`), with copyright held
+solely by the author. `pyproject.toml` points at the license file rather than
+SPDX-identifying it.
+
+Note that the repository itself is public while the license grants no rights:
+the source is visible, but copying, modification, distribution, commercial use,
+and use for model training are all expressly prohibited.
+
+### Asset regeneration
+
+The seven PNGs in `docs/assets/` are build artifacts of
+`scripts/generate_assets.py`. Both the script and its output are committed, so
+the diagrams can be reviewed as code and rebuilt deterministically.
