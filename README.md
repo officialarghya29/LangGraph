@@ -24,7 +24,7 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 
 [![Ruff](https://img.shields.io/badge/Ruff-passing-D7FF64?style=for-the-badge&logo=ruff&logoColor=black)](#quality-gates)
 [![MyPy](https://img.shields.io/badge/MyPy-strict-2A6DB2?style=for-the-badge)](#quality-gates)
-[![Tests](https://img.shields.io/badge/tests-785%20passing-brightgreen?style=for-the-badge)](#quality-gates)
+[![Tests](https://img.shields.io/badge/tests-786%20passing-brightgreen?style=for-the-badge)](#quality-gates)
 
 [![Status](https://img.shields.io/badge/phases-34%20of%2045-yellow?style=for-the-badge)](#build-status)
 [![License](https://img.shields.io/badge/license-proprietary-red?style=for-the-badge)](#license)
@@ -44,7 +44,7 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 > $ ruff format --check .   →  135 files already formatted
 > $ ruff check .            →  All checks passed
 > $ mypy app scripts        →  Success: no issues found in 80 source files
-> $ pytest                  →  785 passed in 31s
+> $ pytest                  →  786 passed in 36s
 > $ python scripts/evaluate.py --quiet
 > rule-based baseline: accuracy=0.911 adversarial=0.429 macro_f1=0.920 ⟶
 >   approval_recall=1.000 p50=0.06ms p95=0.09ms
@@ -511,7 +511,13 @@ A live `/ready` looks like this:
 `GET /metrics` serves the Prometheus text format: `http_requests_total` and
 `http_request_duration_seconds` per **route template** (never per id — an
 unmatched path is bucketed under a constant so a caller cannot mint unbounded
-series), `tasks_total` by outcome, and `spans_total` / `span_duration_seconds`.
+series), `tasks_total` by outcome, `spans_total` / `span_duration_seconds`, and
+the model-cost series — `llm_calls_total`, `llm_tokens_total` by direction, and
+`llm_retries_total` by failure kind. Token counts are reported for failed runs
+too: a run that died halfway consumed what it consumed, and those are exactly
+the runs worth looking at. Every label set is bounded by construction — three
+outcomes, two directions, ten failure kinds — so no input can inflate the
+exposition.
 
 Streaming exposes execution events only: `task_started`, `task_routing`,
 `task_planning`, `task_retry`, `task_completed`, `task_failed`,

@@ -43,7 +43,7 @@ from app.models.approval import ApprovalStatus
 from app.models.execution import TaskStatus
 from app.observability.metrics import MetricRegistry
 from app.observability.tracing import Tracer
-from app.services.budget import budget_for, token_budget
+from app.services.budget import TokenBudget, budget_for, token_budget
 
 __all__ = ["PostgresTaskStore", "TaskRecord", "TaskStore", "execute_task_with_store"]
 
@@ -511,10 +511,30 @@ async def execute_task_with_store(
         if metrics is not None:
             metrics.increment("tasks_total", outcome=outcome)
 
+    def record_usage(active: TokenBudget | None) -> None:
+        """Count the tokens a run spent, split by direction.
+
+        Reported for failed runs too. A run that dies halfway through still
+        consumed whatever it consumed, and a cost dashboard that only counted
+        successes would understate exactly the runs worth investigating.
+        """
+        if metrics is None or active is None or active.calls == 0:
+            return
+        metrics.increment("llm_calls_total", active.calls)
+        metrics.increment("llm_tokens_total", active.usage.prompt_tokens, direction="prompt")
+        metrics.increment(
+            "llm_tokens_total", active.usage.completion_tokens, direction="completion"
+        )
+
     span_context = tracer.span("task.execute", task_id=task_id) if tracer else nullcontext()
     with span_context:
         await _execute_task(
-            task_id, graph=graph, store=store, settings=settings, record_outcome=record_outcome
+            task_id,
+            graph=graph,
+            store=store,
+            settings=settings,
+            record_outcome=record_outcome,
+            record_usage=record_usage,
         )
 
 
@@ -525,6 +545,7 @@ async def _execute_task(
     store: TaskStore,
     settings: Settings,
     record_outcome: Callable[[str], None],
+    record_usage: Callable[[TokenBudget | None], None],
 ) -> None:
     """Carry out one run and record its outcome.
 
@@ -539,6 +560,7 @@ async def _execute_task(
     await store.update(task_id, status=TaskStatus.RUNNING, started_at=datetime.now(UTC))
     await store.append_event(task_id, "task_started", {"request_length": len(record.request)})
 
+    budget: TokenBudget | None = None
     try:
         state = initial_state(
             record.request,
@@ -559,6 +581,7 @@ async def _execute_task(
         budget = budget_for(state, limit=settings.max_token_budget)
         with event_sink_for(publish), token_budget(budget):
             result = await graph.ainvoke(state, thread_config(task_id))
+        record_usage(budget)
     except Exception as exc:
         # The class name only. An exception string can carry a prompt fragment,
         # a URL, or a credential.
@@ -571,6 +594,7 @@ async def _execute_task(
             finished_at=datetime.now(UTC),
         )
         await store.append_event(task_id, "task_failed", {"reason": reason})
+        record_usage(budget)
         record_outcome("failed")
         return
 

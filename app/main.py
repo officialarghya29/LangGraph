@@ -193,6 +193,11 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         provider: LLMProvider = RetryingProvider(
             BudgetedProvider(build_llm_provider(settings)),
             max_retries=settings.max_retries,
+            # Retries are counted by kind, which is a bounded set of ten values,
+            # so the series cannot be inflated by a misbehaving provider.
+            on_retry=lambda attempt, kind, exc: application.state.metrics.increment(
+                "llm_retries_total", kind=kind.value
+            ),
         )
     except ConfigurationError as exc:
         application.state.provider = None

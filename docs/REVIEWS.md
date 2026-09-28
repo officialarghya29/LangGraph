@@ -177,6 +177,14 @@ them.
 query context 0.018 ms, score 500 vector candidates 2.15 ms, score 500 lexical
 candidates 3.37 ms.
 
+**Cost is now observable, not just bounded.** Once usage was actually counted it
+was worth exposing: `llm_calls_total`, `llm_tokens_total` by direction, and
+`llm_retries_total` by failure kind. Cardinality is bounded by construction —
+two directions, ten kinds — so a misbehaving provider cannot inflate the
+exposition. Failed runs are counted too, because a run that died halfway consumed
+what it consumed, and a cost dashboard that only counted successes would
+understate exactly the runs worth investigating.
+
 ---
 
 ## Architecture review

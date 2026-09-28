@@ -264,6 +264,27 @@ def test_a_task_records_the_tokens_it_actually_spent(
     assert completion > 0
 
 
+def test_a_task_reports_the_tokens_it_spent_as_metrics(direct: ApiHarness) -> None:
+    """Accounting that stays inside the process is accounting nobody can alert on.
+
+    The series exist so a cost overrun is visible without querying the database,
+    and they are reported for failed runs too — a run that died halfway still
+    consumed what it consumed.
+    """
+    direct.client.post("/api/v1/tasks", json={"request": "do something"})
+
+    exposition = direct.client.get("/metrics").text
+    samples = [
+        line
+        for line in exposition.splitlines()
+        if line.startswith("llm_tokens_total") or line.startswith("llm_calls_total")
+    ]
+
+    assert samples, exposition
+    prompt = next(line for line in samples if 'direction="prompt"' in line)
+    assert float(prompt.rsplit(" ", 1)[1]) > 0
+
+
 def test_a_spent_budget_keeps_its_own_status(
     direct: ApiHarness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
