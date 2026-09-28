@@ -30,6 +30,7 @@ from app.graph.state import AgentState
 from app.models.agent import AgentOutput, VerificationResult
 from app.models.approval import ApprovalStatus
 from app.models.execution import ExecutionError, ExecutionMetadata
+from app.models.tool import AccessMode
 from app.schemas.plans import Plan, Subtask
 from app.services.llm import LLMProvider, Message, Role
 from app.tools.registry import ToolRegistry
@@ -183,18 +184,27 @@ class GraphNodes:
     # Planning
     # ------------------------------------------------------------------ #
 
+    def _worker_capabilities(self) -> dict[str, list[str]]:
+        """Return which tools each dispatchable agent may use.
+
+        Read from the running registry, so the planner is only ever offered
+        combinations the agents are actually authorised for.
+        """
+        return {name: list(agent.tool_names) for name, agent in sorted(self.deps.workers.items())}
+
     async def plan(self, state: AgentState) -> dict[str, Any]:
         """Produce a validated plan for a complex request."""
         request = state.get("user_request") or ""
-        payload = PlannerInput(
-            user_request=request,
-            available_agents=sorted(self.deps.workers),
-            available_tools=list(self.deps.registry.names()),
-            max_subtasks=max(1, min(self.deps.settings.max_agent_iterations, 6)),
-        )
         try:
+            payload = PlannerInput(
+                user_request=request,
+                agent_tools=self._worker_capabilities(),
+                max_subtasks=max(1, min(self.deps.settings.max_agent_iterations, 6)),
+            )
             plan = await self.deps.planner.run(payload, self._agent_context(state))
         except AppError as exc:
+            # Covers both a planning failure and an unresolvable agent tool set;
+            # either way the run degrades to a reported failure, not a crash.
             return {
                 "plan": None,
                 "errors": [_error("planner", "planning failed", exc.failure_kind)],
@@ -227,6 +237,29 @@ class GraphNodes:
                     )
                 ],
             }
+
+        # A subtask may only name tools its own agent is authorised to use.
+        # Rejecting rather than ignoring keeps the plan's claims true: an agent
+        # never reports having used a tool it cannot reach.
+        unauthorised = [
+            f"{task.id}:{name}"
+            for task in plan.subtasks
+            for name in task.tools
+            if not self.deps.workers[task.agent].allows_tool(name)
+        ]
+        if unauthorised:
+            return {
+                "plan": None,
+                "errors": [
+                    _error(
+                        "validate_plan",
+                        "plan assigns tools the agent is not authorised to use",
+                        FailureKind.VALIDATION,
+                        detail=", ".join(sorted(unauthorised)),
+                    )
+                ],
+            }
+
         if len(plan.subtasks) > self.deps.settings.max_agent_iterations:
             return {
                 "plan": None,
@@ -422,14 +455,49 @@ class GraphNodes:
             "approval_status": ApprovalStatus.APPROVED if approved else ApprovalStatus.REJECTED,
         }
 
+    def _default_action_tool(self) -> str | None:
+        """Return the tool to use for an approved action the router did not name.
+
+        The executor's own allow-list is the authority, so the fallback can only
+        ever be a tool the executor is permitted to run. A write-capable tool is
+        preferred: a read is not an action.
+
+        Returns:
+            The tool name, or ``None`` when the executor has no usable tool.
+        """
+        declared = (*ExecutorAgent.allowed_tools, *ExecutorAgent.optional_tools)
+        tools = [self.deps.registry.get(name) for name in declared if self.deps.registry.has(name)]
+        for tool in tools:
+            if tool.access_mode is not AccessMode.READ:
+                return tool.name
+        return tools[0].name if tools else None
+
     async def execute_approved_action(self, state: AgentState) -> dict[str, Any]:
-        """Perform the approved action."""
+        """Perform the approved action.
+
+        The tool is the first one the router named, so the action performed is
+        the one the router judged to need approval. When the router named none,
+        a tool from the executor's own allow-list is used rather than an invented
+        name, so an unexecutable action is reported instead of crashing.
+        """
         route = state.get("route")
-        tool = "filesystem"
-        if isinstance(route, object):
-            required = list(getattr(route, "required_tools", []) or [])
-            if required:
-                tool = required[0]
+        required = [str(name) for name in (getattr(route, "required_tools", None) or [])]
+        tool = required[0] if required else self._default_action_tool()
+
+        if tool is None:
+            return {
+                "final_answer": (
+                    "The approved action could not be performed: no authorised "
+                    "action tool is available."
+                ),
+                "errors": [
+                    _error(
+                        "execute_approved_action",
+                        "no authorised action tool is available",
+                        FailureKind.PERMANENT,
+                    )
+                ],
+            }
 
         payload = ExecutorInput(
             action=state.get("user_request") or "approved action",
@@ -452,11 +520,12 @@ class GraphNodes:
                 ],
             }
         if not result.performed:
+            # The tool refusing for lack of approval is a distinct outcome from a
+            # tool that genuinely failed, and must not be reported as one.
+            kind = FailureKind.PERMANENT if result.approval_required else FailureKind.TOOL_FAILURE
             return {
                 "final_answer": f"The approved action was not performed: {result.error}",
-                "errors": [
-                    _error("execute_approved_action", "execution failed", FailureKind.TOOL_FAILURE)
-                ],
+                "errors": [_error("execute_approved_action", "execution failed", kind)],
             }
         return {"final_answer": result.summary}
 

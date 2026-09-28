@@ -1,8 +1,8 @@
 """Coding agent.
 
-Generates, analyses, and debugs code. It is given filesystem access, which is
-not write-safe on its own, but the filesystem tool is confined to an allow-listed
-root and any write is written-through as a gated, audited operation.
+Generates, analyses, and debugs code. It is given the file tools, which are not
+write-safe on their own, but each is confined to an allow-listed root, bounded by
+a per-file size cap, and audited on every write.
 """
 
 from __future__ import annotations
@@ -32,7 +32,7 @@ class CodingAgent(BaseAgent[CodingInput, AgentOutput]):
 
     name = "coder"
     description = "Generates code, debugs failures, and analyses implementations"
-    allowed_tools: ClassVar[tuple[str, ...]] = ("filesystem",)
+    allowed_tools: ClassVar[tuple[str, ...]] = ("read_file", "list_directory", "write_file")
     input_model: ClassVar[type[BaseModel]] = CodingInput
     output_model: ClassVar[type[BaseModel]] = AgentOutput
 

@@ -24,7 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.core.config import Settings
 from app.core.constants import FailureKind
-from app.core.exceptions import ToolError
+from app.core.exceptions import AppError
 from app.models.tool import AccessMode, RiskLevel
 
 __all__ = ["Tool", "ToolContext", "ToolRequest", "ToolResult"]
@@ -58,6 +58,9 @@ class ToolResult(BaseModel):
     failure_kind: FailureKind = FailureKind.UNKNOWN
     risk_level: RiskLevel = RiskLevel.LOW
     approved: bool = False
+    #: Set when the tool refused because no human had approved the action. A
+    #: caller must be able to tell "needs approval" from "failed".
+    approval_required: bool = False
     duration_ms: float = 0.0
 
 
@@ -201,11 +204,16 @@ class Tool[In: BaseModel, Out: BaseModel](ABC):
                 FailureKind.TIMEOUT,
                 started,
             )
-        except ToolError as exc:
+        except AppError as exc:
+            # Every deliberate application error carries its own classification.
+            # Catching only ToolError here would silently downgrade anything
+            # else to UNKNOWN and discard the retry semantics it declared.
             return self._failure(
                 request, risk, str(exc), exc.failure_kind, started, detail=exc.detail
             )
         except Exception as exc:
+            # A tool must not crash the graph, so anything unexpected is
+            # reported rather than propagated.
             return self._failure(
                 request,
                 risk,
@@ -268,6 +276,7 @@ class Tool[In: BaseModel, Out: BaseModel](ABC):
             failure_kind=kind,
             risk_level=risk,
             approved=False,
+            approval_required=approval_required,
             duration_ms=_elapsed_ms(started),
         )
 

@@ -27,6 +27,7 @@ from app.agents.planner import PlannerAgent
 from app.agents.researcher import ResearchAgent
 from app.agents.synthesizer import SynthesizerAgent
 from app.core.config import Settings
+from app.core.exceptions import ConfigurationError
 from app.graph.checkpoints import build_checkpointer
 from app.graph.nodes import GraphDependencies, GraphNodes
 from app.graph.router import IntentRouter
@@ -38,6 +39,7 @@ from app.services.llm import LLMProvider
 from app.tools.registry import ToolRegistry
 
 __all__ = [
+    "build_all_agents",
     "build_dependencies",
     "build_graph",
     "build_workforce",
@@ -59,7 +61,11 @@ __all__ = [
 def build_workforce(
     provider: LLMProvider, registry: ToolRegistry
 ) -> dict[str, BaseAgent[Any, Any]]:
-    """Construct the specialist agents, keyed by name.
+    """Construct the specialist worker agents, keyed by name.
+
+    Only the agents a plan can dispatch to. The planner, critic, synthesizer,
+    and executor are orchestrator roles rather than dispatchable workers, so
+    they are not in this map and a plan cannot name them as a subtask agent.
 
     Args:
         provider: The LLM provider every agent reasons with.
@@ -67,11 +73,49 @@ def build_workforce(
 
     Returns:
         A mapping of agent name to agent instance.
+
+    Raises:
+        ConfigurationError: If a worker declares a required tool that is not
+            registered. Checked here, once, at composition time. A misnamed
+            tool is a code defect, and failing loudly at startup is far better
+            than discovering mid-run that an agent quietly has fewer
+            capabilities than the plan assumed.
     """
     agents: list[BaseAgent[Any, Any]] = [
         ResearchAgent(provider, registry),
         CodingAgent(provider, registry),
         DataAnalysisAgent(provider, registry),
+    ]
+
+    missing = sorted(
+        f"{agent.name}:{name}"
+        for agent in agents
+        for name in agent.allowed_tools
+        if not registry.has(name)
+    )
+    if missing:
+        raise ConfigurationError(
+            "agents declare tools that are not registered",
+            detail=", ".join(missing),
+        )
+
+    return {agent.name: agent for agent in agents}
+
+
+def build_all_agents(
+    provider: LLMProvider, registry: ToolRegistry
+) -> dict[str, BaseAgent[Any, Any]]:
+    """Construct every agent, including the orchestrator roles.
+
+    Used for discovery and the API's agent listing. Dispatch uses
+    :func:`build_workforce`, which is a strict subset.
+    """
+    agents: list[BaseAgent[Any, Any]] = [
+        *build_workforce(provider, registry).values(),
+        PlannerAgent(provider, registry),
+        CriticAgent(provider, registry),
+        SynthesizerAgent(provider, registry),
+        ExecutorAgent(provider, registry),
     ]
     return {agent.name: agent for agent in agents}
 

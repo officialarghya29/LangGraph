@@ -77,7 +77,7 @@ convention = "google"
 [tool.ruff.lint.per-file-ignores]
 # Test doubles use obvious placeholder values (which trip the secret heuristics)
 # and are not a public API, so their docstrings are not enforced.
-"tests/**" = ["S101", "S105", "S106", "D100", "D101", "D102", "D103"]
+"tests/**" = ["S101", "S105", "S106", "S107", "D100", "D101", "D102", "D103"]
 
 # --------------------------------------------------------------------------- #
 # MyPy

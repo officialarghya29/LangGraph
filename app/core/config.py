@@ -63,6 +63,14 @@ class Settings(BaseSettings):
     database_pool_size: int = Field(default=10, ge=1, le=100)
     database_max_overflow: int = Field(default=5, ge=0, le=100)
 
+    # --- Database tool ----------------------------------------------------- #
+    # Read-only by default. Writes and destructive statements each need an
+    # explicit opt-in, and destructive ones also need human approval.
+    database_allow_writes: bool = False
+    database_allow_destructive: bool = False
+    database_statement_timeout_ms: int = Field(default=5000, ge=100, le=60_000)
+    database_max_rows: int = Field(default=500, ge=1, le=10_000)
+
     # --- Redis ------------------------------------------------------------- #
     redis_url: str = "redis://localhost:6379/0"
 
@@ -93,6 +101,20 @@ class Settings(BaseSettings):
     # --- GitHub tool ------------------------------------------------------- #
     github_token: SecretStr | None = None
     github_tool_allow_writes: bool = False
+    github_api_url: str = "https://api.github.com"
+
+    # --- Web search tool --------------------------------------------------- #
+    # Provider-agnostic: point SEARCH_API_URL at any endpoint that accepts
+    # {"query": ..., "count": ...} and returns {"results": [...]}.
+    search_api_url: str | None = None
+    search_api_key: SecretStr | None = None
+    search_max_results: int = Field(default=5, ge=1, le=25)
+    search_timeout_seconds: float = Field(default=15.0, gt=0, le=120)
+
+    # --- Network egress ---------------------------------------------------- #
+    # Outbound tools refuse to reach private, loopback, and link-local
+    # addresses unless this is explicitly enabled.
+    allow_private_network_egress: bool = False
 
     # --- Observability ----------------------------------------------------- #
     otel_exporter_otlp_endpoint: str | None = None
@@ -115,7 +137,13 @@ class Settings(BaseSettings):
 
     def secret_values(self) -> tuple[str, ...]:
         """Return every configured secret, for redaction in logs and output."""
-        candidates = (self.llm_api_key, self.embedding_api_key, self.jwt_secret, self.github_token)
+        candidates = (
+            self.llm_api_key,
+            self.embedding_api_key,
+            self.jwt_secret,
+            self.github_token,
+            self.search_api_key,
+        )
         return tuple(s.get_secret_value() for s in candidates if s is not None)
 
     # ------------------------------------------------------------------ #

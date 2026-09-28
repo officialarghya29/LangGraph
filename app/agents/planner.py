@@ -18,11 +18,17 @@ __all__ = ["PlannerAgent", "PlannerInput"]
 
 
 class PlannerInput(BaseModel):
-    """What the planner is asked to plan."""
+    """What the planner is asked to plan.
+
+    ``agent_tools`` maps each dispatchable agent to the tools it may actually
+    use. The capabilities are given per agent rather than as one flat list,
+    because a union lets the planner assign a tool to an agent that is not
+    authorised to run it — a plan that looks valid and silently does less than
+    it claims.
+    """
 
     user_request: str = Field(min_length=1)
-    available_agents: list[str] = Field(default_factory=list)
-    available_tools: list[str] = Field(default_factory=list)
+    agent_tools: dict[str, list[str]] = Field(default_factory=dict)
     max_subtasks: int = Field(default=6, ge=1, le=20)
 
 
@@ -46,7 +52,8 @@ class PlannerAgent(BaseAgent[PlannerInput, Plan]):
         "- Ask for the fewest subtasks that still satisfy the request. Do not "
         "invent work that was not requested.\n"
         "- Give each subtask concrete, checkable success criteria.\n"
-        "- Never include a subtask that requires a capability it was not offered.\n"
+        "- Never include a subtask that requires a capability it was not offered. "
+        "A subtask may only use tools listed for the agent it names.\n"
         "- Assume nothing about the user's environment or data."
     )
 
@@ -65,12 +72,14 @@ class PlannerAgent(BaseAgent[PlannerInput, Plan]):
 
     def _render(self, payload: PlannerInput) -> str:
         """Render the planning request."""
-        agents = ", ".join(payload.available_agents) or "(none)"
-        tools = ", ".join(payload.available_tools) or "(none)"
+        lines = [
+            f"- {agent}: {', '.join(tools) if tools else 'no tools'}"
+            for agent, tools in sorted(payload.agent_tools.items())
+        ]
+        capabilities = "\n".join(lines) or "(none)"
         return (
             f"Request:\n{payload.user_request}\n\n"
-            f"Available agents: {agents}\n"
-            f"Available tools: {tools}\n"
+            f"Available agents and the tools each may use:\n{capabilities}\n\n"
             f"Maximum subtasks: {payload.max_subtasks}\n\n"
             "Produce the plan."
         )

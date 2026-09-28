@@ -35,6 +35,9 @@ class ExecutionOutput(BaseModel):
     summary: str = Field(min_length=1)
     tool: str
     error: str | None = None
+    #: Set when the tool refused because no human had approved the action. Lets
+    #: the caller distinguish "needs approval" from "genuinely failed".
+    approval_required: bool = False
 
 
 class ExecutorAgent(BaseAgent[ExecutorInput, ExecutionOutput]):
@@ -42,8 +45,21 @@ class ExecutorAgent(BaseAgent[ExecutorInput, ExecutionOutput]):
 
     name = "executor"
     description = "Executes approved actions through authorised tools"
-    #: The write-capable tools. Every one of these is gated by approval.
-    allowed_tools: ClassVar[tuple[str, ...]] = ("filesystem", "database", "github")
+    #: The action-capable tools. The write and execute tools are gated by the
+    #: approval check in the tool pipeline; the read tools are here so the
+    #: executor can confirm what it is about to change.
+    allowed_tools: ClassVar[tuple[str, ...]] = (
+        "read_file",
+        "list_directory",
+        "write_file",
+        "python_executor",
+    )
+    #: Available only when the corresponding credential or store is configured.
+    optional_tools: ClassVar[tuple[str, ...]] = (
+        "database",
+        "github_repository",
+        "github_create_issue",
+    )
     input_model: ClassVar[type[BaseModel]] = ExecutorInput
     output_model: ClassVar[type[BaseModel]] = ExecutionOutput
 
@@ -76,6 +92,7 @@ class ExecutorAgent(BaseAgent[ExecutorInput, ExecutionOutput]):
                 summary=f"action not performed: {result.error}",
                 tool=payload.tool,
                 error=result.error,
+                approval_required=result.approval_required,
             )
 
         return ExecutionOutput(

@@ -48,8 +48,8 @@ NEXT PHASE:
 | 7 | Typed, serializable graph state | **Complete** |
 | 8 | Structured execution events | **Complete** |
 | 9 | Tool framework, registry, risk classification | **Complete** |
-| 10 | Concrete tools | Not started |
-| 11 | Tool security pipeline end to end | Partial — pipeline done, per-tool policies pending |
+| 10 | Concrete tools | **Complete** — filesystem, Python, database, GitHub, web search |
+| 11 | Tool security pipeline end to end | **Complete** — per-tool policy plus the shared pipeline |
 | 12 | Base agent contract | **Complete** |
 | 13 | Planner agent | **Complete** |
 | 14 | Structured intent routing | **Complete** |
@@ -60,10 +60,13 @@ NEXT PHASE:
 | 19 | Critic agent | **Complete** |
 | 20 | Memory manager | Not started |
 | 21 | Checkpointing and human approval | Partial — in-memory saver verified; durable PostgreSQL backend pending |
-| 22 | Persist approval records | Not started |
-| 23 | HTTP API | Not started |
+| 22 | Persist approval records | Partial — interrupt/resume verified; records are in-memory only |
+| 23 | HTTP API | **Complete** — all 11 routes; auth and rate limiting still pending |
 | 24 | Execution-event streaming | Not started |
-| 25-33 | Authorization, rate limiting, observability, security hardening | Not started |
+| 25 | Authorization and ownership | Partial — ownership enforced on every task read |
+| 26 | Rate limiting | Not started |
+| 27 | Observability | Partial — structured logging and events; metrics and tracing pending |
+| 28-33 | Prompt injection, SSRF, filesystem, sandbox, database and GitHub policy | **Complete** — enforced per tool, not per call site |
 | 34-37 | Testing, failure injection, evaluation, optimization | Not started |
 | 38-39 | Docker, migration verification | Blocked — no Docker on host |
 | 40-45 | CI/CD, documentation, dashboard, final reviews | Not started |
@@ -323,3 +326,105 @@ NEXT PHASE:         10 (concrete tools), then 20 (memory), 23 (API)
 - **The critic never rewrites.** It reports; the orchestrator decides. A failed
   verdict retries while budget remains and then delivers anyway, with the
   unresolved criticism passed to the synthesizer as an explicit caveat.
+
+---
+
+## Phases 10, 11, 23 — concrete tools, tool security, and the HTTP API
+
+```
+PHASE:              10, 11, 23, plus security phases 28-33, 25 (ownership)
+STATUS:             Complete
+FILES CREATED:      app/core/security.py, app/core/logging.py,
+                    app/tools/{filesystem,python_executor,database,github,
+                    web_search}.py, app/services/tasks.py,
+                    app/api/dependencies.py, app/api/routes/{chat,tasks,
+                    agents}.py, tests/tools/{test_security,test_filesystem,
+                    test_database,test_network_tools,test_python_executor}.py,
+                    tests/api/test_api.py
+FILES MODIFIED:     app/core/config.py, app/main.py, app/api/routes/health.py,
+                    app/tools/{base,registry}.py, app/agents/*.py,
+                    app/graph/{builder,nodes}.py, app/services/tasks.py,
+                    app/agents/planner.py, tests/agents/test_agents.py,
+                    tests/graph/test_graph_execution.py, pyproject.toml,
+                    docs/DEVELOPMENT_PLAN.md
+DEPENDENCIES:       none added; every capability uses the standard library or
+                    an already-present dependency (httpx2 for network tools)
+COMMANDS RUN:       ruff format . && ruff check .
+                    mypy app
+                    pytest
+                    live startup check against GET /health, /ready,
+                    /api/v1/agents, /api/v1/tools, /openapi.json
+TESTS RUN:          383 tests across unit, agents, graph, tools, and api suites
+TEST RESULTS:       PASS
+                      ruff check .............. All checks passed
+                      mypy app ................ Success: no issues in 55 files
+                      pytest .................. 383 passed
+                      startup with a credential  graph_ready, 7 agents
+                      GET /ready .............. ok, 5 tools, 7 agents
+ISSUES FOUND:       1. **Startup-breaking wiring defect.** Every agent declared
+                       tool names that do not exist: the coder and executor
+                       asked for `filesystem`, the executor also for `github`,
+                       and the analyst for `database` without a query executor
+                       being configured. With a credential present,
+                       `build_all_agents` raised and the whole application
+                       failed to start, taking `/health` down with it.
+                    2. `execute_approved_action` defaulted to the hardcoded and
+                       nonexistent tool name `filesystem`, and guarded it with
+                       `isinstance(route, object)`, which is always true.
+                    3. `Tool._failure` accepted an `approval_required` flag and
+                       silently discarded it, so "needs a human" was reported
+                       as an ordinary failure.
+                    4. The planner was offered one flat list of every registered
+                       tool, letting it assign a tool to an agent that is not
+                       authorised to use it. Nothing validated this, and agents
+                       ignore `subtask.tools`, so the mismatch was invisible:
+                       the plan claimed a capability that never ran.
+                    5. `INSERT INTO` was classified destructive because the
+                       token `into` appeared in the destructive keyword set.
+                    6. `Tool.execute` caught only `ToolError`, so any other
+                       `AppError` from a tool was relabelled `UNKNOWN` and lost
+                       the retry semantics it had declared.
+                    7. An `assert` in the cancel route, which is stripped under
+                       `python -O`.
+ISSUES FIXED:       All seven. The tool-name defect is the significant one,
+                    and it is now caught three ways: a composition-time check
+                    in `build_workforce` that raises `ConfigurationError`,
+                    a startup test that asserts the real lifespan wires the
+                    real workforce, and a test that every agent resolves
+                    against the real registry.
+KNOWN LIMITATIONS:  - Tasks and approvals are held in process memory. A
+                      restart loses them; the durable store arrives with the
+                      PostgreSQL backend.
+                    - `POST /cancel` marks the record but cannot interrupt a
+                      run that is already executing, because the run holds the
+                      event loop rather than polling a cancellation token.
+                    - Authentication is not implemented. Callers identify
+                      themselves with an `X-User-Id` header, and ownership is
+                      enforced against it on every read. That is isolation, not
+                      authentication.
+                    - Rate limiting is not implemented.
+                    - The document agent is still not written.
+NEXT PHASE:         20 (memory), 24 (event streaming), 25-26 (auth, rate limits)
+```
+
+### Design decisions recorded
+
+- **Capabilities that depend on configuration are optional, not required.**
+  `BaseAgent.optional_tools` lets the analyst and executor use the database and
+  GitHub tools when those are configured, without the whole workforce failing to
+  build when they are not. What does not resolve is reported through
+  `GET /api/v1/agents` as `unavailable_tools` rather than dropped quietly. A
+  *required* tool that is missing still raises, and now fails at composition
+  time in one place instead of at an arbitrary call site.
+- **The planner is told which tools each agent may use, not the union of every
+  tool.** `validate_plan` then rejects any subtask naming a tool its agent is not
+  authorised for. Both halves are needed: offering the right information makes a
+  valid plan likely, and validating makes an invalid one impossible.
+- **Redaction is applied where a secret could escape, not where it is stored.**
+  Tool failure details are scrubbed against every configured secret before they
+  are recorded, because credentials are a realistic leak path through an
+  exception message.
+- **The API reports degradation rather than refusing to start.** A missing
+  credential is not fatal: `/health` still answers, and `/ready` explains what is
+  missing. A wiring defect *is* fatal, because it is a code bug rather than a
+  configuration gap.

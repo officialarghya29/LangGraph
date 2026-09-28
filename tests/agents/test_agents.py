@@ -61,19 +61,34 @@ def stub_tool(name: str, mode: AccessMode = AccessMode.READ) -> Tool[_Args, _Out
     return type(f"Stub_{name}", (Tool,), namespace)()
 
 
-ALL_TOOL_NAMES = ("web_search", "filesystem", "python_executor", "database", "github")
+#: The real tool names. Using the actual catalogue keeps these tests honest:
+#: an agent referring to a tool that does not exist fails here rather than in
+#: production, where it would take down the whole workforce at startup.
+ALL_TOOL_NAMES = (
+    "web_search",
+    "read_file",
+    "list_directory",
+    "write_file",
+    "python_executor",
+    "database",
+    "github_repository",
+    "github_create_issue",
+)
 
 
 def full_registry() -> ToolRegistry:
     return ToolRegistry(
         [
             stub_tool("web_search"),
-            # Destructive so that it exercises the approval gate: a plain
-            # write is MEDIUM risk and legitimately needs no approval.
-            stub_tool("filesystem", AccessMode.DESTRUCTIVE),
+            stub_tool("read_file"),
+            stub_tool("list_directory"),
+            # Destructive so that it exercises the approval gate: a plain write
+            # is MEDIUM risk and legitimately needs no approval.
+            stub_tool("write_file", AccessMode.DESTRUCTIVE),
             stub_tool("python_executor", AccessMode.WRITE),
             stub_tool("database", AccessMode.READ),
-            stub_tool("github", AccessMode.WRITE),
+            stub_tool("github_repository", AccessMode.WRITE),
+            stub_tool("github_create_issue", AccessMode.WRITE),
         ]
     )
 
@@ -103,10 +118,27 @@ def test_the_analyst_gets_computation_and_read_only_data() -> None:
     assert set(agent.tool_names) == {"python_executor", "database"}
 
 
-def test_the_coder_gets_only_the_filesystem() -> None:
+def test_the_analyst_still_works_without_a_database() -> None:
+    """An unconfigured dependency narrows the agent rather than breaking it."""
+    registry = ToolRegistry([stub_tool("python_executor", AccessMode.WRITE)])
+    agent = DataAnalysisAgent(provider(), registry)
+
+    assert agent.tool_names == ("python_executor",)
+    assert agent.unavailable_tools == ("database",)
+    assert agent.allows_tool("database") is False
+
+
+def test_an_unavailable_optional_tool_is_reported_in_describe() -> None:
+    registry = ToolRegistry([stub_tool("python_executor", AccessMode.WRITE)])
+    described = DataAnalysisAgent(provider(), registry).describe()
+
+    assert described["unavailable_tools"] == ["database"]
+
+
+def test_the_coder_gets_only_the_file_tools() -> None:
     agent = CodingAgent(provider(), full_registry())
 
-    assert agent.tool_names == ("filesystem",)
+    assert set(agent.tool_names) == {"read_file", "list_directory", "write_file"}
 
 
 def test_pler_agents_get_no_tools() -> None:
@@ -145,7 +177,7 @@ def test_allows_tool_is_exact() -> None:
     agent = ResearchAgent(provider(), full_registry())
 
     assert agent.allows_tool("web_search") is True
-    assert agent.allows_tool("filesystem") is False
+    assert agent.allows_tool("write_file") is False
     assert agent.allows_tool("") is False
 
 
@@ -154,7 +186,7 @@ async def test_calling_a_forbidden_tool_is_refused() -> None:
     agent = ResearchAgent(provider(), full_registry())
 
     with pytest.raises(ToolPermissionError, match="not authorised"):
-        await agent.call_tool("filesystem", {"query": "x"}, context())
+        await agent.call_tool("write_file", {"query": "x"}, context())
 
 
 async def test_calling_an_allowed_tool_succeeds() -> None:
@@ -185,6 +217,48 @@ def test_describe_is_client_safe_and_complete() -> None:
     assert described["tools"] == ["web_search"]
     assert "input_schema" in described
     assert "output_schema" in described
+
+
+def test_the_real_workforce_wires_up_against_the_real_registry() -> None:
+    """The composition root must never name a tool that does not exist.
+
+    Regression guard for the whole class of failure where a misnamed tool makes
+    the workforce unconstructable, so the application cannot start at all.
+    """
+    from app.graph.builder import build_all_agents
+    from app.tools.registry import build_default_registry
+
+    registry = build_default_registry(SETTINGS)
+    agents = build_all_agents(provider(), registry)
+
+    assert agents
+    # describe() resolves the allow-list, so a required tool that does not exist
+    # raises here. This is the guard against a misnamed tool reaching startup.
+    for agent in agents.values():
+        assert "tools" in agent.describe()
+    assert agents["researcher"].describe()["tools"] == ["web_search"]
+    assert agents["analyst"].describe()["tools"] == ["python_executor"]
+
+
+def test_only_optional_capabilities_may_be_unavailable() -> None:
+    """A required tool that is missing is a wiring bug; an optional one is not."""
+    from app.graph.builder import build_all_agents
+    from app.tools.registry import build_default_registry
+
+    registry = build_default_registry(SETTINGS)
+    missing = {
+        name: agent.unavailable_tools
+        for name, agent in build_all_agents(provider(), registry).items()
+        if agent.unavailable_tools
+    }
+
+    # The GitHub tools need a token and the database tool needs a query executor,
+    # neither of which is configured here. Everything else must resolve.
+    for agent_name, names in missing.items():
+        for name in names:
+            assert name in {"database", "github_repository", "github_create_issue"}, (
+                f"{agent_name} is missing the required tool {name!r}"
+            )
 
 
 def test_every_agent_declares_a_distinct_name() -> None:
@@ -259,9 +333,14 @@ async def test_the_planner_sends_the_offered_agents_to_the_model() -> None:
 
     from app.agents.planner import PlannerInput
 
-    await agent.run(PlannerInput(user_request="do it", available_agents=["researcher"]), context())
+    await agent.run(
+        PlannerInput(user_request="do it", agent_tools={"researcher": ["web_search"]}),
+        context(),
+    )
 
-    assert "researcher" in provider_instance.last_prompt()
+    prompt = provider_instance.last_prompt()
+    assert "researcher" in prompt
+    assert "web_search" in prompt
 
 
 async def test_the_executor_passes_approval_through_to_the_tool() -> None:
@@ -270,7 +349,7 @@ async def test_the_executor_passes_approval_through_to_the_tool() -> None:
 
     from app.agents.executor import ExecutorInput
 
-    payload = ExecutorInput(action="write", tool="filesystem", arguments={"query": "x"})
+    payload = ExecutorInput(action="write", tool="write_file", arguments={"query": "x"})
 
     unapproved = await agent.run(payload, context())
     approved = await agent.run(payload, AgentContext(settings=SETTINGS, approved=True))

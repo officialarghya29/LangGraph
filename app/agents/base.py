@@ -50,7 +50,16 @@ class BaseAgent[In: BaseModel, Out: BaseModel](ABC):
     #: Role instruction sent as the system message.
     system_prompt: ClassVar[str] = ""
     #: Exactly the tools this agent may use. Nothing else is visible to it.
+    #: Every name here must be registered; a missing one is a wiring bug.
     allowed_tools: ClassVar[tuple[str, ...]] = ()
+    #: Tools this agent would use if they happen to be registered.
+    #:
+    #: Some capabilities depend on configuration rather than code: the database
+    #: tool needs a database, the GitHub tools need a token. Those dependencies
+    #: being absent should narrow an agent, not break the whole workforce. Unlike
+    #: ``allowed_tools``, a name here may legitimately not resolve; what does not
+    #: resolve is reported through :meth:`describe` rather than dropped quietly.
+    optional_tools: ClassVar[tuple[str, ...]] = ()
 
     #: Declared ``ClassVar`` so subclasses can assign concrete models in the
     #: class body. The generic parameters are used by ``run``; the schemas
@@ -68,11 +77,16 @@ class BaseAgent[In: BaseModel, Out: BaseModel](ABC):
         return self._provider
 
     def describe(self) -> dict[str, object]:
-        """Return a client-safe description of the agent."""
+        """Return a client-safe description of the agent.
+
+        Includes the tools that resolved and the optional tools that did not, so
+        a missing capability is visible instead of silently absent.
+        """
         return {
             "name": self.name,
             "description": self.description,
             "tools": list(self.tool_names),
+            "unavailable_tools": list(self.unavailable_tools),
             "input_schema": self.input_model.model_json_schema(),
             "output_schema": self.output_model.model_json_schema(),
         }
@@ -84,20 +98,47 @@ class BaseAgent[In: BaseModel, Out: BaseModel](ABC):
     def tools(self) -> tuple[AnyTool, ...]:
         """Resolve this agent's tool set from the registry.
 
+        Required tools must be registered. Optional tools are included only when
+        they resolve, so an unconfigured dependency narrows the agent instead of
+        raising.
+
+        Returns:
+            The required tools in declaration order, then whichever optional
+            tools are available.
+
         Raises:
-            NotFoundError: If an allowed tool is not registered. A missing
+            NotFoundError: If a required tool is not registered. A missing
                 dependency is a wiring bug and must surface immediately.
         """
-        return self._registry.get_allowed_tools(self.allowed_tools)
+        required = self._registry.get_allowed_tools(self.allowed_tools)
+        available = tuple(
+            self._registry.get(name) for name in self.optional_tools if self._registry.has(name)
+        )
+        return (*required, *available)
 
     @property
     def tool_names(self) -> tuple[str, ...]:
         """Return the names of the tools this agent may use."""
         return tuple(tool.name for tool in self.tools())
 
+    @property
+    def unavailable_tools(self) -> tuple[str, ...]:
+        """Return the declared optional tools that are not registered.
+
+        Reported rather than hidden: an unconfigured dependency and a typo look
+        the same from here, and an operator should be able to see both.
+        """
+        return tuple(name for name in self.optional_tools if not self._registry.has(name))
+
     def allows_tool(self, name: str) -> bool:
-        """Return whether this agent is authorised to use a tool."""
-        return name in self.allowed_tools
+        """Return whether this agent is authorised to use a tool.
+
+        An optional tool that is not registered is not authorised: the agent
+        must not be able to name its way to a capability it does not have.
+        """
+        if name in self.allowed_tools:
+            return True
+        return name in self.optional_tools and self._registry.has(name)
 
     async def call_tool(
         self,

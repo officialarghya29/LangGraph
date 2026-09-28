@@ -11,11 +11,19 @@ from __future__ import annotations
 from collections.abc import Iterable, Sequence
 from typing import Any
 
+import httpx
+
+from app.core.config import Settings
 from app.core.exceptions import NotFoundError
 from app.models.tool import RiskLevel
 from app.tools.base import Tool
+from app.tools.database import DatabaseTool, QueryExecutor
+from app.tools.filesystem import ListDirectoryTool, ReadFileTool, WriteFileTool
+from app.tools.github import GitHubClient, GitHubCreateIssueTool, GitHubRepositoryTool
+from app.tools.python_executor import PythonExecutionTool
+from app.tools.web_search import WebSearchTool
 
-__all__ = ["AnyTool", "ToolRegistry"]
+__all__ = ["AnyTool", "ToolRegistry", "build_default_registry"]
 
 #: Tools are heterogeneous in their input and output models, so the registry
 #: stores them at their most general type.
@@ -138,3 +146,50 @@ class ToolRegistry:
         method above shadows the builtin inside this class body.
         """
         return [tool.describe() for tool in self.list()]
+
+
+def build_default_registry(
+    settings: Settings,
+    *,
+    query_executor: QueryExecutor | None = None,
+    http_client: httpx.AsyncClient | None = None,
+) -> ToolRegistry:
+    """Register the built-in tools against a settings object.
+
+    The composition root for tools. Two dependencies cannot be constructed from
+    settings alone and are injected instead:
+
+    - ``query_executor`` runs SQL. Until it is supplied, the database tool is
+      simply not registered rather than registered broken.
+    - ``http_client`` is shareable across the network tools, mainly so tests can
+      drive them through a mock transport.
+
+    Args:
+        settings: Application settings.
+        query_executor: Runner for the database tool, if available.
+        http_client: Shared HTTP client for the network tools.
+
+    Returns:
+        A registry holding every tool that can be constructed.
+    """
+    tools: list[AnyTool] = [
+        ReadFileTool(),
+        WriteFileTool(),
+        ListDirectoryTool(),
+        PythonExecutionTool(),
+        WebSearchTool(http_client),
+    ]
+
+    if query_executor is not None:
+        tools.append(DatabaseTool(query_executor))
+
+    if settings.github_token is not None:
+        github_client = GitHubClient(
+            token=settings.github_token.get_secret_value(),
+            base_url=settings.github_api_url,
+            client=http_client,
+            secrets=settings.secret_values(),
+        )
+        tools.extend([GitHubRepositoryTool(github_client), GitHubCreateIssueTool(github_client)])
+
+    return ToolRegistry(tools)

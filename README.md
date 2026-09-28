@@ -25,9 +25,9 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 
 [![Ruff](https://img.shields.io/badge/Ruff-passing-D7FF64?style=for-the-badge&logo=ruff&logoColor=black)](#quality-gates)
 [![MyPy](https://img.shields.io/badge/MyPy-strict-2A6DB2?style=for-the-badge)](#quality-gates)
-[![Tests](https://img.shields.io/badge/tests-2%20passing-brightgreen?style=for-the-badge)](#quality-gates)
+[![Tests](https://img.shields.io/badge/tests-383%20passing-brightgreen?style=for-the-badge)](#quality-gates)
 
-[![Status](https://img.shields.io/badge/status-phase%200--1-yellow?style=for-the-badge)](#build-status)
+[![Status](https://img.shields.io/badge/status-phase%2023%20of%2045-yellow?style=for-the-badge)](#build-status)
 [![License](https://img.shields.io/badge/license-proprietary-red?style=for-the-badge)](#license)
 
 </div>
@@ -37,17 +37,19 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 ## Build status
 
 > [!WARNING]
-> **This repository is at Phase 21 of 45.** Working and verified end to end:
+> **This repository is at Phase 23 of 45.** Working and verified end to end:
 > typed configuration, the LLM and embedding provider abstractions, the typed
 > graph state, the execution event model, the tool framework with its full
-> security pipeline, seven agents, the router, the planner, the critic, the
-> synthesizer, the LangGraph orchestration graph with bounded parallel dispatch
-> and classified retries, and human-in-the-loop approval with checkpoint/resume.
+> security pipeline, five real tools behind per-tool policy (filesystem,
+> sandboxed Python, database, GitHub, web search), seven agents, the router, the
+> planner, the critic, the synthesizer, the LangGraph orchestration graph with
+> bounded parallel dispatch and classified retries, human-in-the-loop approval
+> with checkpoint/resume, and the HTTP API with ownership enforced on every read.
 >
-> Not yet written: the concrete tools (Phase 10), the memory manager (Phase 20),
-> durable PostgreSQL checkpointing, the HTTP API (Phase 23), authorization and
-> rate limiting, observability, Docker, and CI. Nothing here is claimed to be
-> production-ready.
+> Not yet written: the memory manager (Phase 20), durable PostgreSQL
+> checkpointing and task storage, execution-event streaming, authorization and
+> rate limiting, metrics and tracing, Docker, and CI. Nothing here is claimed to
+> be production-ready.
 >
 > **The graph runs offline.** Tests drive the real compiled graph against a
 > deterministic fake provider, so the whole orchestration is exercised without
@@ -57,12 +59,13 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 
 | Gate | Command | Result |
 | :--- | :--- | :--- |
-| Formatting | `ruff format --check .` | 65 files already formatted |
+| Formatting | `ruff format --check .` | 84 files already formatted |
 | Linting | `ruff check .` | All checks passed |
-| Types | `mypy app scripts` | Success: no issues in 44 source files |
-| Tests | `pytest` | 232 passed |
+| Types | `mypy app` | Success: no issues in 55 source files |
+| Tests | `pytest` | 383 passed |
 | Startup | `uvicorn app.main:app` | Application startup complete |
 | Endpoint | `curl /health` | `200 {"status":"ok"}` |
+| Readiness | `curl /ready` | `ok` — 5 tools, 7 agents registered |
 
 **Status legend used throughout:** ✅ implemented and verified · 🔶 partially implemented · 🔷 designed, not yet written · ⛔ blocked by a missing dependency on the host
 
@@ -268,20 +271,23 @@ all happen *before* execution, and every call emits an audit event.
 
 | Level | Example operations | Execution policy | Status |
 | :--- | :--- | :--- | :--- |
-| **LOW** | Read a file, search the web | Auto-execute | 🔷 |
-| **MEDIUM** | Write a file, open an issue | Auto-execute, audited | 🔷 |
-| **HIGH** | Execute code, write to the database | Human approval required | 🔷 |
-| **CRITICAL** | Delete data, drop a table | Human approval required | 🔷 |
+| **LOW** | Read a file, search the web | Auto-execute | ✅ |
+| **MEDIUM** | Write a file, open an issue | Auto-execute, audited | ✅ |
+| **HIGH** | Execute code, write to the database | Human approval required | ✅ |
+| **CRITICAL** | Delete data, drop a table | Human approval required | ✅ |
 
 ### Per-tool restrictions
 
-| Tool | Default mode | Additional restriction | Status |
-| :--- | :--- | :--- | :--- |
-| `WebSearchTool` | Read | URL validation; blocks private, loopback, and metadata addresses | 🔷 |
-| `FilesystemTool` | Read | Confined to an allow-listed root; traversal and symlink escapes rejected; size cap | 🔷 |
-| `PythonExecutionTool` | **Disabled** | Must run in an isolated sandbox. Disabled rather than faked | 🔷 |
-| `DatabaseTool` | Read-only | Writes need authorisation; destructive statements need approval | 🔷 |
-| `GitHubTool` | Read | Writes need authorisation; tokens never exposed to the model | 🔷 |
+| Tool | Registered as | Default mode | Additional restriction | Status |
+| :--- | :--- | :--- | :--- | :--- |
+| `WebSearchTool` | `web_search` | Read | URL validation; blocks private, loopback, and metadata addresses | ✅ |
+| `ReadFileTool` | `read_file` | Read | Confined to an allow-listed root; traversal and symlink escapes rejected | ✅ |
+| `WriteFileTool` | `write_file` | Write | Same confinement, plus a per-file size cap and an audit log line | ✅ |
+| `ListDirectoryTool` | `list_directory` | Read | Same confinement; entry count capped | ✅ |
+| `PythonExecutionTool` | `python_executor` | **Disabled** | Must run in an isolated sandbox. Disabled rather than faked | ✅ |
+| `DatabaseTool` | `database` | Read-only | Writes need authorisation; destructive statements need approval | ✅ |
+| `GitHubRepositoryTool` | `github_repository` | Read | Tokens never exposed to the model | ✅ |
+| `GitHubCreateIssueTool` | `github_create_issue` | Write | Disabled unless `GITHUB_TOOL_ALLOW_WRITES` is set | ✅ |
 
 > **On sandboxing:** arbitrary Python execution is the highest-risk capability in
 > any agent system. This host has no container runtime, so
@@ -424,16 +430,21 @@ $ curl -s http://127.0.0.1:8000/health
 | Method | Path | Purpose | Status |
 | :--- | :--- | :--- | :--- |
 | `GET` | `/health` | Liveness. No dependency checks | ✅ |
-| `GET` | `/ready` | Readiness, including dependencies | 🔷 |
-| `POST` | `/api/v1/chat` | Conversational entry point | 🔷 |
-| `POST` | `/api/v1/tasks` | Create a task | 🔷 |
-| `GET` | `/api/v1/tasks/{task_id}` | Fetch a task | 🔷 |
-| `GET` | `/api/v1/tasks/{task_id}/status` | Execution status | 🔷 |
-| `POST` | `/api/v1/tasks/{task_id}/approve` | Approve a gated action | 🔷 |
-| `POST` | `/api/v1/tasks/{task_id}/reject` | Reject a gated action | 🔷 |
-| `POST` | `/api/v1/tasks/{task_id}/cancel` | Cancel a running task | 🔷 |
-| `GET` | `/api/v1/agents` | List available agents | 🔷 |
-| `GET` | `/api/v1/tools` | List available tools | 🔷 |
+| `GET` | `/ready` | Readiness, including dependencies | ✅ |
+| `POST` | `/api/v1/chat` | Conversational entry point | ✅ |
+| `POST` | `/api/v1/tasks` | Create a task | ✅ |
+| `GET` | `/api/v1/tasks/{task_id}` | Fetch a task | ✅ |
+| `GET` | `/api/v1/tasks/{task_id}/status` | Execution status | ✅ |
+| `POST` | `/api/v1/tasks/{task_id}/approve` | Approve a gated action | ✅ |
+| `POST` | `/api/v1/tasks/{task_id}/reject` | Reject a gated action | ✅ |
+| `POST` | `/api/v1/tasks/{task_id}/cancel` | Cancel a running task | 🔶 |
+| `GET` | `/api/v1/agents` | List available agents | ✅ |
+| `GET` | `/api/v1/tools` | List available tools | ✅ |
+
+Task and approval records live in process memory, so `/api/v1/tasks/{id}/cancel`
+marks the record but cannot interrupt a run that is already executing, and a
+restart loses in-flight work. Neither limitation is hidden: both are stated here,
+reported by `/ready`, and tracked in the development plan.
 
 Streaming exposes execution events only — `task_started`, `planning`,
 `agent_started`, `tool_completed`, `verification_completed`,
@@ -552,8 +563,8 @@ suite runs offline and produces stable results.
 - [x] **Phase 7** — typed, serializable graph state
 - [x] **Phase 8** — structured execution events
 - [x] **Phase 9** — tool framework, registry, risk classification
-- [ ] **Phase 10** — concrete tools (web search, filesystem, execution, database, GitHub)
-- [ ] **Phase 11** — tool security pipeline end to end (framework done; per-tool policies pending)
+- [x] **Phase 10** — concrete tools (web search, filesystem, execution, database, GitHub)
+- [x] **Phase 11** — tool security pipeline end to end (framework and per-tool policies)
 - [x] **Phase 12** — base agent contract
 - [x] **Phase 13** — planner agent
 - [x] **Phase 14** — structured intent routing
@@ -564,11 +575,14 @@ suite runs offline and produces stable results.
 - [x] **Phase 19** — critic agent
 - [ ] **Phase 20** — memory manager
 - [x] **Phase 21** — checkpointing and human approval ✅ (in-memory saver; durable PostgreSQL backend pending)
-- [ ] **Phase 22** — approval records persisted to the database
-- [ ] **Phase 23** — HTTP API
+- [ ] **Phase 22** — approval records persisted to the database (interrupt/resume verified; records are in-memory)
+- [x] **Phase 23** — HTTP API (all 11 routes; auth and rate limiting still pending)
 - [ ] **Phase 24** — execution-event streaming
-- [ ] **Phases 25-33** — authorization, rate limiting, observability, prompt injection, SSRF, filesystem, execution, database and GitHub hardening (partial: tool risk gating and secret redaction done)
-- [ ] **Phases 34-37** — testing, failure injection, evaluation, efficiency optimisation (partial: 232 tests across state, tools, agents, routing, and graph paths)
+- 🔶 **Phase 25** — authorization (ownership enforced on every task read; real authentication pending)
+- [ ] **Phase 26** — rate limiting
+- 🔶 **Phase 27** — observability (structured logging and events done; metrics and tracing pending)
+- [x] **Phases 28-33** — prompt injection, SSRF, filesystem, execution sandbox, database and GitHub hardening
+- [ ] **Phases 34-37** — testing, failure injection, evaluation, efficiency optimisation (partial: 383 tests across state, tools, agents, routing, graph, and API paths)
 - [ ] **Phases 38-45** — Docker, migrations, CI/CD, documentation, control dashboard, final security/performance/architecture reviews
 
 </details>

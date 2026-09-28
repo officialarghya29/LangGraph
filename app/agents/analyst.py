@@ -37,7 +37,9 @@ class DataAnalysisAgent(BaseAgent[AnalysisInput, AgentOutput]):
     name = "analyst"
     description = "Inspects datasets, performs calculations, and reports structured results"
     #: Computation and read-only data access. No write path exists.
-    allowed_tools: ClassVar[tuple[str, ...]] = ("python_executor", "database")
+    allowed_tools: ClassVar[tuple[str, ...]] = ("python_executor",)
+    #: Available only when a query executor is wired up.
+    optional_tools: ClassVar[tuple[str, ...]] = ("database",)
     input_model: ClassVar[type[BaseModel]] = AnalysisInput
     output_model: ClassVar[type[BaseModel]] = AgentOutput
 

@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 from app.core.config import Settings
+from app.core.exceptions import ConfigurationError
 from app.graph.builder import build_graph
 from app.graph.checkpoints import thread_config
 from app.graph.state import initial_state
@@ -36,10 +37,10 @@ class _WriteResult(BaseModel):
 
 
 class WriteFileTool(Tool[_NoArgs, _WriteResult]):
-    """A stand-in for the filesystem tool, which arrives in Phase 10."""
+    """A stand-in for the real write tool, so approval resume is testable."""
 
-    name = "filesystem"
-    description = "test double for the filesystem tool"
+    name = "write_file"
+    description = "test double for the write tool"
     access_mode = AccessMode.WRITE
     input_model = _NoArgs
     output_model = _WriteResult
@@ -49,19 +50,71 @@ class WriteFileTool(Tool[_NoArgs, _WriteResult]):
         return _WriteResult()
 
 
+async def _inert_run(self: object, payload: Any, context: ToolContext) -> _WriteResult:
+    """Do nothing, successfully."""
+    return _WriteResult()
+
+
+#: Tool names the worker agents declare as required, and the mode each is
+#: registered with. The graph cannot be built without satisfying this contract,
+#: which is the point: these tests exercise orchestration against the same
+#: wiring rules as production, not against a registry that could never exist.
+_WORKER_TOOLS: dict[str, AccessMode] = {
+    "web_search": AccessMode.READ,
+    "read_file": AccessMode.READ,
+    "list_directory": AccessMode.READ,
+    "write_file": AccessMode.WRITE,
+    "python_executor": AccessMode.WRITE,
+}
+
+
+def stub_tool(name: str, mode: AccessMode = AccessMode.READ) -> Tool[Any, Any]:
+    """Build an inert tool registered under ``name``.
+
+    Built as a class rather than configured per instance because
+    ``effective_risk()`` reads a class attribute; a mode set on an instance
+    would be invisible to the approval gate and the test would pass for the
+    wrong reason.
+    """
+    namespace: dict[str, object] = {
+        "name": name,
+        "description": f"stub for {name}",
+        "access_mode": mode,
+        "input_model": _NoArgs,
+        "output_model": _WriteResult,
+        "run": _inert_run,
+    }
+    return type(f"Stub_{name}", (Tool,), namespace)()
+
+
+def workforce_registry() -> ToolRegistry:
+    """A registry that satisfies the worker agents' required-tool contract."""
+    return ToolRegistry(
+        [
+            WriteFileTool() if name == "write_file" else stub_tool(name, mode)
+            for name, mode in _WORKER_TOOLS.items()
+        ]
+    )
+
+
 # --------------------------------------------------------------------------- #
 # Scripted provider
 # --------------------------------------------------------------------------- #
 
 
-def route_payload(route: str, *, approval: bool = False) -> dict[str, Any]:
+def route_payload(
+    route: str,
+    *,
+    approval: bool = False,
+    required_tools: list[str] | None = None,
+) -> dict[str, Any]:
     return {
         "route": route,
         "complexity": "complex" if route not in {"direct", "human_approval"} else "simple",
         "intent": "scripted",
         "required_capabilities": [],
         "required_agents": [],
-        "required_tools": [],
+        "required_tools": required_tools or [],
         "requires_planning": False,
         "requires_approval": approval,
         "reasoning_summary": "scripted decision",
@@ -143,6 +196,7 @@ def responder_for(
     *,
     route: str = "direct",
     approval: bool = False,
+    required_tools: list[str] | None = None,
     plan: dict[str, Any] | None = None,
     verdicts: list[dict[str, Any]] | None = None,
 ) -> Any:
@@ -157,7 +211,9 @@ def responder_for(
         joined = "\n".join(m.content for m in messages)
 
         if "You route requests" in joined:
-            return json.dumps(route_payload(route, approval=approval))
+            return json.dumps(
+                route_payload(route, approval=approval, required_tools=required_tools)
+            )
         if "You are a planning agent" in joined:
             return json.dumps(plan or DEFAULT_PLAN)
         if "You are a research agent" in joined:
@@ -177,7 +233,9 @@ def make_provider(**kwargs: Any) -> FakeLLMProvider:
 
 
 def build(provider: FakeLLMProvider, registry: ToolRegistry | None = None) -> Any:
-    return build_graph(SETTINGS, provider, registry or ToolRegistry())
+    return build_graph(
+        SETTINGS, provider, registry if registry is not None else workforce_registry()
+    )
 
 
 def run(graph: Any, request: str = "compare two stores", **state_overrides: Any) -> dict[str, Any]:
@@ -258,7 +316,7 @@ def test_parallel_dispatch_respects_the_configured_ceiling() -> None:
     """Concurrency is bounded, not unlimited."""
     settings = Settings(_env_file=None, max_parallel_tasks=1)
     provider = SlowResearchProvider(0.15, responder=responder_for(route="research"))
-    graph = build_graph(settings, provider, ToolRegistry())
+    graph = build_graph(settings, provider, workforce_registry())
     state = initial_state("compare two stores", iteration_limit=10, retry_limit=3)
 
     started = time.perf_counter()
@@ -380,7 +438,7 @@ def test_a_gated_request_pauses_for_approval() -> None:
 def approval_graph(**provider_kwargs: Any) -> tuple[Any, Any]:
     """Build a graph whose executor has a usable tool."""
     provider = make_provider(route="human_approval", approval=True, **provider_kwargs)
-    return build(provider, ToolRegistry([WriteFileTool()])), provider
+    return build(provider), provider
 
 
 def test_approving_resumes_and_executes() -> None:
@@ -417,9 +475,13 @@ def test_rejecting_cancels_without_executing() -> None:
     assert "rejected" in (result["final_answer"] or "").lower()
 
 
-def test_a_missing_execution_tool_fails_cleanly() -> None:
-    """An approved action with no registered tool must not crash the run."""
-    provider = make_provider(route="human_approval", approval=True)
+def test_an_unregistered_execution_tool_fails_cleanly() -> None:
+    """An approved action naming a tool that does not exist must not crash."""
+    provider = make_provider(
+        route="human_approval",
+        approval=True,
+        required_tools=["no_such_tool"],
+    )
     graph = build(provider)
     state = initial_state("delete the production database", iteration_limit=10, retry_limit=3)
     config = thread_config(state["task_id"])
@@ -428,6 +490,14 @@ def test_a_missing_execution_tool_fails_cleanly() -> None:
     result = asyncio.run(graph.ainvoke(Command(resume="approve"), config))
 
     assert "could not be performed" in (result["final_answer"] or "")
+
+
+def test_a_workforce_declaring_an_unknown_tool_cannot_be_built() -> None:
+    """A misnamed tool must fail at wiring time, not silently reduce capability."""
+    provider = make_provider(route="direct")
+
+    with pytest.raises(ConfigurationError, match="not registered"):
+        build(provider, ToolRegistry())
 
 
 def test_resume_is_checkpointed_under_a_stable_thread() -> None:
