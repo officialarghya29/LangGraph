@@ -12,7 +12,7 @@ from typing import ClassVar
 
 from pydantic import BaseModel, Field
 
-from app.agents.base import AgentContext, BaseAgent
+from app.agents.base import UNTRUSTED_CONTENT_RULE, AgentContext, BaseAgent
 from app.models.agent import VerificationResult
 
 __all__ = ["CriticAgent", "CriticInput"]
@@ -48,7 +48,8 @@ class CriticAgent(BaseAgent[CriticInput, VerificationResult]):
         "- List anything the request asked for that is absent.\n"
         "- Set passed=true only when the work genuinely satisfies the request.\n"
         "- Do not rewrite the work. Report problems; do not fix them.\n"
-        "- Confidence is your certainty in your own verdict, not in the work."
+        "- Confidence is your certainty in your own verdict, not in the work.\n"
+        f"- {UNTRUSTED_CONTENT_RULE}"
     )
 
     async def run(self, payload: CriticInput, context: AgentContext) -> VerificationResult:

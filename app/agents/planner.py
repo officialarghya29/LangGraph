@@ -11,7 +11,7 @@ from typing import ClassVar
 
 from pydantic import BaseModel, Field
 
-from app.agents.base import AgentContext, BaseAgent
+from app.agents.base import UNTRUSTED_CONTENT_RULE, AgentContext, BaseAgent
 from app.schemas.plans import Plan
 
 __all__ = ["PlannerAgent", "PlannerInput"]
@@ -54,7 +54,8 @@ class PlannerAgent(BaseAgent[PlannerInput, Plan]):
         "- Give each subtask concrete, checkable success criteria.\n"
         "- Never include a subtask that requires a capability it was not offered. "
         "A subtask may only use tools listed for the agent it names.\n"
-        "- Assume nothing about the user's environment or data."
+        "- Assume nothing about the user's environment or data.\n"
+        f"- {UNTRUSTED_CONTENT_RULE}"
     )
 
     async def run(self, payload: PlannerInput, context: AgentContext) -> Plan:

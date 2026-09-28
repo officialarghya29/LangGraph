@@ -15,7 +15,7 @@ from typing import ClassVar
 
 from pydantic import BaseModel, Field
 
-from app.agents.base import AgentContext, BaseAgent
+from app.agents.base import UNTRUSTED_CONTENT_RULE, AgentContext, BaseAgent
 from app.models.agent import AgentOutput
 
 __all__ = ["AnalysisInput", "DataAnalysisAgent"]
@@ -54,7 +54,8 @@ class DataAnalysisAgent(BaseAgent[AnalysisInput, AgentOutput]):
         "- Distinguish correlation from causation explicitly.\n"
         "- Report the sample size and any obvious selection bias.\n"
         "- Give the uncertainty, not just a point estimate.\n"
-        "- Set confidence to your genuine certainty in the result."
+        "- Set confidence to your genuine certainty in the result.\n"
+        f"- {UNTRUSTED_CONTENT_RULE}"
     )
 
     async def run(self, payload: AnalysisInput, context: AgentContext) -> AgentOutput:

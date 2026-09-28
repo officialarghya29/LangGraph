@@ -11,7 +11,7 @@ from typing import ClassVar
 
 from pydantic import BaseModel, Field
 
-from app.agents.base import AgentContext, BaseAgent
+from app.agents.base import UNTRUSTED_CONTENT_RULE, AgentContext, BaseAgent
 from app.models.agent import AgentOutput
 
 __all__ = ["CodingAgent", "CodingInput"]
@@ -48,7 +48,8 @@ class CodingAgent(BaseAgent[CodingInput, AgentOutput]):
         "- When debugging, identify the root cause rather than patching the "
         "symptom.\n"
         "- State any assumption the code depends on.\n"
-        "- Set confidence to your genuine certainty that the code is correct."
+        "- Set confidence to your genuine certainty that the code is correct.\n"
+        f"- {UNTRUSTED_CONTENT_RULE}"
     )
 
     async def run(self, payload: CodingInput, context: AgentContext) -> AgentOutput:
