@@ -109,11 +109,70 @@ async def test_an_overloaded_response_is_also_a_throttle() -> None:
     assert captured.value.retry_after == 5.0
 
 
-@pytest.mark.parametrize("header", ["soon", "", "Wed, 21 Oct 2026 07:28:00 GMT"])
+@pytest.mark.parametrize("header", ["soon", "", "-5", "not a date at all"])
 async def test_a_malformed_header_is_ignored_rather_than_guessed(header: str) -> None:
-    """A date would mean trusting someone else's clock; better to use the curve."""
+    """Nonsense is not a hint of zero seconds, and not an exception either."""
     transport = httpx.MockTransport(
         lambda request: httpx.Response(429, headers={"Retry-After": header}, json={})
+    )
+    provider = _provider(transport)
+
+    with pytest.raises(LLMRateLimitError) as captured:
+        await provider.ainvoke([])  # type: ignore[arg-type]
+
+    assert captured.value.retry_after is None
+
+
+async def test_a_date_form_is_measured_against_the_servers_own_clock() -> None:
+    """The header expresses a wait, so it is measured against the response's Date.
+
+    Comparing the provider's timestamp with this machine's clock would introduce
+    exactly the skew the relative form exists to avoid.
+    """
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            429,
+            headers={
+                "Retry-After": "Wed, 21 Oct 2026 07:28:30 GMT",
+                "Date": "Wed, 21 Oct 2026 07:28:00 GMT",
+            },
+            json={},
+        )
+    )
+    provider = _provider(transport)
+
+    with pytest.raises(LLMRateLimitError) as captured:
+        await provider.ainvoke([])  # type: ignore[arg-type]
+
+    assert captured.value.retry_after == 30.0
+
+
+async def test_a_date_form_without_a_date_header_is_ignored() -> None:
+    """Nothing to measure against means nothing to honour."""
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            429, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:30 GMT"}, json={}
+        )
+    )
+    provider = _provider(transport)
+
+    with pytest.raises(LLMRateLimitError) as captured:
+        await provider.ainvoke([])  # type: ignore[arg-type]
+
+    assert captured.value.retry_after is None
+
+
+async def test_a_date_form_already_in_the_past_is_ignored() -> None:
+    """A negative wait is not a reason to skip sleeping; it is no instruction."""
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(
+            429,
+            headers={
+                "Retry-After": "Wed, 21 Oct 2026 07:27:00 GMT",
+                "Date": "Wed, 21 Oct 2026 07:28:00 GMT",
+            },
+            json={},
+        )
     )
     provider = _provider(transport)
 

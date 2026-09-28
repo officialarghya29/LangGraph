@@ -16,6 +16,8 @@ import json
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Callable, Coroutine, Mapping, Sequence
+from datetime import UTC
+from email.utils import parsedate_to_datetime
 from enum import StrEnum
 from typing import Any, TypeVar
 
@@ -105,26 +107,60 @@ _THROTTLE_STATUSES = frozenset({429, 503})
 def _retry_after(headers: Mapping[str, str]) -> float | None:
     """Return the delay the provider asked for, in seconds.
 
-    Only the numeric form is honoured. The header also permits an HTTP date, and
-    converting one would mean trusting the provider's clock relative to this
-    machine's — a skew of a few seconds would turn a short wait into a long one
-    or the reverse. A date is therefore ignored in favour of the backoff curve,
-    which at least fails in a known direction.
+    Both permitted forms are understood. A number of seconds is taken as given.
+    An HTTP date is interpreted against the response's *own* ``Date`` header
+    rather than this machine's clock: the header expresses a relative wait, and
+    subtracting two different clocks reintroduces exactly the skew the value is
+    meant to remove. Without a ``Date`` header there is nothing to measure a date
+    against, so it is ignored and the backoff curve applies — which at least
+    fails in a known direction.
 
     Args:
         headers: The response headers.
 
     Returns:
         A positive number of seconds, or ``None`` when the header is absent,
-        malformed, or in a form this does not interpret.
+        malformed, already in the past, or in a form this does not interpret.
     """
     raw = headers.get("retry-after")
     if raw is None:
         return None
+
+    text = raw.strip()
     try:
-        seconds = float(raw.strip())
+        seconds = float(text)
+    except (TypeError, ValueError):
+        return _retry_after_date(text, headers.get("date"))
+    return seconds if seconds > 0 else None
+
+
+def _retry_after_date(value: str, served_at: str | None) -> float | None:
+    """Return a wait expressed as an HTTP date, measured from its ``Date`` header.
+
+    Args:
+        value: The ``Retry-After`` value, in HTTP-date form.
+        served_at: The response's own ``Date`` header, or ``None``.
+
+    Returns:
+        Whole seconds until that instant, or ``None`` if either timestamp is
+        unusable or the instant has already passed.
+    """
+    if not served_at:
+        return None
+    try:
+        due = parsedate_to_datetime(value)
+        now = parsedate_to_datetime(served_at)
     except (TypeError, ValueError):
         return None
+
+    # HTTP dates always carry a zone, but a server that omits one should not
+    # raise on subtraction between an aware and a naive datetime.
+    if due.tzinfo is None:
+        due = due.replace(tzinfo=UTC)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+
+    seconds = (due - now).total_seconds()
     return seconds if seconds > 0 else None
 
 

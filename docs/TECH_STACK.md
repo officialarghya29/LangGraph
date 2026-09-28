@@ -139,10 +139,14 @@ are stated where they would otherwise be assumed:
 
 - **The container image has never been built.** The files are complete and
   lint-checked; this host has no container runtime. CI builds it.
-- **The real provider path has never been exercised end to end.** Every suite,
-  and every number in the README, comes from the deterministic fake provider. The
-  adapters for OpenAI and Anthropic are written against the same interface and are
-  covered by unit tests, but "covered by unit tests" and "has made a real call"
-  are different claims.
+- **No vendor endpoint has ever been called.** Every suite, and every number in
+  the README, comes from the deterministic fake provider. The adapters have now
+  spoken real HTTP to a scripted loopback server, which covers the request and
+  response contract — the endpoint path, the authentication header, the payload
+  shape, the usage fields, and the error mapping. What that still cannot cover is
+  vendor-specific behaviour: real rate-limit quirks, model-specific payloads, and
+  anything only the live endpoint does. "The contract is tested over a socket"
+  and "a real call has succeeded" are different claims, and only the first is
+true here.
 - ~~Frontend framework for the control dashboard — Phase 42.~~ Settled: no
   framework. See the table above.

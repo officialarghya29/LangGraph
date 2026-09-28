@@ -106,28 +106,45 @@ address, and finally a single shared anonymous bucket — an unattributable requ
 is limited rather than exempt. Unmatched paths are counted under a constant route
 label, so a caller cannot mint unbounded metric series by requesting nonsense.
 
+### Closed
+
+**Child-row reads had no `LIMIT`.** `TaskStepRepository.list_for_task`,
+`AgentRunRepository.list_for_task`, and `ToolCallRepository.list_for_task` were
+bounded by `task_id` alone. The argument for accepting that was that the graph
+caps iterations, tool calls, and wall-clock time per task, so the row count is
+bounded by configuration. The counter-argument won: that bound lives somewhere
+else, and nothing would force the query to change if the ceiling were raised. All
+three now take a ceiling and an offset, tested against real PostgreSQL.
+
+**A provider's `Retry-After` in HTTP-date form was ignored.** It is now
+interpreted against the response's *own* ``Date`` header rather than this
+machine's clock — the header expresses a relative wait, and subtracting two
+different clocks reintroduces exactly the skew the relative form exists to
+avoid. Without a ``Date`` header, or when the instant has already passed, it is
+still ignored in favour of the backoff curve.
+
+**The adapters had never spoken HTTP to anything.** Every test of them replaced
+the transport, which tests the *parsing* and cannot test the *request*: a wrong
+base path, a header that never gets sent, a body a server would reject. A
+scripted loopback server now answers them over a real socket, and the assertions
+are about what arrived — the endpoint, the bearer token, the JSON body, the
+Anthropic key header and its mandatory ceiling.
+
+What this does **not** cover is vendor-specific behaviour: rate-limit quirks,
+model-specific payloads, streaming, or anything else only the real endpoint does.
+That still needs a credential and a network, and it is stated rather than
+implied.
+
 ### Accepted risks
-
-**A provider's `Retry-After` in HTTP-date form is ignored.** The header permits
-both a delta and an absolute date, and only the delta is honoured. Converting a
-date would mean trusting the provider's clock against this machine's, where a few
-seconds of skew silently turns a short wait into a long one. Ignoring it falls
-back to the backoff curve, which at least fails in a known direction.
-
-**Child-row reads have no `LIMIT`.** `TaskStepRepository.list_for_task`,
-`AgentRunRepository.list_for_task`, and `ToolCallRepository.list_for_task` are
-bounded by `task_id` only. The graph caps iterations, tool calls, and wall-clock
-time per task, so the row count is bounded by configuration rather than by the
-query. Adding a limit would be a second, weaker copy of a bound that already
-exists, and the weaker copy is the one that would go stale.
-
-*Revisit if* the iteration ceiling is ever removed or made permissive.
 
 **The console's HTML is served unauthenticated.** Only its API calls require a
 token, so the page renders an empty shell without one — but the shell itself is
-still served. This is stated in the route module, in `.env.example`, and in the
-README rather than left for an operator to discover, and the console is off
-unless it is switched on.
+still served. It stays that way deliberately: the alternative is a token in the
+URL, which leaks into browser history, referrers, and access logs, and is worse
+than serving static markup that contains no data. The deployment pattern is to
+front it with an authenticating proxy, which the docs state. The console is off
+unless it is switched on, and it carries `noindex`, `no-referrer`, and a policy
+that permits nothing to be loaded from anywhere else.
 
 ---
 
@@ -166,7 +183,8 @@ measured cost.
 
 **Every repository list is bounded.** Conversations 50, tasks 50 (clamped to 200
 at the route), tasks-by-status 100, pending approvals 100, events 500, memories
-200, prune batch 1000.
+200, prune batch 1000, and the three per-task child reads 500 each — see
+[Closed](#closed) for why the last three moved out of this section.
 
 **Indexes match query shapes.** Composite indexes exist for the (user, status,
 created-at), (task, created-at), and (user, kind, created-at) access patterns the

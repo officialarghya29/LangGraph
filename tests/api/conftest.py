@@ -28,6 +28,7 @@ from app.graph.builder import build_all_agents, build_graph
 from app.main import create_app
 from app.services.budget import BudgetedProvider
 from app.services.llm import FakeLLMProvider
+from app.services.resilience import RetryingProvider
 from app.services.tasks import InMemoryTaskStore
 from tests.conftest import TRUNCATE_ALL
 
@@ -156,7 +157,10 @@ def harness(sql: Callable[..., list[tuple]]) -> Iterator[ApiHarness]:
     # and budget enforcement are exercised rather than bypassed by the harness.
     # The unwrapped provider stays on the harness for rewiring, since the wrapper
     # delegates to the same object.
-    budgeted = BudgetedProvider(provider)
+    # The same two decorators the lifespan applies, in the same order, so the API
+    # suite exercises the production model path rather than a simplification of
+    # it. The scripted provider never fails, so the retry loop costs nothing here.
+    budgeted = RetryingProvider(BudgetedProvider(provider), max_retries=Settings().max_retries)
 
     with TestClient(app) as client:
         # The lifespan built a real graph against the real provider path.

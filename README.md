@@ -24,7 +24,7 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 
 [![Ruff](https://img.shields.io/badge/Ruff-passing-D7FF64?style=for-the-badge&logo=ruff&logoColor=black)](#quality-gates)
 [![MyPy](https://img.shields.io/badge/MyPy-strict-2A6DB2?style=for-the-badge)](#quality-gates)
-[![Tests](https://img.shields.io/badge/tests-786%20passing-brightgreen?style=for-the-badge)](#quality-gates)
+[![Tests](https://img.shields.io/badge/tests-807%20passing-brightgreen?style=for-the-badge)](#quality-gates)
 
 [![Status](https://img.shields.io/badge/phases-34%20of%2045-yellow?style=for-the-badge)](#build-status)
 [![License](https://img.shields.io/badge/license-proprietary-red?style=for-the-badge)](#license)
@@ -41,10 +41,10 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 > — not mocks, and not a plan.
 >
 > ```console
-> $ ruff format --check .   →  135 files already formatted
+> $ ruff format --check .   →  136 files already formatted
 > $ ruff check .            →  All checks passed
 > $ mypy app scripts        →  Success: no issues found in 80 source files
-> $ pytest                  →  786 passed in 36s
+> $ pytest                  →  807 passed in 61s
 > $ python scripts/evaluate.py --quiet
 > rule-based baseline: accuracy=0.911 adversarial=0.429 macro_f1=0.920 ⟶
 >   approval_recall=1.000 p50=0.06ms p95=0.09ms
@@ -792,6 +792,7 @@ one is failing.
 | **API** | Health, readiness, chat, task creation, status, approve, reject, cancel, events, discovery | FastAPI test client, with durability read back over a separate connection |
 | **Security** | Path traversal, prompt injection, unauthorised tools, cross-user access, SSRF, unsafe SQL, secret leakage | Adversarial cases |
 | **Evaluation** | Routing quality against a labelled corpus, and the hot-path timings | Per-route precision and recall, a rule-based baseline, and a percentile timing harness |
+| **Provider transport** | Both model adapters, over a real socket | A scripted loopback server asserting the endpoint, headers, payload, usage fields, and error mapping — then the whole decorator stack against it |
 | **Assets** | The generated diagrams | An audit that measures every drawn label and fails on overlap or overflow |
 
 Two testing decisions are worth calling out, because both were found by getting

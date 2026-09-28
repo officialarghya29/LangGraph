@@ -360,6 +360,46 @@ async def test_a_step_is_updated_in_place_across_retries(session: AsyncSession) 
     assert steps[0].attempt == 2
 
 
+async def test_the_child_reads_are_bounded(session: AsyncSession) -> None:
+    """Every list in this module has a ceiling, including the per-task ones.
+
+    These were the last unbounded reads in the file. The true row count is capped
+    by the graph's iteration and tool-call ceilings, so this changes nothing
+    today — and stops being true the day one of those ceilings is raised, which
+    is the kind of change nobody remembers to audit.
+    """
+    alice = await UserRepository(session).get_or_create("alice")
+    task = await TaskRepository(session).create(user_id=alice.id, request="do it")
+    steps = TaskStepRepository(session)
+    runs = AgentRunRepository(session)
+
+    for index in range(3):
+        await steps.upsert(
+            task_id=task.id, subtask_id=f"s{index}", agent="researcher", description="work"
+        )
+        await runs.start(task_id=task.id, agent="researcher", node="agent_execution")
+
+    assert len(await steps.list_for_task(task.id)) == 3
+    assert len(await steps.list_for_task(task.id, limit=2)) == 2
+    assert len(await steps.list_for_task(task.id, limit=2, offset=2)) == 1
+    assert len(await runs.list_for_task(task.id, limit=1)) == 1
+    # A limit of zero is a legal statement, not an error: it reads nothing.
+    assert await steps.list_for_task(task.id, limit=0) == []
+
+
+async def test_tool_call_reads_are_bounded_too(session: AsyncSession) -> None:
+    """The tool-call timeline is the one that grows fastest per task."""
+    alice = await UserRepository(session).get_or_create("alice")
+    task = await TaskRepository(session).create(user_id=alice.id, request="do it")
+    repo = ToolCallRepository(session)
+
+    for index in range(3):
+        await repo.record(task_id=task.id, tool=f"tool_{index}", arguments={})
+
+    assert len(await repo.list_for_task(task.id)) == 3
+    assert len(await repo.list_for_task(task.id, limit=1)) == 1
+
+
 async def test_a_step_records_its_outcome(session: AsyncSession) -> None:
     alice = await UserRepository(session).get_or_create("alice")
     task = await TaskRepository(session).create(user_id=alice.id, request="do it")

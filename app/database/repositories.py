@@ -316,6 +316,13 @@ class TaskRepository:
         return affected_rows(result) > 0
 
 
+#: Ceiling on rows read from the tables that hang off a task. Far above any run
+#: the graph permits — iterations, tool calls, and wall-clock time are all capped
+#: well below this — so it changes nothing in normal operation and everything the
+#: day one of those ceilings is raised.
+_CHILD_ROW_LIMIT = 500
+
+
 class _ChildRepository:
     """Shared behaviour for the repositories that hang off a task."""
 
@@ -386,10 +393,22 @@ class TaskStepRepository(_ChildRepository):
             )
         )
 
-    async def list_for_task(self, task_id: uuid.UUID) -> Sequence[TaskStep]:
-        """Return a task's steps in creation order."""
+    async def list_for_task(
+        self, task_id: uuid.UUID, *, limit: int = _CHILD_ROW_LIMIT, offset: int = 0
+    ) -> Sequence[TaskStep]:
+        """Return a task's steps in creation order, oldest first.
+
+        Bounded, like every other list in this module. The graph caps iterations
+        and tool calls per task, so the true count is small — but a query with no
+        ceiling becomes an unbounded query the day that ceiling is raised, and
+        nothing in the code would have to change for it to happen.
+        """
         result = await self._session.execute(
-            select(TaskStep).where(TaskStep.task_id == task_id).order_by(TaskStep.created_at)
+            select(TaskStep)
+            .where(TaskStep.task_id == task_id)
+            .order_by(TaskStep.created_at)
+            .limit(limit)
+            .offset(offset)
         )
         return result.scalars().all()
 
@@ -444,10 +463,16 @@ class AgentRunRepository(_ChildRepository):
             )
         )
 
-    async def list_for_task(self, task_id: uuid.UUID) -> Sequence[AgentRun]:
+    async def list_for_task(
+        self, task_id: uuid.UUID, *, limit: int = _CHILD_ROW_LIMIT, offset: int = 0
+    ) -> Sequence[AgentRun]:
         """Return a task's agent runs in creation order, for the timeline."""
         result = await self._session.execute(
-            select(AgentRun).where(AgentRun.task_id == task_id).order_by(AgentRun.created_at)
+            select(AgentRun)
+            .where(AgentRun.task_id == task_id)
+            .order_by(AgentRun.created_at)
+            .limit(limit)
+            .offset(offset)
         )
         return result.scalars().all()
 
@@ -494,10 +519,16 @@ class ToolCallRepository(_ChildRepository):
         await session_flush(self._session, "tool call record")
         return call
 
-    async def list_for_task(self, task_id: uuid.UUID) -> Sequence[ToolCall]:
+    async def list_for_task(
+        self, task_id: uuid.UUID, *, limit: int = _CHILD_ROW_LIMIT, offset: int = 0
+    ) -> Sequence[ToolCall]:
         """Return a task's tool calls, oldest first."""
         result = await self._session.execute(
-            select(ToolCall).where(ToolCall.task_id == task_id).order_by(ToolCall.created_at)
+            select(ToolCall)
+            .where(ToolCall.task_id == task_id)
+            .order_by(ToolCall.created_at)
+            .limit(limit)
+            .offset(offset)
         )
         return result.scalars().all()
 
