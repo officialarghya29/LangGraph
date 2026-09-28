@@ -67,6 +67,10 @@ class Settings(BaseSettings):
     database_echo: bool = False
 
     # --- Database tool ----------------------------------------------------- #
+    #: Where the ``database`` tool points. Unset by default, and the tool is then
+    #: not registered at all rather than aimed at the application's own tables.
+    #: Point this at a read-only replica or a reporting database.
+    database_tool_url: str | None = None
     # Read-only by default. Writes and destructive statements each need an
     # explicit opt-in, and destructive ones also need human approval.
     database_allow_writes: bool = False

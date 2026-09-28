@@ -22,6 +22,24 @@ dependencies = [
     "pydantic==2.13.5",
     "pydantic-settings==2.15.0",
     "uvicorn[standard]==0.54.0",
+    # Durable task, approval, memory, and checkpoint storage. `asyncpg` is the
+    # driver behind the `postgresql+asyncpg` scheme the engine builder requires;
+    # it is named explicitly rather than left to the dialect, because a missing
+    # driver is a startup failure, not an optional feature.
+    "sqlalchemy==2.1.1",
+    "asyncpg==0.31.0",
+    "alembic==1.20.0",
+    # The durable checkpointer. Its separate distribution is what makes a run
+    # survive a restart, so it is a runtime dependency, not a test one.
+    "langgraph-checkpoint-postgres==3.1.2",
+    # The `binary` extra ships a bundled libpq; a system libpq is not something
+    # this project can assume, and without one psycopg refuses to import.
+    "psycopg[binary]==3.3.6",
+    "psycopg-pool==3.3.3",
+    # Rate-limit counters and the cache.
+    "redis==8.1.0",
+    # Bearer-token verification.
+    "pyjwt==2.15.0",
 ]
 
 [project.optional-dependencies]
@@ -32,6 +50,9 @@ dev = [
     "pytest==9.1.1",
     "pytest-asyncio==1.4.0",
     "ruff==0.16.9",
+    # The test suites import psycopg directly, to read a committed row over a
+    # connection the application did not open.
+    "psycopg[binary]==3.3.6",
 ]
 assets = [
     # Only needed to regenerate the diagrams in docs/assets/.

@@ -8,7 +8,7 @@ database, and a process that never touches the database never opens a pool.
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -58,6 +58,7 @@ def build_engine(
     pool_size: int = 10,
     max_overflow: int = 5,
     echo: bool = False,
+    connect_args: Mapping[str, Any] | None = None,
 ) -> AsyncEngine:
     """Create an async engine for ``url``.
 
@@ -66,6 +67,9 @@ def build_engine(
         pool_size: Persistent connections to keep open.
         max_overflow: Additional connections allowed beyond the pool.
         echo: Whether to log every statement. Off outside debugging.
+        connect_args: Extra arguments passed to the driver on connect. Only the
+            database tool uses this, to pin a connection to read-only mode at
+            the server rather than relying on a check in Python.
 
     Returns:
         A configured async engine.
@@ -87,6 +91,8 @@ def build_engine(
         # test database has no use for them.
         options["pool_size"] = pool_size
         options["max_overflow"] = max_overflow
+    if connect_args:
+        options["connect_args"] = dict(connect_args)
 
     return create_async_engine(url, **options)
 

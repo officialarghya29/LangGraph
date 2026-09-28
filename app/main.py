@@ -52,6 +52,7 @@ from app.core.exceptions import (
 )
 from app.core.logging import configure_logging
 from app.database.connection import Database
+from app.database.sql_executor import SqlQueryExecutor
 from app.graph.builder import build_all_agents, build_graph
 from app.graph.checkpoints import CheckpointHandle, open_checkpointer
 from app.services.cache import build_cache
@@ -149,7 +150,20 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         application.state.memory = None
         logger.warning("startup.memory_unavailable", extra={"reason": exc.message})
 
-    registry = build_default_registry(settings)
+    # The database tool is registered only when a target is configured. Pointing
+    # it at the application's own database would hand an agent every user row, so
+    # the absence of a URL means absence of the tool rather than a default that
+    # happens to be dangerous.
+    sql_executor: SqlQueryExecutor | None = None
+    if settings.database_tool_url is not None:
+        sql_executor = SqlQueryExecutor(
+            settings.database_tool_url,
+            read_only=not settings.database_allow_writes,
+            echo=settings.database_echo,
+        )
+    application.state.sql_executor = sql_executor
+
+    registry = build_default_registry(settings, query_executor=sql_executor)
     application.state.tool_registry = registry
 
     checkpoint: CheckpointHandle = await open_checkpointer(settings)
@@ -186,6 +200,9 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         logger.info("shutdown.begin")
+        executor = getattr(application.state, "sql_executor", None)
+        if executor is not None:
+            await executor.close()
         await checkpoint.close()
         await cache.close()
         await database.dispose()

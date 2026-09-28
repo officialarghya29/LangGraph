@@ -10,13 +10,15 @@ covers three statement classes, so the risk cannot be a class-level constant: a
 therefore evaluated per statement, inside :meth:`run`.
 
 Execution is delegated to an injected runner so this module holds no connection
-management. The runner is supplied by the composition root once Phase 3 lands.
+management. The runner is supplied by the composition root, which points it at a
+separate database rather than at the application's own tables.
 """
 
 from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Mapping
 from enum import StrEnum
 from typing import Protocol
 
@@ -182,14 +184,25 @@ def classify_sql(sql: str) -> SqlClass:
 class QueryExecutor(Protocol):
     """Runs a SQL statement and returns its columns and rows.
 
-    Injected rather than imported so this module holds no connection logic. The
-    SQLAlchemy implementation arrives with the database layer in Phase 3.
+    Injected rather than imported so this module holds no connection logic; the
+    implementation lives in :mod:`app.database.sql_executor`.
     """
 
     async def run(
-        self, sql: str, *, max_rows: int, timeout_ms: int
+        self,
+        sql: str,
+        *,
+        parameters: Mapping[str, object],
+        max_rows: int,
+        timeout_ms: int,
     ) -> tuple[list[str], list[list[object]]]:
-        """Execute ``sql`` and return ``(columns, rows)``."""
+        """Execute ``sql`` and return ``(columns, rows)``.
+
+        ``parameters`` are bound by the driver, never interpolated into the
+        statement. Passing them through is what makes a placeholder safe: the
+        earlier signature omitted them, so a caller that supplied bind values
+        had them silently dropped.
+        """
         ...
 
 
@@ -273,6 +286,7 @@ class DatabaseTool(Tool[QueryInput, QueryResult]):
         try:
             columns, rows = await self._executor.run(
                 payload.sql,
+                parameters=payload.parameters,
                 max_rows=settings.database_max_rows,
                 timeout_ms=settings.database_statement_timeout_ms,
             )

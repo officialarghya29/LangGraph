@@ -114,15 +114,23 @@ records the full transitive set that was actually tested.
    PyPI fetch timeout, resolved by raising `UV_HTTP_TIMEOUT` rather than by
    altering any version.
 
-## Deferred decisions
+## Settled decisions
 
-The following are deliberately **not** chosen yet. Each is decided in the phase
-where it is first needed, so the decision is made with the real constraints in
-view:
+Each of these was deliberately left open until the phase that needed it, so the
+choice was made with the real constraints in view rather than in advance:
 
-- LLM vendor and default model — Phase 5.
-- Embedding provider and model — Phase 6.
-- Checkpoint persistence backend and serialization format — Phase 21.
-- Authentication mechanism (JWT vs. session vs. external provider) — Phase 25.
-- Message broker, if any, for execution-event streaming — Phase 24.
+| Decision | Phase | Choice |
+| --- | --- | --- |
+| LLM vendor and default model | 5 | Provider abstraction with OpenAI, Anthropic, and a deterministic fake; no vendor SDK reaches business logic |
+| Embedding provider and model | 6 | Local hashing embeddings by default; OpenAI optional. A model is never required just to run |
+| Checkpoint backend | 21 | PostgreSQL through `langgraph-checkpoint-postgres`, so a run survives a restart |
+| Authentication | 25 | JWT bearer tokens via PyJWT, with a trusted identity header allowed only in development |
+| Event streaming | 24 | Server-sent events, no broker. The durable event log is the source of truth, so a dropped connection is recoverable rather than lost |
+| Database tool target | 33 | A separate `DATABASE_TOOL_URL`; unset means the tool is not registered |
+
+## Still open
+
+- Metrics and tracing backends — Phase 27.
+- Container images and compose topology — Phase 38-39, blocked on a host with a
+  container runtime.
 - Frontend framework for the control dashboard — Phase 42.

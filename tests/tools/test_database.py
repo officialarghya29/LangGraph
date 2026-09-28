@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import pytest
 
 from app.core.config import Settings
@@ -15,12 +17,19 @@ class RecordingExecutor(QueryExecutor):
 
     def __init__(self, rows: list[list[object]] | None = None) -> None:
         self.calls: list[str] = []
+        self.parameters: list[Mapping[str, object]] = []
         self._rows = rows if rows is not None else [[1]]
 
     async def run(
-        self, sql: str, *, max_rows: int, timeout_ms: int
+        self,
+        sql: str,
+        *,
+        parameters: Mapping[str, object],
+        max_rows: int,
+        timeout_ms: int,
     ) -> tuple[list[str], list[list[object]]]:
         self.calls.append(sql)
+        self.parameters.append(parameters)
         return ["value"], self._rows
 
 
@@ -28,8 +37,14 @@ class ExplodingExecutor(QueryExecutor):
     """An executor that always fails."""
 
     async def run(
-        self, sql: str, *, max_rows: int, timeout_ms: int
+        self,
+        sql: str,
+        *,
+        parameters: Mapping[str, object],
+        max_rows: int,
+        timeout_ms: int,
     ) -> tuple[list[str], list[list[object]]]:
+        del parameters, max_rows, timeout_ms
         raise RuntimeError("connection lost")
 
 
@@ -244,6 +259,28 @@ async def test_an_executor_failure_is_reported_structurally() -> None:
 
     assert result.ok is False
     assert "the query failed" in (result.error or "")
+
+
+async def test_bind_parameters_reach_the_executor() -> None:
+    """A placeholder is meaningless unless its value is forwarded.
+
+    The input model advertises ``parameters``, and the earlier version of this
+    tool accepted them and then ran the statement without them, so a bound query
+    failed at the server instead of returning rows.
+    """
+    executor = RecordingExecutor()
+    tool = DatabaseTool(executor)
+
+    result = await tool.execute(
+        ToolRequest(
+            tool="database",
+            arguments={"sql": "SELECT * FROM orders WHERE id = :id", "parameters": {"id": 7}},
+        ),
+        context_for(),
+    )
+
+    assert result.ok is True
+    assert executor.parameters == [{"id": 7}]
 
 
 async def test_results_are_truncated_to_the_row_ceiling() -> None:

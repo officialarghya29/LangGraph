@@ -41,8 +41,8 @@ NEXT PHASE:
 | 0 | Environment discovery | **Complete** |
 | 1 | Base project, tooling, `GET /health` | **Complete** |
 | 2 | Typed configuration (Pydantic Settings) | **Complete** |
-| 3 | PostgreSQL models, repositories, Alembic | Blocked — no PostgreSQL on host |
-| 4 | Redis cache service | Blocked — no Redis on host |
+| 3 | PostgreSQL models, repositories, Alembic | **Complete** — real PostgreSQL 18 reached over a managed local runtime; every migration applied |
+| 4 | Redis cache service | **Complete** — real Redis 8; expiry, atomic counters, and an unreachable server all verified |
 | 5 | LLM provider abstraction | **Complete** |
 | 6 | Embedding provider abstraction | **Complete** |
 | 7 | Typed, serializable graph state | **Complete** |
@@ -58,23 +58,28 @@ NEXT PHASE:
 | 17 | Bounded parallel dispatch | **Complete** |
 | 18 | Failure classification and retry policy | **Complete** |
 | 19 | Critic agent | **Complete** |
-| 20 | Memory manager | Not started |
-| 21 | Checkpointing and human approval | Partial — in-memory saver verified; durable PostgreSQL backend pending |
-| 22 | Persist approval records | Partial — interrupt/resume verified; records are in-memory only |
-| 23 | HTTP API | **Complete** — all 11 routes; auth and rate limiting still pending |
-| 24 | Execution-event streaming | Not started |
-| 25 | Authorization and ownership | Partial — ownership enforced on every task read |
-| 26 | Rate limiting | Not started |
-| 27 | Observability | Partial — structured logging and events; metrics and tracing pending |
+| 20 | Memory manager | **Complete** — four tiers behind one manager, scored by similarity, importance, and recency |
+| 21 | Checkpointing and human approval | **Complete** — durable PostgreSQL checkpointer; interrupt and resume verified across processes |
+| 22 | Persist approval records | **Complete** — approvals survive a restart and are read back by task |
+| 23 | HTTP API | **Complete** — 13 routes across health, chat, tasks, approvals, events, and discovery |
+| 24 | Execution-event streaming | **Complete** — SSE over the durable event log, with a replay endpoint |
+| 25 | Authorization and ownership | **Complete** — every read is scoped to the caller; cross-user access is refused |
+| 26 | Rate limiting | **Complete** — fixed-window counters in Redis, with a configurable fail-open or fail-closed posture |
+| 27 | Observability | Partial — structured logging, correlation ids, and a durable event log; metrics and tracing pending |
 | 28-33 | Prompt injection, SSRF, filesystem, sandbox, database and GitHub policy | **Complete** — enforced per tool, not per call site |
 | 34-37 | Testing, failure injection, evaluation, optimization | Not started |
 | 38-39 | Docker, migration verification | Blocked — no Docker on host |
 | 40-45 | CI/CD, documentation, dashboard, final reviews | Not started |
 
-**Blocked phases:** 3, 4, 38, 39 need services that are not installed. They stay
-blocked until PostgreSQL, Redis, and Docker are available; the code for them
-will not be written blind, because unverifiable database and container work
-would have to be shipped untested.
+**Blocked phases:** 38 and 39 only. They need a container runtime, and this host
+has none. Both will be written and lint-checked, and will be reported as
+unverified until a Docker daemon is available, because container work that has
+never been built cannot honestly be called complete.
+
+Phases 3 and 4 were blocked for the same reason and are now complete: a
+self-contained runtime under `.services/` supplies a real PostgreSQL 18 and a
+real Redis 8, so the persistence and cache layers run against genuine servers
+rather than against mocks or an in-memory stand-in.
 
 ---
 

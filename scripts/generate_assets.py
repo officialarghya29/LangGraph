@@ -14,9 +14,14 @@ application).
 from __future__ import annotations
 
 import math
+from collections.abc import Callable, Sequence
 from pathlib import Path
+from typing import Protocol
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+#: Anything Pillow accepts as a fill or outline for a shape.
+Fill = str | int | float | tuple[int, ...] | None
 
 # --------------------------------------------------------------------------- #
 # Paths and fonts
@@ -25,6 +30,22 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ASSETS = REPO_ROOT / "docs" / "assets"
 FONT_ROOT = Path("/usr/share/fonts/truetype")
+
+#: Supersampling factor.
+#:
+#: The builders below are written in *design units* — the numbers that describe
+#: the layout, not pixel counts. Rendering multiplies every one of them by this
+#: factor. A README image is scaled down to the width of the column it sits in
+#: (roughly 830 CSS pixels on GitHub), so a 1:1 render of an 1800-pixel-wide
+#: diagram shrinks a 17-pixel label to about eight CSS pixels and makes it
+#: unreadable. Drawing at 2x keeps the geometry identical while leaving enough
+#: pixels for text to survive that downscale sharp.
+SCALE = 2
+
+#: Resolution written into the PNG's pHYs chunk, in dots per inch. Declaring it
+#: lets viewers that honour pixel density pick a sensible on-screen size rather
+#: than assuming 72 dpi and rendering the asset at double size.
+DPI = 144
 
 FONT_DISPLAY = FONT_ROOT / "ubuntu" / "Ubuntu-B.ttf"
 FONT_MEDIUM = FONT_ROOT / "ubuntu" / "Ubuntu-M.ttf"
@@ -57,9 +78,201 @@ PINK = (244, 114, 182)
 BLUE = (96, 165, 250)
 
 
+#: Every string drawn by the current asset, with its box in design units.
+#: Populated by :class:`ScaledDraw` and inspected by :func:`audit_layout`, which
+#: is what turns "this diagram looks crowded" into a checkable assertion.
+_RECORDED_TEXT: list[tuple[tuple[float, float, float, float], str]] = []
+
+
+def audit_layout(width: int, height: int) -> list[str]:
+    """Return the layout problems in the most recently built asset.
+
+    Two invariants are checked, both of which were violated somewhere in the
+    first version of these diagrams:
+
+    1. **Nothing escapes the canvas.** A label drawn past the edge is silently
+       cropped, which looks like a rendering bug rather than a layout one.
+    2. **No two labels overlap.** Overlapping text is always a mistake here;
+       there is no case where two strings are meant to occupy the same pixels.
+
+    Args:
+        width: Canvas width in design units.
+        height: Canvas height in design units.
+
+    Returns:
+        One human-readable line per problem, empty when the layout is sound.
+    """
+    problems: list[str] = []
+    for (x0, y0, x1, y1), text in _RECORDED_TEXT:
+        if x0 < 0 or y0 < 0 or x1 > width or y1 > height:
+            box = tuple(round(value, 1) for value in (x0, y0, x1, y1))
+            problems.append(f"{text!r} escapes the {width}x{height} canvas at {box}")
+
+    for index, (first, first_text) in enumerate(_RECORDED_TEXT):
+        for second, second_text in _RECORDED_TEXT[index + 1 :]:
+            if (
+                first[0] < second[2]
+                and second[0] < first[2]
+                and first[1] < second[3]
+                and second[1] < first[3]
+            ):
+                problems.append(f"{first_text!r} overlaps {second_text!r}")
+    return problems
+
+
 def font(path: Path, size: int) -> ImageFont.FreeTypeFont:
-    """Load a TrueType font at the given pixel size."""
-    return ImageFont.truetype(str(path), size)
+    """Load a TrueType font at the given design-unit size.
+
+    Args:
+        path: Font file to load.
+        size: Size in design units; scaled by :data:`SCALE` before loading.
+    """
+    return ImageFont.truetype(str(path), round(size * SCALE))
+
+
+class Surface(Protocol):
+    """The drawing operations the layout helpers rely on.
+
+    Declared as a protocol so a helper can accept either a real
+    :class:`ImageDraw.ImageDraw` or a :class:`ScaledDraw` without either having
+    to subclass the other. mypy checks calls against this shape rather than
+    against a concrete class, which is what keeps the coordinate-scaling
+    wrapper invisible to everything downstream of it.
+    """
+
+    def textlength(self, text: str, font: ImageFont.FreeTypeFont | None = None) -> float:
+        """Return the width ``text`` would occupy."""
+        ...
+
+    def text(
+        self,
+        xy: tuple[float, float],
+        text: str,
+        font: ImageFont.FreeTypeFont | None = None,
+        fill: Fill = None,
+        anchor: str | None = None,
+    ) -> None:
+        """Draw ``text`` anchored at ``xy``."""
+        ...
+
+    def line(self, xy: Sequence[tuple[float, float]], fill: Fill = None, width: float = 1) -> None:
+        """Draw a polyline through ``xy``."""
+        ...
+
+    def ellipse(
+        self, xy: Sequence[float], fill: Fill = None, outline: Fill = None, width: float = 1
+    ) -> None:
+        """Draw an ellipse inside the bounding box ``xy``."""
+        ...
+
+    def polygon(
+        self,
+        xy: Sequence[tuple[float, float]],
+        fill: Fill = None,
+        outline: Fill = None,
+        width: float = 1,
+    ) -> None:
+        """Draw a polygon through the vertices ``xy``."""
+        ...
+
+    def rounded_rectangle(
+        self,
+        xy: Sequence[float],
+        radius: float = 0,
+        fill: Fill = None,
+        outline: Fill = None,
+        width: float = 1,
+    ) -> None:
+        """Draw a rounded rectangle inside the bounding box ``xy``."""
+        ...
+
+
+class ScaledDraw:
+    """A :class:`Surface` that accepts coordinates in design units.
+
+    Every coordinate, pen width, corner radius, and font size is multiplied by
+    :data:`SCALE` on its way to the real draw object. That keeps the builders
+    readable — they describe the layout, not the raster — while the render
+    happens at a higher resolution. State lives only in the wrapped draw object,
+    so one proxy is created per layer.
+
+    Measurement is scaled the other way: :meth:`textlength` divides by
+    :data:`SCALE` so callers keep reasoning in design units. Without that,
+    every layout calculation that measures text would silently switch to pixels
+    and overflow its container.
+    """
+
+    __slots__ = ("_draw",)
+
+    def __init__(self, image: Image.Image) -> None:
+        self._draw = ImageDraw.Draw(image)
+
+    @staticmethod
+    def _points(points: Sequence[tuple[float, float]]) -> list[tuple[float, float]]:
+        """Return the points converted from design units to pixels."""
+        return [(x * SCALE, y * SCALE) for x, y in points]
+
+    @staticmethod
+    def _pen(width: float) -> int:
+        """Return a stroke width in pixels, never thinner than one."""
+        return max(1, round(width * SCALE))
+
+    def textlength(self, text: str, font: ImageFont.FreeTypeFont | None = None) -> float:
+        """Return the rendered width of ``text`` in design units."""
+        return self._draw.textlength(text, font=font) / SCALE
+
+    def text(
+        self,
+        xy: tuple[float, float],
+        text: str,
+        font: ImageFont.FreeTypeFont | None = None,
+        fill: Fill = None,
+        anchor: str | None = None,
+    ) -> None:
+        """Draw ``text`` at a design-unit position, recording its box for audit."""
+        pixels = (xy[0] * SCALE, xy[1] * SCALE)
+        self._draw.text(pixels, text, font=font, fill=fill, anchor=anchor)
+        x0, y0, x1, y1 = self._draw.textbbox(pixels, text, font=font, anchor=anchor)
+        _RECORDED_TEXT.append(((x0 / SCALE, y0 / SCALE, x1 / SCALE, y1 / SCALE), text))
+
+    def line(self, xy: Sequence[tuple[float, float]], fill: Fill = None, width: float = 1) -> None:
+        """Draw a polyline between design-unit points."""
+        self._draw.line(self._points(xy), fill=fill, width=self._pen(width))
+
+    def ellipse(
+        self, xy: Sequence[float], fill: Fill = None, outline: Fill = None, width: float = 1
+    ) -> None:
+        """Draw an ellipse inside a design-unit bounding box."""
+        self._draw.ellipse(
+            [value * SCALE for value in xy], fill=fill, outline=outline, width=self._pen(width)
+        )
+
+    def polygon(
+        self,
+        xy: Sequence[tuple[float, float]],
+        fill: Fill = None,
+        outline: Fill = None,
+        width: float = 1,
+    ) -> None:
+        """Draw a polygon through design-unit vertices."""
+        self._draw.polygon(self._points(xy), fill=fill, outline=outline, width=self._pen(width))
+
+    def rounded_rectangle(
+        self,
+        xy: Sequence[float],
+        radius: float = 0,
+        fill: Fill = None,
+        outline: Fill = None,
+        width: float = 1,
+    ) -> None:
+        """Draw a rounded rectangle at a design-unit box and radius."""
+        self._draw.rounded_rectangle(
+            [value * SCALE for value in xy],
+            radius=radius * SCALE,
+            fill=fill,
+            outline=outline,
+            width=self._pen(width),
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -85,14 +298,19 @@ def vertical_gradient(
     return strip.resize((width, height), Image.Resampling.BICUBIC)
 
 
+def draw_on(image: Image.Image) -> ScaledDraw:
+    """Return a design-unit drawing surface for ``image``."""
+    return ScaledDraw(image)
+
+
 def canvas(
     width: int,
     height: int,
     top: tuple[int, int, int] = BG_TOP,
     bottom: tuple[int, int, int] = BG_BOTTOM,
 ) -> Image.Image:
-    """Create the base RGBA canvas for an asset."""
-    return vertical_gradient(width, height, top, bottom).convert("RGBA")
+    """Create the base RGBA canvas for an asset, sized in design units."""
+    return vertical_gradient(width * SCALE, height * SCALE, top, bottom).convert("RGBA")
 
 
 def glow(
@@ -103,12 +321,13 @@ def glow(
     alpha: int = 90,
     blur: int = 110,
 ) -> Image.Image:
-    """Composite a soft radial bloom onto the canvas."""
+    """Composite a soft radial bloom onto the canvas, positioned in design units."""
     layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(layer)
-    cx, cy = center
-    draw.ellipse([cx - radius, cy - radius, cx + radius, cy + radius], fill=(*color, alpha))
-    return Image.alpha_composite(base, layer.filter(ImageFilter.GaussianBlur(blur)))
+    cx, cy = center[0] * SCALE, center[1] * SCALE
+    span = radius * SCALE
+    draw.ellipse([cx - span, cy - span, cx + span, cy + span], fill=(*color, alpha))
+    return Image.alpha_composite(base, layer.filter(ImageFilter.GaussianBlur(blur * SCALE)))
 
 
 def grid(
@@ -121,22 +340,21 @@ def grid(
     layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(layer)
     width, height = base.size
-    for x in range(0, width, step):
+    spacing = max(1, round(step * SCALE))
+    for x in range(0, width, spacing):
         draw.line([(x, 0), (x, height)], fill=(*color, alpha), width=1)
-    for y in range(0, height, step):
+    for y in range(0, height, spacing):
         draw.line([(0, y), (width, y)], fill=(*color, alpha), width=1)
     return Image.alpha_composite(base, layer)
 
 
-def text_width(
-    draw: ImageDraw.ImageDraw, text: str, f: ImageFont.FreeTypeFont, spacing: float = 0.0
-) -> float:
+def text_width(draw: Surface, text: str, f: ImageFont.FreeTypeFont, spacing: float = 0.0) -> float:
     """Measure a string including letter spacing."""
     return sum(draw.textlength(c, font=f) for c in text) + spacing * max(len(text) - 1, 0)
 
 
 def tracked(
-    draw: ImageDraw.ImageDraw,
+    draw: Surface,
     xy: tuple[float, float],
     text: str,
     f: ImageFont.FreeTypeFont,
@@ -154,6 +372,55 @@ def tracked(
     return x - xy[0] if center_x is None else text_width(draw, text, f, spacing)
 
 
+def wrap_text(
+    draw: Surface,
+    text: str,
+    f: ImageFont.FreeTypeFont,
+    max_width: float,
+    max_lines: int = 2,
+) -> list[str]:
+    """Break ``text`` into lines that each fit within ``max_width``.
+
+    Used instead of a hard character cut, which is what overflowed these cards
+    before: a truncated string knows nothing about the font it will be drawn
+    with, so a limit that looks safe in code still runs off the card. Measuring
+    the actual glyphs is the only way to be sure.
+
+    Args:
+        draw: Surface used for measurement.
+        text: The string to fit.
+        f: Font the string will be drawn with.
+        max_width: Available width, in design units.
+        max_lines: Maximum lines to emit; the last is ellipsised if needed.
+
+    Returns:
+        One or more lines, each no wider than ``max_width``.
+    """
+    lines: list[str] = []
+    current = ""
+    consumed = 0
+    words = text.split()
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if current and draw.textlength(candidate, font=f) > max_width:
+            lines.append(current)
+            current = word
+            if len(lines) == max_lines:
+                break
+        else:
+            current = candidate
+        consumed += 1
+
+    # ``current`` holds the last word accepted before the loop stopped. It is
+    # dropped only when a full set of lines was already emitted and words
+    # remain, which is exactly the case the ellipsis below reports.
+    if len(lines) < max_lines and current:
+        lines.append(current)
+    elif consumed < len(words):
+        lines[-1] = f"{lines[-1].rstrip()} \u2026"
+    return lines
+
+
 def hexagon(cx: float, cy: float, radius: float) -> list[tuple[float, float]]:
     """Return the six vertices of a pointy-top hexagon."""
     return [
@@ -166,7 +433,7 @@ def hexagon(cx: float, cy: float, radius: float) -> list[tuple[float, float]]:
 
 
 def arrow(
-    draw: ImageDraw.ImageDraw,
+    draw: Surface,
     start: tuple[float, float],
     end: tuple[float, float],
     color: tuple[int, int, int],
@@ -186,7 +453,7 @@ def arrow(
 
 
 def node(
-    draw: ImageDraw.ImageDraw,
+    draw: Surface,
     box: tuple[float, float, float, float],
     label: str,
     accent: tuple[int, int, int] = CYAN,
@@ -211,7 +478,7 @@ def node(
 
 
 def pill(
-    draw: ImageDraw.ImageDraw,
+    draw: Surface,
     x: float,
     y: float,
     text: str,
@@ -248,7 +515,7 @@ def build_banner() -> Image.Image:
     base = grid(base)
 
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
-    od = ImageDraw.Draw(overlay)
+    od = draw_on(overlay)
     # Decorative node graph on the right.
     graph_center = (1290, 300)
     for i, vertex in enumerate(hexagon(*graph_center, 132)):
@@ -270,23 +537,23 @@ def build_banner() -> Image.Image:
     )
     base = Image.alpha_composite(base, overlay)
 
-    d = ImageDraw.Draw(base)
-    f_eyebrow = font(FONT_MONO, 18)
-    f_title = font(FONT_DISPLAY, 108)
-    f_sub = font(FONT_MEDIUM, 31)
-    f_tag = font(FONT_REGULAR, 21)
-    f_pill = font(FONT_MEDIUM, 19)
+    d = draw_on(base)
+    f_eyebrow = font(FONT_MONO, 22)
+    f_title = font(FONT_DISPLAY, 112)
+    f_sub = font(FONT_MEDIUM, 35)
+    f_tag = font(FONT_REGULAR, 24)
+    f_pill = font(FONT_MEDIUM, 22)
 
     # Eyebrow: hexagon mark + label.
     d.polygon(hexagon(96, 88, 20), outline=(*CYAN, 255), width=3)
     d.polygon(hexagon(96, 88, 8), fill=(*CYAN, 255))
-    tracked(d, (130, 76), "ORCHESTRATION PLATFORM", f_eyebrow, MUTED, spacing=4.0)
+    tracked(d, (130, 74), "ORCHESTRATION PLATFORM", f_eyebrow, MUTED, spacing=4.0)
 
-    tracked(d, (78, 138), "LANGGRAPH", f_title, TEXT, spacing=9.0)
-    d.rounded_rectangle((82, 272, 300, 279), radius=4, fill=(*CYAN, 255))
-    d.rounded_rectangle((300, 272, 420, 279), radius=4, fill=(*VIOLET, 255))
+    tracked(d, (78, 132), "LANGGRAPH", f_title, TEXT, spacing=9.0)
+    d.rounded_rectangle((82, 276, 300, 284), radius=4, fill=(*CYAN, 255))
+    d.rounded_rectangle((300, 276, 420, 284), radius=4, fill=(*VIOLET, 255))
 
-    tracked(d, (80, 300), "MULTI-AGENT SYSTEM", f_sub, (147, 164, 204), spacing=13.0)
+    tracked(d, (80, 302), "MULTI-AGENT SYSTEM", f_sub, (147, 164, 204), spacing=13.0)
     d.text(
         (82, 356),
         "Typed state  ·  Durable checkpointing  ·  Human-in-the-loop approval",
@@ -309,7 +576,7 @@ def build_banner() -> Image.Image:
         ("Docker", VIOLET),
         ("Pydantic v2", AMBER),
     ):
-        x += pill(d, x, 430, label, f_pill, accent) + 12
+        x += pill(d, x, 424, label, f_pill, accent, pad=15) + 11
 
     return base
 
@@ -322,16 +589,17 @@ def build_banner() -> Image.Image:
 def build_logo() -> Image.Image:
     """Square brand mark."""
     size = 512
-    base = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    pixels = size * SCALE
+    base = Image.new("RGBA", (pixels, pixels), (0, 0, 0, 0))
     tile = canvas(size, size, (14, 18, 40), (4, 6, 16))
-    mask = Image.new("L", (size, size), 0)
-    ImageDraw.Draw(mask).rounded_rectangle((0, 0, size - 1, size - 1), radius=104, fill=255)
+    mask = Image.new("L", (pixels, pixels), 0)
+    draw_on(mask).rounded_rectangle((0, 0, size - 1, size - 1), radius=104, fill=255)
     base.paste(tile, (0, 0), mask)
     base = glow(base, (256, 180), 200, VIOLET, alpha=120, blur=110)
     base = glow(base, (150, 380), 170, CYAN, alpha=90, blur=110)
 
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
-    od = ImageDraw.Draw(overlay)
+    od = draw_on(overlay)
     center = (256.0, 256.0)
     vertices = hexagon(*center, 142)
     for vertex in vertices:
@@ -341,7 +609,7 @@ def build_logo() -> Image.Image:
     )
     base = Image.alpha_composite(base, overlay)
 
-    d = ImageDraw.Draw(base)
+    d = draw_on(base)
     d.polygon(vertices, outline=(*CYAN, 255), width=4)
     for vertex in vertices:
         d.ellipse(
@@ -365,11 +633,11 @@ def build_architecture() -> Image.Image:
     base = glow(base, (1500, 1040), 400, CYAN, alpha=64, blur=150)
     base = grid(base)
 
-    d = ImageDraw.Draw(base)
-    f_title = font(FONT_DISPLAY, 30)
-    f_head = font(FONT_DISPLAY, 22)
-    f_meta = font(FONT_REGULAR, 17)
-    f_band = font(FONT_MONO_BOLD, 19)
+    d = draw_on(base)
+    f_title = font(FONT_DISPLAY, 36)
+    f_head = font(FONT_DISPLAY, 26)
+    f_meta = font(FONT_REGULAR, 22)
+    f_band = font(FONT_MONO_BOLD, 23)
 
     d.text((60, 34), "SYSTEM ARCHITECTURE", font=f_title, fill=TEXT)
     d.text(
@@ -409,7 +677,6 @@ def build_architecture() -> Image.Image:
                 ("Research", "evidence"),
                 ("Coding", "generate · debug"),
                 ("Analysis", "compute"),
-                ("Document", "extract"),
                 ("Executor", "approved actions"),
             ],
         ),
@@ -481,22 +748,29 @@ def build_architecture() -> Image.Image:
 
 
 def build_graph_flow() -> Image.Image:
-    """LangGraph node graph with conditional branches and a retry loop."""
-    width, height = 1820, 1650
+    """LangGraph node graph with conditional branches and a retry loop.
+
+    Every box here is a node that exists in ``app/graph/builder.py``. An earlier
+    version of this diagram showed a ``dispatch_tasks`` node that was never
+    registered, which is worse than an incomplete diagram: it documents a
+    control flow that does not exist. The terminal nodes that the main chain
+    omits are named in the caption instead, so nothing is implied to be absent.
+    """
+    width, height = 1820, 1500
     base = canvas(width, height)
     base = glow(base, (880, 60), 420, VIOLET, alpha=62, blur=150)
     base = glow(base, (1560, 900), 380, AMBER, alpha=52, blur=150)
     base = glow(base, (200, 1300), 340, GREEN, alpha=48, blur=150)
     base = grid(base)
 
-    d = ImageDraw.Draw(base)
-    f_title = font(FONT_DISPLAY, 30)
-    f_meta = font(FONT_REGULAR, 17)
-    f_node = font(FONT_MEDIUM, 22)
-    f_kind = font(FONT_MONO, 16)
-    f_edge = font(FONT_MONO_BOLD, 16)
+    d = draw_on(base)
+    f_title = font(FONT_DISPLAY, 36)
+    f_meta = font(FONT_REGULAR, 22)
+    f_node = font(FONT_MEDIUM, 26)
+    f_kind = font(FONT_MONO, 22)
+    f_edge = font(FONT_MONO_BOLD, 22)
 
-    d.text((60, 34), "GRAPH EXECUTION FLOW", font=f_title, fill=TEXT)
+    d.text((60, 30), "GRAPH EXECUTION FLOW", font=f_title, fill=TEXT)
     d.text(
         (62, 76),
         "Conditional edges decide every branch. Every cycle is bounded by the "
@@ -504,12 +778,19 @@ def build_graph_flow() -> Image.Image:
         font=f_meta,
         fill=MUTED,
     )
+    d.text(
+        (62, 106),
+        "Terminal branches not drawn: cancel_task, fail_task, and record_memory, "
+        "which every path passes through before finalize.",
+        font=f_meta,
+        fill=DIM,
+    )
 
     main_x = 700.0
     branch_x = 1360.0
     node_w, node_h = 330.0, 74.0
-    step = 92.0
-    top = 128.0
+    step = 96.0
+    top = 168.0
 
     def main_box(row: int) -> tuple[float, float, float, float]:
         y = top + row * step
@@ -524,116 +805,95 @@ def build_graph_flow() -> Image.Image:
         y_to = top + (row + 1) * step
         arrow(d, (main_x, y_from + 3), (main_x, y_to - 3), (86, 102, 148), width=3, head=12)
 
-    # Main chain.
+    # Row numbers below are the order the nodes actually run in, so every
+    # straight connector is between adjacent rows and no gap needs explaining.
+    # Subtitles are deliberately terse: at this width a longer caption overflows
+    # the node, and the prose around the diagram carries the detail.
     node(d, main_box(0), "START", GREEN, f_node, "entry point", f_kind)
-    node(d, main_box(1), "validate_input", CYAN, f_node, "reject malformed requests", f_kind)
-    node(d, main_box(2), "route_request", AMBER, f_node, "intent · complexity · risk", f_kind)
+    node(d, main_box(1), "validate_input", CYAN, f_node, "reject bad input", f_kind)
+    node(d, main_box(2), "recall_memory", VIOLET, f_node, "relevance-gated", f_kind)
+    node(d, main_box(3), "route_request", AMBER, f_node, "intent · risk", f_kind)
     node(d, main_box(4), "planner", BLUE, f_node, "structured plan", f_kind)
-    node(d, main_box(5), "validate_plan", CYAN, f_node, "schema + dependency check", f_kind)
-    node(d, main_box(6), "dispatch_tasks", VIOLET, f_node, "bounded parallelism", f_kind)
-    node(d, main_box(7), "agent_execution", BLUE, f_node, "research · coding · analysis", f_kind)
-    node(d, main_box(8), "aggregate_results", CYAN, f_node, "merge agent outputs", f_kind)
-    node(d, main_box(9), "critic", AMBER, f_node, "PASS / FAIL", f_kind)
-    node(d, main_box(11), "synthesizer", BLUE, f_node, "verified final answer", f_kind)
-    node(d, main_box(12), "risk_check", AMBER, f_node, "approval required?", f_kind)
-    node(d, main_box(14), "finalize", GREEN, f_node, "persist · respond", f_kind)
-    node(d, main_box(15), "END", GREEN, f_node, "terminal", f_kind)
+    node(d, main_box(5), "validate_plan", CYAN, f_node, "schema + deps", f_kind)
+    node(d, main_box(6), "agent_execution", BLUE, f_node, "bounded fan-out", f_kind)
+    node(d, main_box(7), "aggregate_results", CYAN, f_node, "merge outputs", f_kind)
+    node(d, main_box(8), "critic", AMBER, f_node, "PASS / FAIL", f_kind)
+    node(d, main_box(9), "synthesizer", BLUE, f_node, "final answer", f_kind)
+    node(d, main_box(10), "risk_check", AMBER, f_node, "approval needed?", f_kind)
+    node(d, main_box(11), "finalize", GREEN, f_node, "persist · respond", f_kind)
+    node(d, main_box(12), "END", GREEN, f_node, "terminal", f_kind)
 
-    for row in (0, 1, 4, 5, 6, 7, 8, 11, 14):
+    for row in range(12):
         connector(row)
 
-    # route_request -> planner, skipping the unused row 3.
-    arrow(
-        d,
-        (main_x, main_box(2)[3] + 3),
-        (main_x, main_box(4)[1] - 3),
-        (86, 102, 148),
-        width=3,
-        head=12,
-    )
-    d.text(
-        (main_x + 18, (main_box(2)[3] + main_box(4)[1]) / 2 - 9),
-        "COMPLEX -> plan",
-        font=f_edge,
-        fill=MUTED,
-    )
+    def edge_label(row: int, text: str, colour: tuple[int, int, int]) -> None:
+        """Label the connector leaving ``row``, beside the line rather than on it."""
+        midpoint = (main_box(row)[3] + main_box(row + 1)[1]) / 2
+        d.text((main_x + 18, midpoint - 12), text, font=f_edge, fill=colour)
 
-    # critic -> synthesizer, the passing path, skipping the unused row 10.
-    arrow(d, (main_x, main_box(9)[3] + 3), (main_x, main_box(11)[1] - 3), GREEN, width=3, head=12)
-    d.text(
-        (main_x + 18, (main_box(9)[3] + main_box(11)[1]) / 2 - 9), "PASS", font=f_edge, fill=GREEN
-    )
-
-    # risk_check -> finalize when no approval is required, skipping row 13.
-    arrow(
-        d,
-        (main_x, main_box(12)[3] + 3),
-        (main_x, main_box(14)[1] - 3),
-        (86, 102, 148),
-        width=3,
-        head=12,
-    )
-    d.text(
-        (main_x + 18, (main_box(12)[3] + main_box(14)[1]) / 2 - 9), "NO", font=f_edge, fill=MUTED
-    )
+    edge_label(3, "COMPLEX", MUTED)
+    edge_label(8, "PASS", GREEN)
+    edge_label(10, "NO", MUTED)
 
     # Route branch: a simple request short-circuits down a dedicated right-hand
     # channel, so it never draws across the approval branch.
-    node(d, branch_box(2), "direct_response", GREEN, f_node, "no planning needed", f_kind)
+    node(d, branch_box(3), "direct_response", GREEN, f_node, "no planning", f_kind)
     arrow(
         d,
-        (main_box(2)[2], main_box(2)[1] + node_h / 2),
-        (branch_box(2)[0] - 3, branch_box(2)[1] + node_h / 2),
+        (main_box(3)[2], main_box(3)[1] + node_h / 2),
+        (branch_box(3)[0] - 3, branch_box(3)[1] + node_h / 2),
         GREEN,
         width=3,
     )
     d.text(
-        (main_box(2)[2] + 14, main_box(2)[1] + node_h / 2 - 34), "SIMPLE", font=f_edge, fill=GREEN
+        (main_box(3)[2] + 14, main_box(3)[1] + node_h / 2 - 34), "SIMPLE", font=f_edge, fill=GREEN
     )
-    simple_channel = 1752.0
-    end_y = main_box(15)[1] + node_h / 2
-    simple_y = branch_box(2)[1] + node_h / 2
-    d.line([(branch_box(2)[2], simple_y), (simple_channel, simple_y)], fill=GREEN, width=3)
+    simple_channel = 1750.0
+    end_y = main_box(12)[1] + node_h / 2
+    simple_y = branch_box(3)[1] + node_h / 2
+    d.line([(branch_box(3)[2], simple_y), (simple_channel, simple_y)], fill=GREEN, width=3)
     d.line([(simple_channel, simple_y), (simple_channel, end_y)], fill=GREEN, width=3)
-    arrow(d, (simple_channel, end_y), (main_box(15)[2] + 4, end_y), GREEN, width=3)
-    d.text((simple_channel - 226, simple_y - 30), "respond directly", font=f_edge, fill=MUTED)
+    arrow(d, (simple_channel, end_y), (main_box(12)[2] + 4, end_y), GREEN, width=3)
+    d.text((simple_channel - 232, simple_y - 34), "respond directly", font=f_edge, fill=MUTED)
 
-    # Critic failure path loops back to dispatch_tasks.
-    node(d, branch_box(9), "retry_or_replan", RED, f_node, "if budget remains", f_kind)
+    # Critic failure path loops back to agent_execution, which is where the work
+    # would be redone.
+    node(d, branch_box(8), "retry_or_replan", RED, f_node, "if budget remains", f_kind)
     arrow(
         d,
-        (main_box(9)[2], main_box(9)[1] + node_h / 2),
-        (branch_box(9)[0] - 3, branch_box(9)[1] + node_h / 2),
+        (main_box(8)[2], main_box(8)[1] + node_h / 2),
+        (branch_box(8)[0] - 3, branch_box(8)[1] + node_h / 2),
         RED,
         width=3,
     )
-    d.text((main_box(9)[2] + 14, main_box(9)[1] + node_h / 2 - 34), "FAIL", font=f_edge, fill=RED)
-    loop_x = 1618.0
-    loop_y = top + 6 * step + node_h / 2
-    failure_y = branch_box(9)[1] + node_h / 2
-    d.line([(branch_box(9)[2], failure_y), (loop_x, failure_y)], fill=RED, width=3)
+    d.text((main_box(8)[2] + 14, main_box(8)[1] + node_h / 2 - 34), "FAIL", font=f_edge, fill=RED)
+    loop_x = 1630.0
+    loop_y = main_box(6)[1] + node_h / 2
+    failure_y = branch_box(8)[1] + node_h / 2
+    d.line([(branch_box(8)[2], failure_y), (loop_x, failure_y)], fill=RED, width=3)
     d.line([(loop_x, failure_y), (loop_x, loop_y)], fill=RED, width=3)
     arrow(d, (loop_x, loop_y), (main_box(6)[2] + 4, loop_y), RED, width=3)
-    d.text((loop_x - 300, loop_y - 30), "REPLAN", font=f_edge, fill=RED)
+    d.text((loop_x - 322, loop_y - 34), "REPLAN", font=f_edge, fill=RED)
 
-    # Approval branch.
-    node(d, branch_box(12), "human_approval", VIOLET, f_node, "graph interrupts", f_kind)
-    node(d, branch_box(13), "execute / cancel", PINK, f_node, "on resume", f_kind)
+    # Approval branch. Reaching execute_approved_action requires the run to have
+    # been resumed with a decision, so it sits directly beneath the interrupt.
+    node(d, branch_box(10), "human_approval", VIOLET, f_node, "graph interrupts", f_kind)
+    node(d, branch_box(11), "execute / cancel", PINK, f_node, "on resume", f_kind)
     arrow(
         d,
-        (main_box(12)[2], main_box(12)[1] + node_h / 2),
-        (branch_box(12)[0] - 3, branch_box(12)[1] + node_h / 2),
+        (main_box(10)[2], main_box(10)[1] + node_h / 2),
+        (branch_box(10)[0] - 3, branch_box(10)[1] + node_h / 2),
         VIOLET,
         width=3,
     )
     d.text(
-        (main_box(12)[2] + 14, main_box(12)[1] + node_h / 2 - 34), "YES", font=f_edge, fill=VIOLET
+        (main_box(10)[2] + 14, main_box(10)[1] + node_h / 2 - 34), "YES", font=f_edge, fill=VIOLET
     )
-    arrow(d, (branch_x, branch_box(12)[3] + 3), (branch_x, branch_box(13)[1] - 3), VIOLET, width=3)
+    arrow(d, (branch_x, branch_box(10)[3] + 3), (branch_x, branch_box(11)[1] - 3), VIOLET, width=3)
     arrow(
         d,
-        (branch_box(13)[0] - 3, branch_box(13)[1] + node_h / 2),
-        (main_box(14)[2] + 4, main_box(14)[1] + node_h / 2),
+        (branch_box(11)[0] - 3, branch_box(11)[1] + node_h / 2),
+        (main_box(11)[2] + 4, main_box(11)[1] + node_h / 2),
         PINK,
         width=3,
     )
@@ -648,23 +908,23 @@ def build_graph_flow() -> Image.Image:
 
 def build_tool_security() -> Image.Image:
     """The mandatory pipeline every tool call passes through, plus the risk ladder."""
-    width, height = 1760, 700
+    width, height = 1760, 780
     base = canvas(width, height)
     base = glow(base, (880, 80), 420, VIOLET, alpha=66, blur=140)
-    base = glow(base, (1420, 620), 380, RED, alpha=58, blur=150)
+    base = glow(base, (1420, 700), 380, RED, alpha=58, blur=150)
     base = grid(base)
 
-    d = ImageDraw.Draw(base)
-    f_title = font(FONT_DISPLAY, 30)
-    f_meta = font(FONT_REGULAR, 17)
-    f_stage = font(FONT_MEDIUM, 19)
-    f_step = font(FONT_MONO_BOLD, 15)
-    f_risk = font(FONT_DISPLAY, 24)
-    f_risk_meta = font(FONT_REGULAR, 16)
+    d = draw_on(base)
+    f_title = font(FONT_DISPLAY, 36)
+    f_meta = font(FONT_REGULAR, 22)
+    f_stage = font(FONT_MEDIUM, 24)
+    f_step = font(FONT_MONO_BOLD, 22)
+    f_risk = font(FONT_DISPLAY, 30)
+    f_risk_meta = font(FONT_REGULAR, 21)
 
-    d.text((60, 34), "TOOL CALL SECURITY PIPELINE", font=f_title, fill=TEXT)
+    d.text((60, 30), "TOOL CALL SECURITY PIPELINE", font=f_title, fill=TEXT)
     d.text(
-        (62, 76),
+        (62, 80),
         "No tool executes outside this pipeline. Permission, risk, and approval "
         "checks all precede execution.",
         font=f_meta,
@@ -682,27 +942,54 @@ def build_tool_security() -> Image.Image:
         ("Audit Event", BLUE),
     ]
 
+    # Eight stages in one row left roughly 190 pixels each, which forced labels
+    # small enough to be unreadable once the README scaled the image down.
+    # Two rows of four give each label twice the width, so a legible size fits.
     left, right = 60.0, width - 60.0
-    count = len(stages)
-    gap = 18.0
-    box_w = (right - left - gap * (count - 1)) / count
-    top, bottom = 128.0, 216.0
+    per_row = 4
+    gap = 22.0
+    box_w = (right - left - gap * (per_row - 1)) / per_row
+    row_height = 84.0
+    row_ys = (140.0, 258.0)
 
     for index, (label, accent) in enumerate(stages):
-        x = left + index * (box_w + gap)
-        node(d, (x, top, x + box_w, bottom), label, accent, f_stage, radius=12)
-        d.text((x + 12, top - 26), f"0{index + 1}", font=f_step, fill=DIM)
-        if index < count - 1:
+        row, column = divmod(index, per_row)
+        # Serpentine order: the flow reads left to right, then down and back, so
+        # a single connector joins the two rows instead of a long diagonal.
+        if row % 2 == 1:
+            column = per_row - 1 - column
+        x = left + column * (box_w + gap)
+        y = row_ys[row]
+        node(d, (x, y, x + box_w, y + row_height), label, accent, f_stage, radius=12)
+        d.text((x + 14, y - 30), f"0{index + 1}", font=f_step, fill=DIM)
+
+        following = index + 1
+        if following < len(stages) and following // per_row == row:
+            direction = 1 if row % 2 == 0 else -1
+            edge_x = x + box_w + 3 if direction == 1 else x - 3
+            target_x = edge_x + direction * (gap - 6)
             arrow(
                 d,
-                (x + box_w + 3, (top + bottom) / 2),
-                (x + box_w + gap - 3, (top + bottom) / 2),
+                (edge_x, y + row_height / 2),
+                (target_x, y + row_height / 2),
                 (86, 102, 148),
                 width=3,
-                head=9,
+                head=11,
             )
 
-    d.text((60, 268), "RISK CLASSIFICATION", font=f_step, fill=DIM)
+    # The first row ends and the second begins at the same column, because the
+    # second row runs right to left. One short vertical arrow joins them.
+    seam_x = right - box_w / 2
+    arrow(
+        d,
+        (seam_x, row_ys[0] + row_height + 4),
+        (seam_x, row_ys[1] - 4),
+        (86, 102, 148),
+        width=3,
+        head=11,
+    )
+
+    d.text((60, 366), "RISK CLASSIFICATION", font=f_step, fill=DIM)
 
     risks = [
         ("LOW", GREEN, "Read file, search web", "auto-execute"),
@@ -713,7 +1000,7 @@ def build_tool_security() -> Image.Image:
     r_left, r_right = 60.0, width - 60.0
     r_gap = 20.0
     r_w = (r_right - r_left - r_gap * 3) / 4
-    r_top, r_bottom = 306.0, 640.0
+    r_top, r_bottom = 404.0, 726.0
 
     for index, (level, accent, example, policy) in enumerate(risks):
         x = r_left + index * (r_w + r_gap)
@@ -725,11 +1012,11 @@ def build_tool_security() -> Image.Image:
             width=2,
         )
         d.rounded_rectangle((x, r_top, x + r_w, r_top + 8), radius=4, fill=(*accent, 255))
-        d.text((x + 26, r_top + 34), level, font=f_risk, fill=accent)
-        d.text((x + 26, r_top + 82), "example", font=f_step, fill=DIM)
-        d.text((x + 26, r_top + 108), example, font=f_risk_meta, fill=TEXT)
-        d.text((x + 26, r_top + 168), "policy", font=f_step, fill=DIM)
-        d.text((x + 26, r_top + 194), policy, font=f_risk_meta, fill=accent)
+        d.text((x + 26, r_top + 38), level, font=f_risk, fill=accent)
+        d.text((x + 26, r_top + 96), "example", font=f_step, fill=DIM)
+        d.text((x + 26, r_top + 126), example, font=f_risk_meta, fill=TEXT)
+        d.text((x + 26, r_top + 196), "policy", font=f_step, fill=DIM)
+        d.text((x + 26, r_top + 226), policy, font=f_risk_meta, fill=accent)
 
     return base
 
@@ -747,13 +1034,13 @@ def build_memory() -> Image.Image:
     base = glow(base, (1450, 560), 380, VIOLET, alpha=60, blur=150)
     base = grid(base)
 
-    d = ImageDraw.Draw(base)
-    f_title = font(FONT_DISPLAY, 30)
-    f_meta = font(FONT_REGULAR, 17)
-    f_node = font(FONT_MEDIUM, 21)
-    f_kind = font(FONT_MONO, 16)
-    f_step = font(FONT_MONO_BOLD, 15)
-    f_body = font(FONT_REGULAR, 16)
+    d = draw_on(base)
+    f_title = font(FONT_DISPLAY, 36)
+    f_meta = font(FONT_REGULAR, 22)
+    f_node = font(FONT_MEDIUM, 26)
+    f_kind = font(FONT_MONO, 22)
+    f_step = font(FONT_MONO_BOLD, 22)
+    f_body = font(FONT_REGULAR, 22)
 
     d.text((60, 34), "MEMORY ARCHITECTURE", font=f_title, fill=TEXT)
     d.text(
@@ -766,10 +1053,10 @@ def build_memory() -> Image.Image:
 
     node(
         d,
-        (540, 122, 1220, 196),
+        (470, 122, 1290, 204),
         "MemoryManager",
         VIOLET,
-        font(FONT_DISPLAY, 26),
+        font(FONT_DISPLAY, 32),
         "retrieve · store · update · summarize · delete",
         f_kind,
         radius=16,
@@ -789,15 +1076,16 @@ def build_memory() -> Image.Image:
 
     for index, (name, accent, desc, store) in enumerate(tiers):
         x = left + index * (box_w + gap)
-        arrow(d, (x + box_w / 2, 200), (x + box_w / 2, top - 6), accent, width=3, head=11)
+        arrow(d, (x + box_w / 2, 208), (x + box_w / 2, top - 6), accent, width=3, head=11)
         d.rounded_rectangle(
             (x, top, x + box_w, bottom), radius=18, fill=PANEL_SOFT, outline=(*accent, 205), width=2
         )
         d.rounded_rectangle((x, top, x + box_w, top + 8), radius=4, fill=(*accent, 255))
-        tracked(d, (x + 26, top + 32), name, f_step, accent, spacing=1.6)
-        d.text((x + 26, top + 74), desc, font=f_node, fill=TEXT)
-        d.text((x + 26, top + 116), "storage", font=f_step, fill=DIM)
-        d.text((x + 26, top + 142), store, font=f_body, fill=MUTED)
+        tracked(d, (x + 26, top + 34), name, f_step, accent, spacing=1.6)
+        for offset, line in enumerate(wrap_text(d, desc, f_node, box_w - 52, max_lines=2)):
+            d.text((x + 26, top + 80 + offset * 33), line, font=f_node, fill=TEXT)
+        d.text((x + 26, top + 166), "storage", font=f_step, fill=DIM)
+        d.text((x + 26, top + 196), store, font=f_body, fill=MUTED)
 
     return base
 
@@ -815,12 +1103,12 @@ def build_roadmap() -> Image.Image:
     base = glow(base, (1500, 120), 400, VIOLET, alpha=62, blur=150)
     base = grid(base)
 
-    d = ImageDraw.Draw(base)
-    f_title = font(FONT_DISPLAY, 30)
-    f_meta = font(FONT_REGULAR, 17)
-    f_disp = font(FONT_DISPLAY, 22)
-    f_step = font(FONT_MONO_BOLD, 15)
-    f_body = font(FONT_REGULAR, 16)
+    d = draw_on(base)
+    f_title = font(FONT_DISPLAY, 36)
+    f_meta = font(FONT_REGULAR, 22)
+    f_disp = font(FONT_DISPLAY, 26)
+    f_step = font(FONT_MONO_BOLD, 22)
+    f_body = font(FONT_REGULAR, 22)
 
     d.text((60, 34), "BUILD ROADMAP", font=f_title, fill=TEXT)
     d.text(
@@ -831,8 +1119,11 @@ def build_roadmap() -> Image.Image:
         fill=MUTED,
     )
 
-    track_y = 320.0
-    left, right = 110.0, width - 110.0
+    track_y = 336.0
+    # Inset by the half-width of a card so that the first and last cards sit
+    # inside the canvas. The original inset was 110 pixels against a 148-pixel
+    # half-width, which clipped both end cards and their text.
+    left, right = 200.0, width - 200.0
     d.line([(left, track_y), (right, track_y)], fill=(58, 72, 116), width=4)
 
     milestones = [
@@ -869,13 +1160,16 @@ def build_roadmap() -> Image.Image:
         if index == 0:
             d.line([(cx, track_y), (cx + spacing, track_y)], fill=(*GREEN, 255), width=4)
 
-        box_top = 174.0 if index % 2 == 0 else 380.0
-        box = (cx - 148, box_top, cx + 148, box_top + 116)
+        # Cards alternate above and below the track, and both must stay clear of
+        # it: the connector arrows would otherwise be drawn through a card.
+        box_top = 140.0 if index % 2 == 0 else 380.0
+        box = (cx - 148, box_top, cx + 148, box_top + 166)
         d.rounded_rectangle(box, radius=16, fill=PANEL_SOFT, outline=(*accent, 200), width=2)
-        tracked(d, (cx - 130, box_top + 16), phase, f_step, accent, spacing=1.6)
-        d.text((cx - 130, box_top + 44), name, font=f_disp, fill=TEXT)
-        d.text((cx - 130, box_top + 78), detail[:40], font=f_body, fill=MUTED)
-        d.text((cx - 130, box_top + 98), status.upper(), font=f_step, fill=accent)
+        tracked(d, (cx - 126, box_top + 18), phase, f_step, accent, spacing=1.6)
+        d.text((cx - 126, box_top + 50), name, font=f_disp, fill=TEXT)
+        for offset, line in enumerate(wrap_text(d, detail, f_body, 262, max_lines=2)):
+            d.text((cx - 126, box_top + 90 + offset * 25), line, font=f_body, fill=MUTED)
+        d.text((cx - 126, box_top + 140), status.upper(), font=f_step, fill=accent)
         target = box[3] if index % 2 == 0 else box[1]
         arrow(
             d,
@@ -893,26 +1187,44 @@ def build_roadmap() -> Image.Image:
 # Entry point
 # --------------------------------------------------------------------------- #
 
-BUILDERS = {
-    "banner.png": build_banner,
-    "logo.png": build_logo,
-    "architecture.png": build_architecture,
-    "graph-flow.png": build_graph_flow,
-    "tool-security.png": build_tool_security,
-    "memory.png": build_memory,
-    "roadmap.png": build_roadmap,
+#: Each builder paired with its canvas size in design units, so the audit can
+#: check that nothing was drawn past the edge.
+BUILDERS: dict[str, tuple[Callable[[], Image.Image], tuple[int, int]]] = {
+    "banner.png": (build_banner, (1600, 520)),
+    "logo.png": (build_logo, (512, 512)),
+    "architecture.png": (build_architecture, (1760, 1180)),
+    "graph-flow.png": (build_graph_flow, (1820, 1500)),
+    "tool-security.png": (build_tool_security, (1760, 780)),
+    "memory.png": (build_memory, (1760, 620)),
+    "roadmap.png": (build_roadmap, (1760, 640)),
 }
 
 
 def main() -> int:
-    """Render every asset and report what was produced."""
+    """Render every asset, audit its layout, and report what was produced."""
     ASSETS.mkdir(parents=True, exist_ok=True)
     print(f"writing to {ASSETS}")
 
-    for name, builder in BUILDERS.items():
+    problems = 0
+    for name, (builder, design) in BUILDERS.items():
+        _RECORDED_TEXT.clear()
         image = builder()
+
+        # The registered size drives the audit, so a stale entry would silently
+        # disable the "nothing escapes the canvas" check along one axis.
+        if image.size != (design[0] * SCALE, design[1] * SCALE):
+            raise RuntimeError(
+                f"{name}: declared {design} but rendered "
+                f"{image.size[0] // SCALE}x{image.size[1] // SCALE}; "
+                "update the BUILDERS entry"
+            )
+
+        for problem in audit_layout(*design):
+            problems += 1
+            print(f"  ! {name}: {problem}")
+
         target = ASSETS / name
-        image.save(target, optimize=True)
+        image.save(target, optimize=True, dpi=(DPI, DPI))
 
         # Guard against silently emitting a blank canvas. A histogram is used
         # rather than getextrema() because the latter is typed as a union that
@@ -926,8 +1238,11 @@ def main() -> int:
         size_kb = target.stat().st_size / 1024
         print(f"  {name:<20} {image.size[0]}x{image.size[1]}  {size_kb:6.1f} KB")
 
-    print(f"done: {len(BUILDERS)} assets")
-    return 0
+    print(f"done: {len(BUILDERS)} assets, {problems} layout problem(s)")
+    # A non-zero exit is the point of the audit: a diagram that silently pushed
+    # a label off its own canvas is a documentation defect, and one this build
+    # can detect for free.
+    return 1 if problems else 0
 
 
 if __name__ == "__main__":
