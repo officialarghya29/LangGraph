@@ -63,6 +63,7 @@ from app.services.budget import BudgetedProvider
 from app.services.cache import build_cache
 from app.services.llm import LLMProvider, build_llm_provider
 from app.services.memory import build_memory_manager
+from app.services.resilience import RetryingProvider
 from app.services.task_store import PostgresTaskStore
 from app.tools.registry import build_default_registry
 
@@ -186,10 +187,13 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         logger.warning("startup.volatile_checkpoints")
 
     try:
-        # Wrapped here rather than inside the factory, so every provider —
-        # including one a test substitutes later — is charged to the run's budget
-        # as long as it is wrapped before it reaches the graph.
-        provider: LLMProvider = BudgetedProvider(build_llm_provider(settings))
+        # Two decorators, in this order. Retrying outermost means a retried call
+        # is retried *and charged*, since each attempt passes through the budget.
+        # Reversed, the discarded attempts would be invisible in the totals.
+        provider: LLMProvider = RetryingProvider(
+            BudgetedProvider(build_llm_provider(settings)),
+            max_retries=settings.max_retries,
+        )
     except ConfigurationError as exc:
         application.state.provider = None
         application.state.provider_error = exc.message

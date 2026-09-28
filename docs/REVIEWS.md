@@ -181,6 +181,28 @@ candidates 3.37 ms.
 
 ## Architecture review
 
+### Found, and fixed
+
+**The retry policy was written, tested, and never called.** A classification
+table, a backoff curve, a retry loop with injectable sleep, a suite of 24 tests
+covering all three — and no caller anywhere in `app/`. A transient 429 or a
+timeout failed the whole run while the machinery to survive it sat unused beside
+the code path. Every individual test passed throughout, which is exactly why the
+gap survived: each part was correct, and nothing asserted the parts were joined.
+
+The join is now `RetryingProvider`, a decorator applied outside the budget
+decorator, with the ordering rationale written into the module so the next person
+does not reverse it by accident. The new tests assert the *composition*, not the
+pieces: a transient failure earns another attempt, a permanent one does not, a
+spent budget is not retried, and the original failure is what escapes rather than
+the loop's own wrapper type.
+
+**A decorator changed what a caller is told.** Retrying inside the provider means
+the failure a caller classifies is the provider's own error, not
+`RetryExhaustedError` — whose kind is not one the classification table knows.
+The original is re-raised with the exhausted wrapper attached as the chain's
+cause, so the log still explains how many attempts were spent.
+
 ### Verified
 
 **Dependency direction holds.** No module under `app/services`, `app/graph`,

@@ -24,7 +24,7 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 
 [![Ruff](https://img.shields.io/badge/Ruff-passing-D7FF64?style=for-the-badge&logo=ruff&logoColor=black)](#quality-gates)
 [![MyPy](https://img.shields.io/badge/MyPy-strict-2A6DB2?style=for-the-badge)](#quality-gates)
-[![Tests](https://img.shields.io/badge/tests-773%20passing-brightgreen?style=for-the-badge)](#quality-gates)
+[![Tests](https://img.shields.io/badge/tests-785%20passing-brightgreen?style=for-the-badge)](#quality-gates)
 
 [![Status](https://img.shields.io/badge/phases-34%20of%2045-yellow?style=for-the-badge)](#build-status)
 [![License](https://img.shields.io/badge/license-proprietary-red?style=for-the-badge)](#license)
@@ -41,10 +41,10 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 > — not mocks, and not a plan.
 >
 > ```console
-> $ ruff format --check .   →  133 files already formatted
+> $ ruff format --check .   →  135 files already formatted
 > $ ruff check .            →  All checks passed
-> $ mypy app scripts        →  Success: no issues found in 79 source files
-> $ pytest                  →  773 passed in 67s
+> $ mypy app scripts        →  Success: no issues found in 80 source files
+> $ pytest                  →  785 passed in 31s
 > $ python scripts/evaluate.py --quiet
 > rule-based baseline: accuracy=0.911 adversarial=0.429 macro_f1=0.920 ⟶
 >   approval_recall=1.000 p50=0.06ms p95=0.09ms
@@ -444,9 +444,21 @@ never retried in a loop.
 | `PERMANENT` | No | — |
 | `UNKNOWN` | Once | Fixed |
 
-Implemented in `app/core/constants.py` (classification table and backoff) and
-`app/services/execution.py` (the retry loop). **Destructive actions are never
+Implemented in `app/core/constants.py` (classification table and backoff),
+`app/services/execution.py` (the retry loop), and `app/services/resilience.py`
+(the decorator that puts it on the model path). **Destructive actions are never
 retried automatically**, regardless of classification.
+
+Two details are worth knowing, because both are easy to get wrong:
+
+- **Retries wrap the budget, not the other way round.**
+  `RetryingProvider(BudgetedProvider(inner))` means the allowance is checked
+  between attempts, so a spent budget stops retrying instead of finishing the
+  loop and reporting the overrun afterwards. A failed attempt raises without
+  yielding usage, so it is never billed; only a request that came back is
+  charged, once.
+- **A provider's `Retry-After` overrides the curve upwards**, capped at a minute.
+  See [Budgets and throttling](#budgets-and-throttling).
 
 ---
 
