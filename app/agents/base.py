@@ -14,19 +14,32 @@ Each agent declares:
 
 from __future__ import annotations
 
+import logging
+import time
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from pydantic import BaseModel
 
 from app.core.config import Settings
 from app.core.exceptions import ToolPermissionError
+from app.services.limits import current_limits
 from app.services.llm import LLMProvider, Message, Role
 from app.tools.base import ToolContext, ToolRequest, ToolResult
 from app.tools.registry import AnyTool, ToolRegistry
 
-__all__ = ["UNTRUSTED_CONTENT_RULE", "AgentContext", "BaseAgent"]
+__all__ = ["UNTRUSTED_CONTENT_RULE", "AgentContext", "BaseAgent", "EventEmitter"]
+
+logger = logging.getLogger(__name__)
+
+#: Signature of an execution-event publisher: ``(event_type, payload)``.
+#:
+#: Agents announce their own tool calls through this, because the agent is the
+#: only layer that knows when a tool was really invoked. The graph supplies it,
+#: so an agent still has no idea where events are persisted.
+EventEmitter = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 #: The rule every agent prompt must carry, worded once.
 #:
@@ -51,6 +64,9 @@ class AgentContext:
     task_id: str | None = None
     conversation_id: str | None = None
     approved: bool = False
+    #: Where this run's tool events go. Optional because an agent driven directly
+    #: by a script or a unit test has no run to publish into.
+    emit: EventEmitter | None = None
 
 
 class BaseAgent[In: BaseModel, Out: BaseModel](ABC):
@@ -197,9 +213,19 @@ class BaseAgent[In: BaseModel, Out: BaseModel](ABC):
 
         Raises:
             ToolPermissionError: If the tool is not on this agent's allow-list.
+            ExecutionLimitError: If the run has spent its tool-call allowance or
+                has outlived its execution-time ceiling. Checked *before* the
+                call, so a refused call is never half-performed.
         """
         if not self.allows_tool(tool_name):
             raise ToolPermissionError(f"agent {self.name!r} is not authorised to use {tool_name!r}")
+
+        # The single choke point every tool invocation passes through, which is
+        # why the ceiling is enforced here rather than at each call site.
+        limits = current_limits()
+        if limits is not None:
+            limits.check_deadline()
+            limits.note_tool_call()
 
         tool = self._registry.get(tool_name)
         tool_context = ToolContext(
@@ -216,7 +242,54 @@ class BaseAgent[In: BaseModel, Out: BaseModel](ABC):
             agent=self.name,
             user_id=context.user_id,
         )
-        return await tool.execute(request, tool_context)
+        # Only the tool's name, risk, and timing are published. The arguments are
+        # not: they are model-authored and can carry a prompt fragment, a path, or
+        # a credential, and events are served to clients.
+        # ``label``, not ``value``: :class:`RiskLevel` is an ``IntEnum``, so its
+        # value is ``1`` rather than ``"LOW"``. The audit column is a string with
+        # a check constraint on those names, and the discovery endpoint already
+        # reports them this way.
+        await self._publish(
+            context,
+            "tool_started",
+            tool=tool_name,
+            agent=self.name,
+            risk_level=tool.effective_risk().label,
+        )
+        started = time.perf_counter()
+        result = await tool.execute(request, tool_context)
+        duration_ms = round((time.perf_counter() - started) * 1000, 3)
+        await self._publish(
+            context,
+            "tool_completed",
+            tool=result.tool,
+            agent=self.name,
+            ok=result.ok,
+            risk_level=result.risk_level.label,
+            approved=result.approved,
+            approval_required=result.approval_required,
+            failure_kind=result.failure_kind.value,
+            duration_ms=duration_ms,
+        )
+        return result
+
+    async def _publish(self, context: AgentContext, event_type: str, **payload: Any) -> None:
+        """Announce a tool lifecycle event, if this run has a sink.
+
+        A failing sink is logged and swallowed, for the same reason the graph
+        swallows one: observability must not be able to fail the work it is
+        observing.
+        """
+        emit = context.emit
+        if emit is None:
+            return
+        try:
+            await emit(event_type, payload)
+        except Exception as exc:
+            logger.warning(
+                "agent.event_failed",
+                extra={"event": event_type, "error": type(exc).__name__},
+            )
 
     # ------------------------------------------------------------------ #
     # Reasoning

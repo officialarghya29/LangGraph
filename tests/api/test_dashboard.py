@@ -152,6 +152,44 @@ def _strip_javascript_comments(source: str) -> str:
     return re.sub(r"//[^\n]*", "", without_blocks)
 
 
+def test_every_element_the_script_reaches_for_exists(console: TestClient) -> None:
+    """A typo in an element id is a button that throws when clicked.
+
+    The page and its script are two files that share a set of ids and nothing
+    checks that they agree. This is the check: every ``el('...')`` in the script
+    must appear as an ``id="..."`` in the markup.
+    """
+    from app.api.routes.dashboard import _SCRIPT
+
+    page = console.get("/dashboard").text
+    referenced = set(re.findall(r"el\('([^']+)'\)", _SCRIPT))
+
+    assert referenced, "the script should reach for elements by id"
+    missing = sorted(name for name in referenced if f'id="{name}"' not in page)
+    assert not missing, f"the script references ids the page does not define: {missing}"
+
+
+def test_the_console_does_not_stream_with_event_source() -> None:
+    """EventSource cannot authenticate, so using it would be a broken button.
+
+    It sets no request headers, and the API takes identity from a header. Passing
+    credentials as query parameters to work around that would leak them into
+    history, referrers, and access logs. The script therefore uses ``fetch`` and
+    parses the frames itself, which is what this asserts — and the guard exists so
+    a future edit cannot quietly reintroduce the shortcut.
+    """
+    from app.api.routes.dashboard import _SCRIPT
+
+    code = _strip_javascript_comments(_SCRIPT)
+
+    assert "EventSource" not in code
+    assert "fetch(" in code
+    assert "getReader()" in code
+    # No credential may travel in a URL.
+    assert "?identity=" not in code
+    assert "?token=" not in code
+
+
 def test_the_script_never_builds_html_from_data() -> None:
     """The XSS guard, asserted structurally.
 

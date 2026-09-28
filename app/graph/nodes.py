@@ -145,7 +145,15 @@ class GraphNodes:
         self.deps = deps
 
     async def _emit(self, event_type: EventType, **payload: Any) -> None:
-        """Publish a client-safe execution event.
+        """Publish a client-safe execution event."""
+        await self._emit_raw(str(event_type), payload)
+
+    async def _emit_raw(self, event_type: str, payload: dict[str, Any]) -> None:
+        """Publish an already-assembled event.
+
+        Split from :meth:`_emit` so the same sink can be handed to collaborators
+        that speak in ``(name, payload)`` pairs — agents announcing their tool
+        calls — without each of them having to know about :class:`EventType`.
 
         A failing sink is logged and swallowed. Observability must never be able
         to break the run it is observing: a full disk or a dead event log would
@@ -155,11 +163,11 @@ class GraphNodes:
         if sink is None:
             return
         try:
-            await sink(str(event_type), payload)
+            await sink(event_type, payload)
         except Exception as exc:
             logger.warning(
                 "graph.event_sink_failed",
-                extra={"event": str(event_type), "error": type(exc).__name__},
+                extra={"event": event_type, "error": type(exc).__name__},
             )
 
     # ------------------------------------------------------------------ #
@@ -167,12 +175,20 @@ class GraphNodes:
     # ------------------------------------------------------------------ #
 
     def _agent_context(self, state: AgentState, *, approved: bool = False) -> AgentContext:
+        """Build the context for one agent invocation.
+
+        The run's event sink is handed to the agent so a tool call announces
+        itself as it happens. It is the agent, not this node, that knows when a
+        tool was really invoked: a worker calls tools from inside its own
+        ``run``, and the node only sees the result.
+        """
         return AgentContext(
             settings=self.deps.settings,
             user_id=state.get("user_id"),
             task_id=state.get("task_id"),
             conversation_id=state.get("conversation_id"),
             approved=approved,
+            emit=self._emit_raw,
         )
 
     @staticmethod

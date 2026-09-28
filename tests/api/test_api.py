@@ -19,6 +19,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import reset_settings_cache
+from app.main import create_app
 from tests.api.conftest import ApiHarness
 
 
@@ -264,6 +265,40 @@ def test_a_task_records_the_tokens_it_actually_spent(
     assert completion > 0
 
 
+def test_metrics_can_be_turned_off(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A kill switch that only changed a readiness string was not a kill switch.
+
+    ``METRICS_ENABLED=false`` used to leave the endpoint serving; an operator who
+    turned it off for a reason still exposed it.
+    """
+    monkeypatch.setenv("METRICS_ENABLED", "false")
+    reset_settings_cache()
+    try:
+        assert client.get("/metrics").status_code == 404
+        checks = client.get("/ready").json()["checks"]
+        assert "disabled" in checks["metrics"]
+    finally:
+        reset_settings_cache()
+
+
+def test_the_provider_uses_its_own_retry_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``LLM_MAX_RETRIES`` configures model retries; nothing else did.
+
+    It was declared and never read, so the provider retried on the graph's
+    replan budget instead — the same number doing two unrelated jobs.
+    """
+    monkeypatch.setenv("LLM_API_KEY", "sk-test-key")
+    monkeypatch.setenv("LLM_MAX_RETRIES", "7")
+    reset_settings_cache()
+    try:
+        with TestClient(create_app()) as probe:
+            provider = probe.app.state.provider
+            assert provider.max_retries == 7
+            assert type(provider.inner).__name__ == "BudgetedProvider"
+    finally:
+        reset_settings_cache()
+
+
 def test_a_task_reports_the_tokens_it_spent_as_metrics(direct: ApiHarness) -> None:
     """Accounting that stays inside the process is accounting nobody can alert on.
 
@@ -418,6 +453,71 @@ def test_approving_resumes_and_completes(gated: ApiHarness) -> None:
 
     assert response.status_code == 200
     assert response.json()["approval_status"] == "approved"
+
+
+def test_a_run_records_the_tool_calls_it_made(
+    gated: ApiHarness, sql: Callable[..., list[tuple]]
+) -> None:
+    """``tool_call_count`` was updatable and updated by nothing.
+
+    Every task reported zero tool calls however many it made, which is worse than
+    no column at all: the number looked authoritative and was fictitious.
+    """
+    created = gated.client.post("/api/v1/tasks", json={"request": "delete everything"}).json()
+
+    gated.client.post(f"/api/v1/tasks/{created['task_id']}/approve", json={})
+
+    rows = sql("SELECT tool_call_count FROM tasks WHERE id = %s", (created["task_id"],))
+
+    assert rows[0][0] >= 1, "the approved action is a tool call"
+
+
+def test_a_tool_call_reaches_the_durable_event_log(
+    gated: ApiHarness, sql: Callable[..., list[tuple]]
+) -> None:
+    """``TOOL_STARTED`` and ``TOOL_COMPLETED`` are advertised, so they must be real.
+
+    A client streaming for progress was entitled to expect these; the event
+    catalogue listed them and no code ever produced one.
+    """
+    created = gated.client.post("/api/v1/tasks", json={"request": "delete everything"}).json()
+
+    gated.client.post(f"/api/v1/tasks/{created['task_id']}/approve", json={})
+
+    rows = sql(
+        "SELECT event_type FROM execution_events WHERE task_id = %s ORDER BY seq",
+        (created["task_id"],),
+    )
+    kinds = [row[0] for row in rows]
+
+    assert "tool_started" in kinds, kinds
+    assert "tool_completed" in kinds, kinds
+
+
+def test_a_tool_call_reaches_the_audit_table(
+    gated: ApiHarness, sql: Callable[..., list[tuple]]
+) -> None:
+    """``record_tool_call`` was called by nothing, so the table was always empty.
+
+    The risk level is read back through the column's check constraint, which only
+    accepts the level's *name*. ``RiskLevel`` is an ``IntEnum``, so publishing
+    ``.value`` would have sent ``1`` and the insert would have been refused — the
+    audit row is the one place where the difference is enforced.
+    """
+    created = gated.client.post("/api/v1/tasks", json={"request": "delete everything"}).json()
+
+    gated.client.post(f"/api/v1/tasks/{created['task_id']}/approve", json={})
+
+    rows = sql(
+        "SELECT tool, agent, risk_level FROM tool_calls WHERE task_id = %s",
+        (created["task_id"],),
+    )
+
+    assert rows, "the audit trail records no tool call"
+    tool, agent, risk_level = rows[0]
+    assert tool
+    assert agent == "executor"
+    assert risk_level in {"LOW", "MEDIUM", "HIGH", "CRITICAL"}
 
 
 def test_a_decision_records_who_made_it(gated: ApiHarness, sql: Callable[..., list[tuple]]) -> None:
@@ -661,10 +761,32 @@ def test_an_unmatched_path_is_bucketed_under_a_constant(direct: ApiHarness) -> N
 
 
 def test_startup_gauges_describe_the_running_application(direct: ApiHarness) -> None:
+    """The tool gauge is checked against discovery, not against a fixed number.
+
+    The registry holds whatever the deployment's credentials allow, so a literal
+    count is a claim about one machine. It previously read seven, which was the
+    number produced by a *blank* GitHub token registering two tools that could
+    only fail when called.
+    """
     body = direct.client.get("/metrics").text
+    listed = direct.client.get("/api/v1/tools").json()
 
     assert "registered_agents 8" in body
-    assert "registered_tools 7" in body
+    assert f"registered_tools {len(listed)}" in body
+
+
+def test_an_unconfigured_credential_does_not_register_its_tools(direct: ApiHarness) -> None:
+    """``GITHUB_TOKEN=`` is configuration meaning none, not a credential.
+
+    An empty secret is not ``None``, so the "is a token configured?" test passed
+    and the GitHub tools were reported as available. The first call would then
+    fail with an authentication error that reads like an upstream problem rather
+    than a missing setting.
+    """
+    names = {tool["name"] for tool in direct.client.get("/api/v1/tools").json()}
+
+    assert "github_repository" not in names
+    assert "github_create_issue" not in names
 
 
 def test_a_task_outcome_is_counted(direct: ApiHarness) -> None:

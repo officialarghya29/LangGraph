@@ -20,9 +20,11 @@ from app.core.config import Settings
 from app.core.exceptions import ConfigurationError, UsageLimitExceededError
 from app.graph.builder import build_graph
 from app.graph.checkpoints import thread_config
+from app.graph.nodes import event_sink_for
 from app.graph.state import initial_state
 from app.models.tool import AccessMode
 from app.services.budget import BudgetedProvider, TokenBudget, token_budget
+from app.services.limits import RunLimits, run_limits
 from app.services.llm import FakeLLMProvider, LLMProvider
 from app.tools.base import Tool, ToolContext
 from app.tools.registry import ToolRegistry
@@ -508,6 +510,75 @@ def test_an_approved_action_is_actually_performed() -> None:
     result = asyncio.run(graph.ainvoke(Command(resume="approve"), config))
 
     assert "completed" in (result["final_answer"] or "").lower()
+
+
+def test_an_approved_action_within_the_ceiling_is_counted() -> None:
+    """``MAX_TOOL_CALLS`` bounds real tool calls, so the count must be real."""
+    graph, _ = approval_graph()
+    state = initial_state("delete the production database", iteration_limit=10, retry_limit=3)
+    config = thread_config(state["task_id"])
+    limits = RunLimits(max_tool_calls=10, max_seconds=30)
+
+    asyncio.run(graph.ainvoke(state, config))
+    with run_limits(limits):
+        result = asyncio.run(graph.ainvoke(Command(resume="approve"), config))
+
+    assert "completed" in (result["final_answer"] or "").lower()
+    assert limits.tool_calls == 1, "an executed action is one tool call"
+
+
+def test_an_expired_run_cannot_perform_its_approved_action() -> None:
+    """A run out of time stops before touching the world, and says why.
+
+    The refused call is the interesting half: the ceiling must stop the work
+    rather than let it happen and report it afterwards.
+    """
+    graph, _ = approval_graph()
+    state = initial_state("delete the production database", iteration_limit=10, retry_limit=3)
+    config = thread_config(state["task_id"])
+    now = [1_000.0]
+    limits = RunLimits(max_tool_calls=10, max_seconds=30, clock=lambda: now[0])
+
+    asyncio.run(graph.ainvoke(state, config))
+    now[0] += 31.0
+    with run_limits(limits):
+        result = asyncio.run(graph.ainvoke(Command(resume="approve"), config))
+
+    answer = result["final_answer"] or ""
+    assert "could not be performed" in answer
+    assert "execution-time ceiling" in answer
+    assert limits.tool_calls == 0, "a refused call was charged as work done"
+
+
+def test_a_tool_call_is_announced_through_the_run_s_sink() -> None:
+    """``TOOL_STARTED`` and ``TOOL_COMPLETED`` were declared and never emitted.
+
+    The event schema has always advertised them, so a client could reasonably be
+    streaming for events that no code produced.
+    """
+    graph, _ = approval_graph()
+    state = initial_state("delete the production database", iteration_limit=10, retry_limit=3)
+    config = thread_config(state["task_id"])
+    events: list[tuple[str, dict[str, Any]]] = []
+
+    async def sink(event_type: str, payload: dict[str, Any]) -> None:
+        events.append((event_type, payload))
+
+    asyncio.run(graph.ainvoke(state, config))
+
+    async def resume() -> dict[str, Any]:
+        with event_sink_for(sink):
+            return await graph.ainvoke(Command(resume="approve"), config)
+
+    asyncio.run(resume())
+
+    names = [name for name, _ in events]
+    assert "tool_started" in names, names
+    assert "tool_completed" in names, names
+    completed = next(payload for name, payload in events if name == "tool_completed")
+    assert completed["ok"] is True
+    assert completed["tool"]
+    assert isinstance(completed["duration_ms"], float)
 
 
 def test_rejecting_cancels_without_executing() -> None:

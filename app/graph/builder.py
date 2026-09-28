@@ -5,7 +5,10 @@ decided by a function over typed state, and every cycle is bounded:
 
 - the dispatch loop is capped by ``MAX_AGENT_ITERATIONS``;
 - the retry loop is capped by ``MAX_RETRIES``;
-- every node that calls outward has a timeout from configuration.
+- every node that calls outward has a timeout from configuration;
+- the whole run is capped by ``MAX_EXECUTION_TIME`` and ``MAX_TOOL_CALLS``, which
+  are enforced by :mod:`app.services.limits` at the tool pipeline and here in the
+  dispatch loop.
 
 There is no path through this graph that can run forever.
 """
@@ -36,6 +39,7 @@ from app.graph.state import AgentState
 from app.models.agent import VerificationResult
 from app.models.approval import ApprovalStatus
 from app.schemas.plans import Plan, Route
+from app.services.limits import current_limits
 from app.services.llm import LLMProvider
 from app.services.memory import MemoryManager
 from app.tools.registry import ToolRegistry
@@ -180,8 +184,14 @@ def route_after_planning(state: AgentState) -> str:
 def route_after_aggregate(state: AgentState) -> str:
     """Loop back for outstanding subtasks, or move on to verification.
 
-    This is the dispatch loop, and both its exit conditions live here: every
-    subtask finished, or the iteration ceiling was reached.
+    This is the dispatch loop, and all three of its exit conditions live here:
+    every subtask finished, the iteration ceiling was reached, or the run has
+    outlived its execution-time ceiling.
+
+    The deadline is checked here as well as before every tool call, because a
+    plan whose subtasks call no tools would otherwise keep dispatching passes
+    until the hard cancellation fired. Exiting the loop instead lets the run
+    finish with the work it has, which is a better answer than a cancellation.
     """
     plan = state.get("plan")
     if not isinstance(plan, Plan):
@@ -192,6 +202,10 @@ def route_after_aggregate(state: AgentState) -> str:
     if completed >= set(plan.subtask_ids):
         return "critic"
     if (state.get("iteration_count") or 0) >= _coalesce(state.get("iteration_limit"), 10):
+        return "critic"
+
+    limits = current_limits()
+    if limits is not None and limits.expired:
         return "critic"
     return "continue"
 

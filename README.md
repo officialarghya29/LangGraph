@@ -24,9 +24,9 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 
 [![Ruff](https://img.shields.io/badge/Ruff-passing-D7FF64?style=for-the-badge&logo=ruff&logoColor=black)](#quality-gates)
 [![MyPy](https://img.shields.io/badge/MyPy-strict-2A6DB2?style=for-the-badge)](#quality-gates)
-[![Tests](https://img.shields.io/badge/tests-807%20passing-brightgreen?style=for-the-badge)](#quality-gates)
+[![Tests](https://img.shields.io/badge/tests-862%20passing-brightgreen?style=for-the-badge)](#quality-gates)
 
-[![Status](https://img.shields.io/badge/phases-34%20of%2045-yellow?style=for-the-badge)](#build-status)
+[![Status](https://img.shields.io/badge/phases-45%20of%2045-brightgreen?style=for-the-badge)](#build-status)
 [![License](https://img.shields.io/badge/license-proprietary-red?style=for-the-badge)](#license)
 
 </div>
@@ -41,10 +41,10 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 > — not mocks, and not a plan.
 >
 > ```console
-> $ ruff format --check .   →  136 files already formatted
+> $ ruff format --check .   →  139 files already formatted
 > $ ruff check .            →  All checks passed
-> $ mypy app scripts        →  Success: no issues found in 80 source files
-> $ pytest                  →  807 passed in 61s
+> $ mypy app scripts        →  Success: no issues found in 81 source files
+> $ pytest                  →  862 passed in 59s
 > $ python scripts/evaluate.py --quiet
 > rule-based baseline: accuracy=0.911 adversarial=0.429 macro_f1=0.920 ⟶
 >   approval_recall=1.000 p50=0.06ms p95=0.09ms
@@ -53,8 +53,9 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 
 **Complete and verified (phases 0–33).** Typed configuration; the LLM and
 embedding provider abstractions; typed graph state; the structured execution
-event model; the tool framework with its security pipeline; seven tools behind
-per-tool policy; eight agents; the router, planner, critic, and synthesizer; the
+event model; the tool framework with its security pipeline; eight tools behind
+per-tool policy, registered according to the credentials a deployment holds;
+eight agents; the router, planner, critic, and synthesizer; the
 orchestration graph with bounded parallel dispatch and classified retries;
 durable PostgreSQL checkpointing with interrupt/resume; approvals persisted to
 the database; the four-tier memory manager; the HTTP API with ownership enforced
@@ -73,6 +74,14 @@ timing harness plus the optimisation it found — see
 
 **Also complete:** CI, the operator console, and the final reviews — see
 [Delivery](#delivery) and [`docs/REVIEWS.md`](docs/REVIEWS.md).
+
+**Complete and verified (deep scan).** A pass that asked which of this
+repository's own claims were not true, and fixed what it found: ceilings that
+bounded nothing, counters that were always zero, three audit tables nothing
+wrote to, a kill switch that killed nothing, and a console whose live stream
+could not authenticate. One gap remains, and it is recorded rather than
+papered over — per-agent token attribution, which would mean writing zeros into
+columns named `prompt_tokens`. See [the deep scan](docs/REVIEWS.md#deep-scan).
 
 **Unbuilt, not unverified.** The `Dockerfile` and `docker-compose.yml` are
 written and lint-checked, but this host has no container runtime, so neither has
@@ -171,6 +180,22 @@ Four ceilings are enforced outside the model: `MAX_AGENT_ITERATIONS`,
 belt-and-braces until you consider what "the model will stop when it is done"
 means at scale: it means *usually*. A run that exceeds its budget must fail
 deterministically, from the orchestrator, not from a prompt asking nicely.
+
+Each one has a single named enforcement point, because a ceiling that is checked
+in several places by hand is a ceiling that will eventually be checked in all but
+one of them:
+
+| Ceiling | Enforced at | Behaviour when reached |
+| :--- | :--- | :--- |
+| `MAX_AGENT_ITERATIONS` | The dispatch loop's exit condition | Leave the loop and answer with the work already done |
+| `MAX_TOOL_CALLS` | `BaseAgent.call_tool`, the one path every tool invocation passes through | Refuse the call before it runs, and record why |
+| `MAX_EXECUTION_TIME` | The tool pipeline, the loop guard, and a hard cancellation around the graph | Stop dispatching; cancel a run that is inside one long call |
+| `MAX_PARALLEL_TASKS` | The semaphore around dispatch | Queue the next subtask rather than start it |
+
+Refusals are checked *before* the work, never after it, so a ceiling can only ever
+prevent a call — never perform one and then discard the result. Everything the
+run consumed before it stopped is still recorded: a failed run is the run whose
+consumption someone will want to look at.
 
 ### 3. Verification has to be independent to be worth anything
 
@@ -377,7 +402,11 @@ The scoring formula and the reasoning behind its weights are in
 <img src="docs/assets/tool-security.png" alt="Tool security pipeline and risk ladder" width="100%">
 
 Every tool call passes the same pipeline. Permission, risk, and approval checks all
-happen *before* execution, and every call emits an audit event.
+happen *before* execution, and every call emits an audit event — the agent that
+invokes the tool announces it, so a call is recorded even when the node above it
+only ever sees the result. A completed call is written to the `tool_calls` audit
+table as well as to the event stream, so "which tools ran on this task, and did
+they work?" is a query rather than a reconstruction.
 
 ### Risk levels and execution policy
 
@@ -494,7 +523,7 @@ A live `/ready` looks like this:
   "checks": {
     "llm_provider": "ok",
     "orchestration_graph": "ok",
-    "tool_registry": "7 tools",
+    "tool_registry": "5 tools",
     "agents": "8 registered",
     "database": "ok",
     "checkpoint_store": "ok (postgres)",
@@ -1080,6 +1109,7 @@ $ curl -s http://127.0.0.1:8000/ready | python -m json.tool
 - [x] **Phase 41** — documentation — README, architecture, tech stack, plan, and this review record
 - [x] **Phase 42** — operator console — off by default, strict CSP, and no HTML built from user input
 - [x] **Phases 43–45** — final reviews — see [`docs/REVIEWS.md`](docs/REVIEWS.md): two findings fixed, the rest verified or accepted on the record
+- [x] **Deep scan** — a claim-by-claim audit of this repository: eleven findings fixed, one verified non-defect, one accepted gap on the record
 
 </details>
 

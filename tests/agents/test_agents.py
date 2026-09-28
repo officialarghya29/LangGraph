@@ -17,9 +17,10 @@ from app.agents.planner import PlannerAgent
 from app.agents.researcher import ResearchAgent
 from app.agents.synthesizer import SynthesizerAgent
 from app.core.config import Settings
-from app.core.exceptions import NotFoundError, ToolPermissionError
+from app.core.exceptions import ExecutionLimitError, NotFoundError, ToolPermissionError
 from app.models.agent import AgentOutput
 from app.models.tool import AccessMode
+from app.services.limits import RunLimits, run_limits
 from app.services.llm import FakeLLMProvider
 from app.tools.base import Tool, ToolContext
 from app.tools.registry import ToolRegistry
@@ -267,6 +268,180 @@ async def test_arguments_are_still_validated_for_allowed_tools() -> None:
     result = await agent.call_tool("web_search", {"nonsense": 1}, context())
 
     assert result.ok is False
+
+
+# --------------------------------------------------------------------------- #
+# Execution ceilings and tool events
+# --------------------------------------------------------------------------- #
+
+
+def counting_tool(name: str, calls: list[str]) -> Tool[_Args, _Out]:
+    """Build a stub tool that records each invocation.
+
+    Recording is what separates "the call was refused" from "the call was made
+    and its result discarded", which are very different failures.
+    """
+
+    async def run(self: object, payload: _Args, context: ToolContext) -> _Out:
+        calls.append(name)
+        return _Out()
+
+    namespace: dict[str, object] = {
+        "name": name,
+        "description": f"counting stub for {name}",
+        "access_mode": AccessMode.READ,
+        "input_model": _Args,
+        "output_model": _Out,
+        "run": run,
+    }
+    return type(f"Counting_{name}", (Tool,), namespace)()
+
+
+async def test_a_tool_call_past_the_ceiling_is_refused_before_it_runs() -> None:
+    """``MAX_TOOL_CALLS`` bounds the work, so the refused call must not happen."""
+    calls: list[str] = []
+    agent = ResearchAgent(provider(), ToolRegistry([counting_tool("web_search", calls)]))
+    limits = RunLimits(max_tool_calls=1, max_seconds=60)
+
+    with run_limits(limits):
+        first = await agent.call_tool("web_search", {"query": "x"}, context())
+        with pytest.raises(ExecutionLimitError, match="tool-call ceiling"):
+            await agent.call_tool("web_search", {"query": "y"}, context())
+
+    assert first.ok is True
+    assert calls == ["web_search"], "the refused call reached the tool"
+    assert limits.tool_calls == 1, "the refused call was counted as work done"
+
+
+async def test_a_call_with_no_ceiling_in_scope_is_unbounded() -> None:
+    """A script driving an agent directly has no run to charge."""
+    calls: list[str] = []
+    agent = ResearchAgent(provider(), ToolRegistry([counting_tool("web_search", calls)]))
+
+    for _ in range(5):
+        assert (await agent.call_tool("web_search", {"query": "x"}, context())).ok is True
+
+    assert len(calls) == 5
+
+
+async def test_an_expired_run_cannot_start_a_tool_call() -> None:
+    """``MAX_EXECUTION_TIME`` is checked before the work, not after it."""
+    calls: list[str] = []
+    agent = ResearchAgent(provider(), ToolRegistry([counting_tool("web_search", calls)]))
+    now = [1_000.0]
+    limits = RunLimits(max_tool_calls=5, max_seconds=30, clock=lambda: now[0])
+
+    now[0] += 31.0
+
+    with run_limits(limits), pytest.raises(ExecutionLimitError, match="execution-time"):
+        await agent.call_tool("web_search", {"query": "x"}, context())
+
+    assert calls == []
+
+
+async def test_a_refused_permission_does_not_spend_the_allowance() -> None:
+    """A call that was never authorised is not a call that was made."""
+    agent = ResearchAgent(provider(), full_registry())
+    limits = RunLimits(max_tool_calls=1, max_seconds=60)
+
+    with run_limits(limits), pytest.raises(ToolPermissionError):
+        await agent.call_tool("write_file", {"query": "x"}, context())
+
+    assert limits.tool_calls == 0
+
+
+async def test_a_tool_call_is_announced_to_the_run() -> None:
+    """The declared tool events were never emitted; the agent is what emits them."""
+    events: list[tuple[str, dict[str, object]]] = []
+
+    async def sink(event_type: str, payload: dict[str, object]) -> None:
+        events.append((event_type, payload))
+
+    agent = ResearchAgent(provider(), ToolRegistry([stub_tool("web_search")]))
+    ctx = AgentContext(settings=SETTINGS, user_id="u", task_id="t", emit=sink)
+
+    result = await agent.call_tool("web_search", {"query": "x"}, ctx)
+
+    assert result.ok is True
+    assert [name for name, _ in events] == ["tool_started", "tool_completed"]
+    assert events[0][1]["tool"] == "web_search"
+    assert events[0][1]["agent"] == "researcher"
+    assert events[1][1]["ok"] is True
+    assert isinstance(events[1][1]["duration_ms"], float)
+
+
+async def test_a_published_risk_level_is_its_name_not_its_ordinal() -> None:
+    """``RiskLevel`` is an ``IntEnum``, so ``.value`` is ``1``, not ``"LOW"``.
+
+    The audit column is a string with a check constraint on those names, and the
+    discovery endpoint reports them this way, so the ordinal would be rejected by
+    the database and misread by a client.
+    """
+    events: list[tuple[str, dict[str, object]]] = []
+
+    async def sink(event_type: str, payload: dict[str, object]) -> None:
+        events.append((event_type, payload))
+
+    agent = ResearchAgent(provider(), ToolRegistry([stub_tool("web_search")]))
+    ctx = AgentContext(settings=SETTINGS, emit=sink)
+
+    await agent.call_tool("web_search", {"query": "x"}, ctx)
+
+    assert events[0][1]["risk_level"] == "LOW"
+    assert events[1][1]["risk_level"] == "LOW"
+
+
+async def test_a_destructive_tool_publishes_its_critical_risk() -> None:
+    """The declared, effective risk is what is published, not the raw mode."""
+    events: list[tuple[str, dict[str, object]]] = []
+
+    async def sink(event_type: str, payload: dict[str, object]) -> None:
+        events.append((event_type, payload))
+
+    agent = CodingAgent(provider(), full_registry())
+    ctx = AgentContext(settings=SETTINGS, emit=sink)
+
+    await agent.call_tool("write_file", {"query": "x"}, ctx)
+
+    assert events[0][1]["risk_level"] == "CRITICAL"
+
+
+async def test_a_published_tool_event_carries_no_arguments() -> None:
+    """Arguments are model-authored and can hold a prompt fragment or a secret."""
+    events: list[tuple[str, dict[str, object]]] = []
+
+    async def sink(event_type: str, payload: dict[str, object]) -> None:
+        events.append((event_type, payload))
+
+    agent = ResearchAgent(provider(), ToolRegistry([stub_tool("web_search")]))
+    ctx = AgentContext(settings=SETTINGS, emit=sink)
+
+    await agent.call_tool("web_search", {"query": "top-secret-query"}, ctx)
+
+    assert "top-secret-query" not in json.dumps(events)
+
+
+async def test_a_failing_sink_does_not_fail_the_tool_call() -> None:
+    """Observability must never be able to break the work it observes."""
+
+    async def sink(event_type: str, payload: dict[str, object]) -> None:
+        raise RuntimeError("the event log is full")
+
+    agent = ResearchAgent(provider(), ToolRegistry([stub_tool("web_search")]))
+    ctx = AgentContext(settings=SETTINGS, emit=sink)
+
+    result = await agent.call_tool("web_search", {"query": "x"}, ctx)
+
+    assert result.ok is True
+
+
+async def test_a_tool_call_without_a_sink_still_works() -> None:
+    """An agent driven by a test or a script has no run to publish into."""
+    agent = ResearchAgent(provider(), ToolRegistry([stub_tool("web_search")]))
+
+    result = await agent.call_tool("web_search", {"query": "x"}, context())
+
+    assert result.ok is True
 
 
 # --------------------------------------------------------------------------- #

@@ -7,8 +7,9 @@ something outside this project.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Request, Response
+from fastapi import APIRouter, HTTPException, Request, Response, status
 
+from app.core.config import get_settings
 from app.observability.metrics import MetricRegistry
 
 __all__ = ["router"]
@@ -37,7 +38,15 @@ async def metrics(request: Request) -> Response:
         The exposition payload. Falls back to an explanatory comment rather than
         a 404 when the registry is absent, so a scraper sees a valid response
         and an operator sees why it is empty.
+
+    Raises:
+        HTTPException: 404 when ``METRICS_ENABLED`` is false. Until this check
+            existed the setting changed what ``/ready`` reported and nothing
+            else, so an operator who turned it off still served the endpoint.
     """
+    if not get_settings().metrics_enabled:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not Found")
+
     registry: MetricRegistry | None = getattr(request.app.state, "metrics", None)
     if registry is None:  # pragma: no cover - the registry is built in the lifespan
         return Response(

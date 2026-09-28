@@ -15,7 +15,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from app.core.exceptions import ConfigurationError
@@ -239,6 +239,69 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------ #
     # Validation
     # ------------------------------------------------------------------ #
+
+    @field_validator(
+        "llm_api_key",
+        "embedding_api_key",
+        "jwt_secret",
+        "github_token",
+        "search_api_key",
+        mode="after",
+    )
+    @classmethod
+    def _blank_secret_means_absent(cls, value: SecretStr | None) -> SecretStr | None:
+        """Treat an empty or whitespace-only secret as not set.
+
+        ``LLM_API_KEY=`` in a ``.env`` file is the commonest way to configure
+        nothing, and pydantic reads it as the empty string rather than as absent.
+        That difference is not cosmetic: a provider built with an empty key sends
+        ``Authorization: Bearer `` and fails at the transport layer with an error
+        about an illegal header value, which reads like a bug in the client
+        rather than a missing credential. Worse, the production validator's
+        ``is None`` checks — including the one guarding ``JWT_SECRET`` — pass for
+        an empty string, so a deployment could start believing it had a signing
+        key.
+
+        Surrounding whitespace is stripped as well: a key pasted with a trailing
+        newline would produce a header the server rejects for reasons nobody
+        enjoys diagnosing.
+
+        Args:
+            value: The parsed secret, if any.
+
+        Returns:
+            The stripped secret, or ``None`` when there was nothing in it.
+        """
+        if value is None:
+            return None
+        text = value.get_secret_value().strip()
+        return SecretStr(text) if text else None
+
+    @field_validator(
+        "llm_base_url",
+        "database_tool_url",
+        "search_api_url",
+        "otel_exporter_otlp_endpoint",
+        mode="after",
+    )
+    @classmethod
+    def _blank_url_means_unset(cls, value: str | None) -> str | None:
+        """Treat an empty or whitespace-only URL as not set.
+
+        The same failure as a blank secret, one layer on: ``DATABASE_TOOL_URL=``
+        would register the database tool against an empty target, and the tool's
+        own "is a target configured?" check is an ``is not None`` test.
+
+        Args:
+            value: The parsed URL, if any.
+
+        Returns:
+            The stripped URL, or ``None`` when there was nothing in it.
+        """
+        if value is None:
+            return None
+        text = value.strip()
+        return text or None
 
     @model_validator(mode="after")
     def _enforce_production_safety(self) -> Settings:

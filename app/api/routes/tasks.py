@@ -11,6 +11,7 @@ cannot accidentally trust a caller-supplied value.
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, status
@@ -28,9 +29,11 @@ from app.api.dependencies import (
 )
 from app.core.exceptions import DatabaseError
 from app.graph.checkpoints import thread_config
+from app.graph.nodes import event_sink_for
 from app.models.approval import ApprovalDecision, ApprovalStatus
 from app.models.execution import TaskStatus
-from app.services.task_store import TaskRecord, execute_task_with_store
+from app.services.limits import limits_for, run_limits
+from app.services.task_store import TaskRecord, execute_task_with_store, task_event_sink
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
 
@@ -215,12 +218,23 @@ async def _decide(
     principal_user: str,
     graph: Any,
     store: Any,
+    settings: Any,
 ) -> ApprovalResponse:
     """Record a human decision and resume the suspended graph.
 
     The decision is written to the durable record *before* the graph is resumed.
     If the resume then fails, the audit trail still shows who decided what and
     when, which is the fact that cannot be reconstructed.
+
+    The resumed run gets fresh execution ceilings. It is a new segment of work,
+    and it is bounded like any other: before this the resume was the one way to
+    invoke the graph with no ceiling at all. The clock deliberately restarts — a
+    human may take hours to decide, and charging that wait to the run's execution
+    time would fail every approved task.
+
+    Its events are routed to the store, as the first segment's are. Without a
+    sink a resumed run published nothing, so a client following a gated task saw
+    it fall silent at exactly the point where the action was performed.
     """
     record = await store.get_for_user(task_id, principal_user)
     if record is None:
@@ -241,7 +255,20 @@ async def _decide(
 
     from langgraph.types import Command
 
-    result = await graph.ainvoke(Command(resume=decision.value), thread_config(task_id))
+    limits = limits_for(settings)
+    publish = task_event_sink(task_id, store)
+    try:
+        with event_sink_for(publish), run_limits(limits):
+            async with asyncio.timeout(settings.max_execution_time):
+                result = await graph.ainvoke(Command(resume=decision.value), thread_config(task_id))
+    except TimeoutError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail=(
+                f"the resumed run exceeded its {settings.max_execution_time} second "
+                "execution ceiling"
+            ),
+        ) from exc
 
     final_answer = result.get("final_answer")
     await store.update(
@@ -253,6 +280,8 @@ async def _decide(
             else ApprovalStatus.REJECTED
         ),
         answer=final_answer,
+        # Added to whatever the earlier segment recorded, not written over it.
+        tool_call_count=record.tool_call_count + limits.tool_calls,
     )
 
     updated = await store.get(task_id)
@@ -277,12 +306,14 @@ async def approve_task(
     graph: GraphDep,
     store: TaskStoreDep,
     principal: PrincipalDep,
+    settings: SettingsDep,
 ) -> ApprovalResponse:
     """Approve a gated action and resume the run.
 
     Raises:
         HTTPException: 404 if the task is absent or not the caller's, 409 if it
-            is not awaiting a decision.
+            is not awaiting a decision, 504 if the resumed run outlives its
+            execution ceiling.
     """
     return await _decide(
         task_id=task_id,
@@ -291,6 +322,7 @@ async def approve_task(
         principal_user=principal.user_id,
         graph=graph,
         store=store,
+        settings=settings,
     )
 
 
@@ -301,12 +333,14 @@ async def reject_task(
     graph: GraphDep,
     store: TaskStoreDep,
     principal: PrincipalDep,
+    settings: SettingsDep,
 ) -> ApprovalResponse:
     """Reject a gated action. The action is never performed.
 
     Raises:
         HTTPException: 404 if the task is absent or not the caller's, 409 if it
-            is not awaiting a decision.
+            is not awaiting a decision, 504 if the run outlives its execution
+            ceiling.
     """
     return await _decide(
         task_id=task_id,
@@ -315,6 +349,7 @@ async def reject_task(
         principal_user=principal.user_id,
         graph=graph,
         store=store,
+        settings=settings,
     )
 
 

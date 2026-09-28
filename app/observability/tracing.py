@@ -188,6 +188,10 @@ def build_tracer(settings: Settings, *, metrics: MetricRegistry | None = None) -
     turn an observability misconfiguration into an outage, which is the wrong
     trade; silently doing nothing would hide it, which is worse.
 
+    The history size is taken from settings rather than left to the constructor's
+    default. Until it was, ``TRACE_HISTORY_SIZE`` was a setting that configured
+    nothing: an operator could lower it to bound memory and see no change.
+
     Args:
         settings: Application settings.
         metrics: Optional registry to feed span counts and durations into.
@@ -195,7 +199,11 @@ def build_tracer(settings: Settings, *, metrics: MetricRegistry | None = None) -
     Returns:
         The tracer.
     """
-    tracer = LoggingTracer(service_name=settings.otel_service_name, metrics=metrics)
+    tracer = LoggingTracer(
+        service_name=settings.otel_service_name,
+        metrics=metrics,
+        history=settings.trace_history_size,
+    )
 
     if settings.otel_exporter_otlp_endpoint:
         # Probed rather than imported: an import statement for a package that may

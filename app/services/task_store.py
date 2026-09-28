@@ -16,6 +16,7 @@ a translation layer:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from collections.abc import Callable, Sequence
@@ -37,17 +38,131 @@ from app.database.repositories import (
     UserRepository,
 )
 from app.graph.checkpoints import thread_config
-from app.graph.nodes import event_sink_for
+from app.graph.nodes import EventSink, event_sink_for
 from app.graph.state import initial_state
 from app.models.approval import ApprovalStatus
 from app.models.execution import TaskStatus
 from app.observability.metrics import MetricRegistry
 from app.observability.tracing import Tracer
 from app.services.budget import TokenBudget, budget_for, token_budget
+from app.services.limits import limits_for, run_limits
 
-__all__ = ["PostgresTaskStore", "TaskRecord", "TaskStore", "execute_task_with_store"]
+__all__ = [
+    "PostgresTaskStore",
+    "TaskRecord",
+    "TaskStore",
+    "execute_task_with_store",
+    "task_event_sink",
+]
 
 logger = logging.getLogger(__name__)
+
+
+def _count(value: object) -> int:
+    """Coerce a graph-state counter to the integer a column stores.
+
+    The state is typed as ``object`` by the time it comes back from the graph, so
+    this is the boundary where a missing or surprising value becomes zero rather
+    than a database error.
+    """
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _number(value: object) -> float:
+    """Coerce a payload number to the float a column stores."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    return float(value)
+
+
+def _text(value: object) -> str | None:
+    """Coerce a payload string, treating an empty one as absent."""
+    return value if isinstance(value, str) and value else None
+
+
+async def _mirror_audit(
+    task_id: str, event_type: str, payload: dict[str, object], store: TaskStore
+) -> None:
+    """Write the specialised row an event describes, when it describes one.
+
+    Every branch is guarded on the payload carrying what the row needs, and an
+    event that describes no row is simply ignored. A payload the graph did not
+    produce is not a reason to fail a run whose progress is already recorded in
+    the event log.
+    """
+    if event_type == "agent_started":
+        subtask = payload.get("subtask")
+        agent = payload.get("agent")
+        if isinstance(subtask, str) and isinstance(agent, str):
+            await store.record_step(
+                task_id,
+                subtask_id=subtask,
+                agent=agent,
+                description=_text(payload.get("description")) or "",
+            )
+        return
+
+    if event_type == "agent_completed":
+        subtask = payload.get("subtask")
+        if isinstance(subtask, str):
+            await store.finish_step(
+                task_id,
+                subtask_id=subtask,
+                status=_text(payload.get("status")) or "completed",
+                # The agent's own summary, and the failure kind rather than an
+                # exception message: the trail records what happened without
+                # copying a prompt fragment or a URL into it.
+                output=_text(payload.get("summary")),
+                error=_text(payload.get("reason")),
+                duration_ms=_number(payload.get("duration_ms")),
+            )
+        return
+
+    if event_type == "tool_completed":
+        tool = _text(payload.get("tool"))
+        if tool is not None:
+            await store.record_tool_call(
+                task_id,
+                tool=tool,
+                agent=_text(payload.get("agent")),
+                ok=payload.get("ok") is True,
+                risk_level=_text(payload.get("risk_level")) or "LOW",
+                approved=payload.get("approved") is True,
+                approval_required=payload.get("approval_required") is True,
+                failure_kind=_text(payload.get("failure_kind")),
+                duration_ms=_number(payload.get("duration_ms")),
+            )
+
+
+def task_event_sink(task_id: str, store: TaskStore) -> EventSink:
+    """Return the sink that records one run's progress in both trails.
+
+    Two destinations, deliberately. The append-only event log is what a client
+    streams and what a reader replays; the specialised tables are what an
+    operator queries — "which tools ran on this task, and did they work?".
+
+    Until this existed, only the first was written. ``record_step``,
+    ``finish_step``, and ``record_tool_call`` were declared, implemented, and
+    tested directly, and called by nothing at all, so three of the tables this
+    module's docstring calls the durable side trail were empty for every run this
+    system had ever executed.
+
+    The event is appended first. If mirroring then fails, the record of what
+    happened survives and only the query view is missing.
+
+    Args:
+        task_id: The task these events belong to.
+        store: The store to write into.
+
+    Returns:
+        A sink suitable for :func:`~app.graph.nodes.event_sink_for`.
+    """
+
+    async def publish(event_type: str, payload: dict[str, object]) -> None:
+        await store.append_event(task_id, event_type, payload)
+        await _mirror_audit(task_id, event_type, payload, store)
+
+    return publish
 
 
 class TaskRecord(BaseModel):
@@ -66,6 +181,11 @@ class TaskRecord(BaseModel):
     answer: str | None = None
     failure_reason: str | None = None
     route: str | None = None
+    #: Tool calls recorded against this task so far. Carried on the record because
+    #: a task can run in more than one segment — an approved action resumes the
+    #: graph after a human decides — and the later segment has to add to the
+    #: earlier count rather than replace it.
+    tool_call_count: int = 0
     approval_status: ApprovalStatus = ApprovalStatus.NOT_REQUIRED
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -170,6 +290,47 @@ class TaskStore:
         """Return every unresolved approval, oldest first."""
         return []
 
+    async def record_step(
+        self,
+        task_id: str,
+        *,
+        subtask_id: str,
+        agent: str,
+        description: str,
+        status: str = "running",
+        attempt: int = 1,
+    ) -> None:
+        """Open or update a step in the durable trail. No-op when not durable."""
+
+    async def finish_step(
+        self,
+        task_id: str,
+        *,
+        subtask_id: str,
+        status: str,
+        output: str | None = None,
+        error: str | None = None,
+        duration_ms: float = 0.0,
+    ) -> None:
+        """Close a step in the durable trail. No-op when not durable."""
+
+    async def record_tool_call(
+        self,
+        task_id: str,
+        *,
+        tool: str,
+        agent: str | None = None,
+        arguments: dict[str, object] | None = None,
+        ok: bool = False,
+        risk_level: str = "LOW",
+        approved: bool = False,
+        approval_required: bool = False,
+        error: str | None = None,
+        failure_kind: str | None = None,
+        duration_ms: float = 0.0,
+    ) -> None:
+        """Append a tool call to the audit trail. No-op when not durable."""
+
     async def counts(self) -> dict[str, int]:
         """Return task counts by status."""
         return {}
@@ -201,6 +362,7 @@ class PostgresTaskStore(TaskStore):
             answer=task.answer,
             failure_reason=task.failure_reason,
             route=task.route,
+            tool_call_count=task.tool_call_count,
             approval_status=ApprovalStatus(task.approval_status),
             created_at=task.created_at,
             updated_at=task.updated_at,
@@ -561,6 +723,7 @@ async def _execute_task(
     await store.append_event(task_id, "task_started", {"request_length": len(record.request)})
 
     budget: TokenBudget | None = None
+    limits = limits_for(settings)
     try:
         state = initial_state(
             record.request,
@@ -570,18 +733,42 @@ async def _execute_task(
             retry_limit=settings.max_retries,
         )
 
-        async def publish(event_type: str, payload: dict[str, object]) -> None:
-            await store.append_event(task_id, event_type, payload)
-
-        # Both contexts are bound to this run, not to the shared compiled graph,
-        # so two concurrent tasks never write into each other's event history or
-        # pool their token counts. The budget writes into this state's usage
-        # object, which is the same one the terminal update reads below, so the
-        # task record ends up with the real numbers rather than zeros.
+        # All three contexts are bound to this run, not to the shared compiled
+        # graph, so two concurrent tasks never write into each other's event
+        # history, pool their token counts, or share a tool-call allowance. The
+        # budget writes into this state's usage object, which is the same one the
+        # terminal update reads below, so the task record ends up with the real
+        # numbers rather than zeros.
         budget = budget_for(state, limit=settings.max_token_budget)
-        with event_sink_for(publish), token_budget(budget):
-            result = await graph.ainvoke(state, thread_config(task_id))
+        publish = task_event_sink(task_id, store)
+        with event_sink_for(publish), token_budget(budget), run_limits(limits):
+            # The hard wall-clock ceiling. The limits check the deadline at every
+            # tool call and in the dispatch loop, which lets a run finish with
+            # what it has; this is the backstop for a run that is inside one long
+            # model or tool call when the ceiling passes.
+            async with asyncio.timeout(settings.max_execution_time):
+                result = await graph.ainvoke(state, thread_config(task_id))
         record_usage(budget)
+    except TimeoutError:
+        # `asyncio.timeout` cancels the run and surfaces the expiry here. Saying
+        # so is the point: a task that stopped because it ran too long must not
+        # be reported as an unexplained failure.
+        logger.warning(
+            "task.timed_out",
+            extra={"task_id": task_id, "limit_seconds": settings.max_execution_time},
+        )
+        reason = f"the run exceeded its {settings.max_execution_time} second execution ceiling"
+        await store.update(
+            task_id,
+            status=TaskStatus.FAILED,
+            failure_reason=reason,
+            finished_at=datetime.now(UTC),
+            tool_call_count=limits.tool_calls,
+        )
+        await store.append_event(task_id, "task_failed", {"reason": reason})
+        record_usage(budget)
+        record_outcome("failed")
+        return
     except Exception as exc:
         # The class name only. An exception string can carry a prompt fragment,
         # a URL, or a credential.
@@ -592,6 +779,9 @@ async def _execute_task(
             status=TaskStatus.FAILED,
             failure_reason=reason,
             finished_at=datetime.now(UTC),
+            # Whatever the run got through before it died. A failed run is
+            # precisely the one whose consumption someone will want to see.
+            tool_call_count=limits.tool_calls,
         )
         await store.append_event(task_id, "task_failed", {"reason": reason})
         record_usage(budget)
@@ -609,6 +799,8 @@ async def _execute_task(
             status=TaskStatus.AWAITING_APPROVAL,
             approval_status=ApprovalStatus.PENDING,
             route=route_name,
+            iteration_count=_count(result.get("iteration_count")),
+            tool_call_count=limits.tool_calls,
         )
         await store.request_approval(
             task_id,
@@ -627,6 +819,12 @@ async def _execute_task(
         route=route_name,
         approval_status=approval_status or ApprovalStatus.NOT_REQUIRED,
         finished_at=datetime.now(UTC),
+        # Read from what the run actually recorded rather than left at the column
+        # default. These were always zero: nothing wrote them, so a task that made
+        # twenty tool calls reported none.
+        iteration_count=_count(result.get("iteration_count")),
+        retry_count=_count(result.get("retry_count")),
+        tool_call_count=limits.tool_calls,
         duration_ms=float(getattr(metadata, "duration_ms", 0.0) or 0.0),
         prompt_tokens=int(getattr(getattr(metadata, "usage", None), "prompt_tokens", 0) or 0),
         completion_tokens=int(

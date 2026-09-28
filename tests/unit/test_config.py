@@ -129,6 +129,72 @@ def test_api_docs_can_be_enabled_explicitly_in_any_environment() -> None:
     assert make_settings(app_env="development", api_docs_enabled=False).serve_api_docs is False
 
 
+def test_a_blank_secret_is_treated_as_absent() -> None:
+    """``LLM_API_KEY=`` in a .env file is how a person configures nothing.
+
+    pydantic reads it as the empty string, not as absent, and that difference
+    produced real bugs: a provider was built with an empty key and failed at the
+    transport layer with "Illegal header value b'Bearer '", which reads like a
+    client bug rather than a missing credential.
+    """
+    assert make_settings(llm_api_key="").llm_api_key is None
+    assert make_settings(llm_api_key="   ").llm_api_key is None
+    assert make_settings(jwt_secret="").jwt_secret is None
+    assert make_settings(github_token="\n").github_token is None
+    assert make_settings(search_api_key="").search_api_key is None
+    assert make_settings(embedding_api_key="").embedding_api_key is None
+
+
+def test_a_secret_is_trimmed_but_never_altered() -> None:
+    """A key pasted with a trailing newline would make a header a server rejects."""
+    configured = make_settings(llm_api_key="  sk-abc123  ")
+
+    assert configured.llm_api_key is not None
+    assert configured.llm_api_key.get_secret_value() == "sk-abc123"
+
+
+def test_a_blank_url_is_treated_as_unset() -> None:
+    """The same failure one layer on: an empty target is not a target.
+
+    ``DATABASE_TOOL_URL=`` would have registered the database tool, because the
+    deciding check is an ``is not None`` test.
+    """
+    assert make_settings(database_tool_url="").database_tool_url is None
+    assert make_settings(llm_base_url="  ").llm_base_url is None
+    assert make_settings(search_api_url="").search_api_url is None
+    assert (
+        make_settings(database_tool_url="postgresql://x/y").database_tool_url == "postgresql://x/y"
+    )
+
+
+def test_production_refuses_a_blank_signing_key() -> None:
+    """The hole this closed: an empty secret is truthy as an object.
+
+    ``not SecretStr("")`` is false, so the validator's ``is None`` guard passed
+    for an empty string and a deployment could start believing it had a key.
+    """
+    with pytest.raises(ConfigurationError):
+        Settings(
+            _env_file=None,
+            app_env="production",
+            auth_enabled=True,
+            trust_identity_header=False,
+            jwt_secret="",
+        )
+
+
+def test_production_refuses_a_whitespace_signing_key() -> None:
+    """Padding is not a key either."""
+    with pytest.raises(ConfigurationError):
+        Settings(
+            _env_file=None,
+            app_env="production",
+            auth_enabled=True,
+            trust_identity_header=False,
+            jwt_secret="    ",
+        )
+
+
 def test_the_operator_console_is_off_unless_it_is_asked_for() -> None:
     """A control surface must not be one environment variable away from live.
 

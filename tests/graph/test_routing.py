@@ -19,6 +19,7 @@ from app.graph.builder import (
 from app.models.agent import VerificationResult
 from app.models.approval import ApprovalStatus
 from app.schemas.plans import Plan, Route, RouteDecision, Subtask
+from app.services.limits import RunLimits, run_limits
 
 
 def plan_with(*ids: str) -> Plan:
@@ -138,6 +139,41 @@ def test_dispatch_stops_well_before_the_ceiling() -> None:
 
 def test_dispatch_handles_a_missing_plan() -> None:
     assert route_after_aggregate({"plan": None}) == "critic"  # type: ignore[arg-type]
+
+
+def test_dispatch_continues_while_the_run_has_time_left() -> None:
+    """The deadline must not stop a run that is comfortably inside it."""
+    state = {
+        "plan": plan_with("a", "b"),
+        "completed_subtasks": ["a"],
+        "iteration_count": 1,
+        "iteration_limit": 10,
+    }
+
+    with run_limits(RunLimits(max_tool_calls=10, max_seconds=30)):
+        assert route_after_aggregate(state) == "continue"  # type: ignore[arg-type]
+
+
+def test_dispatch_stops_when_the_run_outlives_its_deadline() -> None:
+    """``MAX_EXECUTION_TIME`` is the third way out of the dispatch loop.
+
+    Exiting here rather than being cancelled mid-flight lets the run answer with
+    the work it already has, which is a better outcome than a timeout. The hard
+    cancellation in the task runner is the backstop for a run that is inside a
+    single long call when the ceiling passes.
+    """
+    now = [1_000.0]
+    limits = RunLimits(max_tool_calls=10, max_seconds=30, clock=lambda: now[0])
+    now[0] += 31.0
+    state = {
+        "plan": plan_with("a", "b"),
+        "completed_subtasks": ["a"],
+        "iteration_count": 1,
+        "iteration_limit": 10,
+    }
+
+    with run_limits(limits):
+        assert route_after_aggregate(state) == "critic"  # type: ignore[arg-type]
 
 
 # --------------------------------------------------------------------------- #

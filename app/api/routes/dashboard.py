@@ -100,6 +100,7 @@ _PAGE = """<!DOCTYPE html>
     <div class="row">
       <button id="refresh" type="button">Refresh</button>
       <button id="stream" type="button">Stream selected</button>
+      <button id="stop-stream" type="button">Stop stream</button>
       <button id="approve" type="button" class="warn">Approve</button>
       <button id="reject" type="button" class="warn">Reject</button>
       <button id="cancel" type="button" class="danger">Cancel</button>
@@ -204,7 +205,7 @@ _SCRIPT = """'use strict';
 // would. The identity header is only honoured when the server has been
 // explicitly configured to trust it, and it is a development affordance, not a
 // substitute for a token.
-const state = { selected: null, source: null };
+const state = { selected: null, controller: null };
 
 function headers() {
   const identity = el('identity-input').value.trim();
@@ -367,21 +368,69 @@ function appendEvent(event) {
 }
 
 function stopStream() {
-  if (state.source) { state.source.close(); state.source = null; }
+  if (state.controller) { state.controller.abort(); state.controller = null; }
 }
 
-function startStream() {
+// Streaming uses fetch, not EventSource.
+//
+// EventSource cannot set request headers, so it cannot present the identity or
+// the bearer token the API requires. Passing them as query parameters would be
+// the obvious workaround and the wrong one: a credential in a URL leaks into
+// browser history, into the Referer of any outbound request, and into every
+// access log on the path. fetch() can send headers, and its response body is a
+// readable stream, so the frame parsing is done here instead.
+function parseFrames(buffer, onFrame) {
+  const parts = buffer.split('\n\n');
+  const remainder = parts.pop();
+  parts.forEach((part) => {
+    let payload = null;
+    part.split('\n').forEach((line) => {
+      if (line.startsWith('data:')) payload = line.slice(5).trim();
+    });
+    if (payload) onFrame(payload);
+  });
+  return remainder;
+}
+
+async function startStream() {
   if (!state.selected) { setText('submit-result', 'Select a task first.'); return; }
   stopStream();
-  const source = new EventSource(
-    '/api/v1/events/' + encodeURIComponent(state.selected) + '?identity=' +
-      encodeURIComponent(el('identity-input').value.trim())
+  const controller = new AbortController();
+  state.controller = controller;
+
+  const response = await fetch(
+    '/api/v1/events/' + encodeURIComponent(state.selected),
+    { headers: headers(), signal: controller.signal }
   );
-  source.onmessage = (message) => {
-    try { appendEvent(JSON.parse(message.data)); } catch (ignored) { /* keep going */ }
-  };
-  source.onerror = () => { stopStream(); };
-  state.source = source;
+  if (!response.ok) {
+    setText('submit-result', 'stream → ' + describeFailure(
+      { ok: false, status: response.status, body: await response.text() }
+    ));
+    stopStream();
+    return;
+  }
+
+  setText('submit-result', 'streaming ' + state.selected);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  try {
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      buffer += decoder.decode(chunk.value, { stream: true });
+      buffer = parseFrames(buffer, (payload) => {
+        try { appendEvent(JSON.parse(payload)); } catch (ignored) { /* keep going */ }
+      });
+    }
+  } catch (error) {
+    if (!controller.signal.aborted) {
+      setText('submit-result', 'stream ended: ' + error.message);
+    }
+  } finally {
+    stopStream();
+  }
 }
 
 async function decide(action) {
@@ -423,7 +472,8 @@ async function refreshMetrics() {
 
 el('submit-form').addEventListener('submit', submit);
 el('refresh').addEventListener('click', refreshTasks);
-el('stream').addEventListener('click', startStream);
+el('stream').addEventListener('click', () => { startStream(); });
+el('stop-stream').addEventListener('click', stopStream);
 el('approve').addEventListener('click', () => decide('approve'));
 el('reject').addEventListener('click', () => decide('reject'));
 el('cancel').addEventListener('click', () => decide('cancel'));

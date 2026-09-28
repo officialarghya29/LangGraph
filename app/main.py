@@ -192,7 +192,11 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         # Reversed, the discarded attempts would be invisible in the totals.
         provider: LLMProvider = RetryingProvider(
             BudgetedProvider(build_llm_provider(settings)),
-            max_retries=settings.max_retries,
+            # The provider's own retry budget, which is a different question from
+            # ``max_retries``: that one bounds how many times a run may be
+            # replanned after a failed verdict, while this bounds how many times
+            # one model call may be attempted.
+            max_retries=settings.llm_max_retries,
             # Retries are counted by kind, which is a bounded set of ten values,
             # so the series cannot be inflated by a misbehaving provider.
             on_retry=lambda attempt, kind, exc: application.state.metrics.increment(

@@ -284,6 +284,107 @@ instead of a copy of them. A copy would measure the copy.
 
 ---
 
+## Deep scan
+
+A pass with one question: **which claims in this repository are not true?** Not
+"what could be better" — that is what the three reviews above are for. The target
+was the specific failure this project warns about elsewhere: configuration,
+documentation, and tests that describe behaviour no code performs. Each finding
+below was reachable by running the system, and each was fixed rather than
+annotated.
+
+### Fixed
+
+**A ceiling that bounded nothing, twice.** `MAX_TOOL_CALLS` and
+`MAX_EXECUTION_TIME` were declared, given bounds, documented as hard ceilings in
+four places, and read by nothing — while the `TOOL_STARTED`/`TOOL_COMPLETED`
+event types, the `tool_call_count` column, and the `ExecutionLimitError` type all
+existed unused, waiting for them. A run could call tools and consume wall-clock
+time without limit.
+
+`app/services/limits.py` now holds the enforcement: a `RunLimits` in a
+`ContextVar` per run, checked at `BaseAgent.call_tool` — the single path every
+invocation passes through — and in the dispatch loop's exit condition, with a
+hard `asyncio.timeout` around the graph as the backstop for a run that is inside
+one long call when the deadline passes. Refusals happen before the work, never
+after it. Verified by `tests/unit/test_limits.py`, the ceiling cases in
+`tests/agents/test_agents.py`, and an end-to-end case in
+`tests/graph/test_graph_execution.py` where an expired run cannot perform its
+approved action and says so.
+
+**Three audit tables were empty for every run this system had ever executed.**
+`record_step`, `finish_step`, and `record_tool_call` were declared on the store,
+implemented, and tested directly — and called by no production code. The module
+docstring promising that "steps, agent runs, tool calls, approvals, and events
+land in their own tables" was two-fifths true. The run's sink now writes the
+event log *and* the specialised rows, which is why the agent announces its own
+tool calls: a worker calls tools from inside its own `run`, and the node above it
+only ever sees the result.
+
+**A count that was always zero.** `tool_call_count` and `iteration_count` were
+updatable columns that nothing updated, so a task making twenty tool calls
+reported none. Combined with the item above, this is the same disease in two
+places: a number that looks authoritative and is fictitious. The counts now come
+from the run — including a failed or timed-out run, which is precisely the run
+whose consumption someone will want to see — and the approved path *adds* its
+segment rather than replacing the earlier count.
+
+**A blank credential registered a tool that could only fail.** `GITHUB_TOKEN=`
+in a `.env` file parses as an empty secret, which is not `None`, so the registry's
+"is a token configured?" test passed and listed two GitHub tools that would fail
+authentication on first use — an error that reads like an upstream problem rather
+than a missing setting. Worse, the same distinction let a deployment start
+believing it had a `JWT_SECRET`: the production guard is an `is None` check, and
+an empty string is not `None`. Empty and whitespace-only secrets and URLs are now
+treated as absent. The API suite had pinned the resulting tool count as a literal
+`7`; the assertion now compares the gauge against discovery instead.
+
+**Two settings declared and never read.** `LLM_MAX_RETRIES` left the provider
+retrying on the graph's *replan* budget — one number doing two unrelated jobs —
+and `TRACE_HISTORY_SIZE` left the tracer at its own default. Both are wired, and
+both are asserted by reading the running object rather than the setting.
+
+**A kill switch that killed nothing.** `METRICS_ENABLED=false` changed what
+`/ready` reported and left `/metrics` serving. It now returns 404.
+
+**A console whose live stream could not work.** The dashboard's `EventSource`
+cannot set request headers, so the identity and token were dropped and the stream
+failed; passing them in the query string would have worked and would have written
+credentials into browser history, referrers, and access logs. The stream is now
+read through `fetch` with an `AbortController` — which can send headers — plus a
+Stop control. Two tests keep it honest: every element the script reaches for must
+exist, and the page must not use `EventSource` or put a credential in a URL.
+
+**Two defects found by the fixes above, not by the scan.** `RiskLevel` is an
+`IntEnum`, so publishing `.value` would have sent `1` where the `tool_calls` audit
+column requires a level *name* — rejected by its own check constraint. And a
+resumed run bound no event sink at all, so a client following a gated task saw it
+fall silent at exactly the point where the action was performed.
+
+### Verified, not a defect
+
+**`except ValueError: pass` in the SSRF check.** The one place in the codebase
+that swallows an exception, and it reads like a hole. It is the fast path that
+tries to parse the host as a literal address before resolving it through DNS: a
+`ValueError` here is the expected answer to "is this an IP, or a name?", and the
+fallback is the next statement, not a silent failure. The DNS branch that follows
+is what fails closed.
+
+### Accepted
+
+**`record_agent_run` is still called by nothing.** Per-agent token attribution is
+the reason: the budget is counted per run, and up to `MAX_PARALLEL_TASKS` agents
+run concurrently against it, so a delta taken around one agent's call measures
+whatever finished in that window rather than that agent. Wiring the method would
+write zeros into columns named `prompt_tokens` and `completion_tokens`, which is
+the defect this section exists to remove. The run-level totals are on the task
+row and are exact; per-agent totals need a provider wrapper per agent, and that
+is tracked work rather than something to fake. `agent_runs` is therefore still
+empty, and this is the one claim in the store's docstring that remains false —
+recorded here so it is not mistaken for working.
+
+---
+
 ## Verification
 
 | Phase | Scope | Status |
@@ -291,6 +392,7 @@ instead of a copy of them. A copy would measure the copy.
 | 43 | Security review | Complete — one finding fixed, one accepted and documented |
 | 44 | Performance review | Complete — one optimisation shipped, budgets asserted |
 | 45 | Architecture review | Complete — no layer violations; stale documentation corrected |
+| — | Deep scan | Complete — eleven findings fixed, one verified non-defect, one accepted and documented above |
 
 Migration verification, which was blocked alongside the container work, was
 completed without a container runtime: the revision applies to an empty database,

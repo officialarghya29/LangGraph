@@ -52,6 +52,13 @@ _API_ENV = {
     "RATE_LIMIT_REQUESTS": "10000",
     "RATE_LIMIT_WINDOW_SECONDS": "60",
     "LLM_API_KEY": "test-key",
+    # Blank, and set explicitly rather than inherited, because the registry is
+    # built from what is configured: without this the tools under test would
+    # depend on whether the machine running the suite happens to hold a GitHub
+    # token. A blank value is also the case worth pinning down, since an empty
+    # token must not register a tool that can only fail when it is called.
+    "GITHUB_TOKEN": "",
+    "SEARCH_API_URL": "",
 }
 
 
