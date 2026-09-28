@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from app.core.config import reset_settings_cache
 from tests.api.conftest import ApiHarness
 
 
@@ -239,6 +240,66 @@ def test_a_task_is_durable_not_just_in_memory(
     rows = sql("SELECT status, answer FROM tasks WHERE id = %s", (created["task_id"],))
 
     assert rows == [("completed", "the answer")]
+
+
+def test_a_task_records_the_tokens_it_actually_spent(
+    direct: ApiHarness, sql: Callable[..., list[tuple]]
+) -> None:
+    """Token accounting has to reach the database, or it is decoration.
+
+    The columns existed and were always zero: usage was parsed off every response
+    and then dropped. A test asserting only that the task completed passed
+    throughout, which is why this one asserts the numbers.
+    """
+    created = direct.client.post("/api/v1/tasks", json={"request": "do something"}).json()
+
+    rows = sql(
+        "SELECT prompt_tokens, completion_tokens FROM tasks WHERE id = %s",
+        (created["task_id"],),
+    )
+
+    assert rows, "the task should have been recorded"
+    prompt, completion = rows[0]
+    assert prompt > 0, "the routing call alone should have been counted"
+    assert completion > 0
+
+
+def test_a_spent_budget_keeps_its_own_status(
+    direct: ApiHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deliberate refusal must not be flattened into a 500.
+
+    The chat handler catches everything unexpected and reports a server error.
+    Without an explicit pass-through for :class:`AppError`, an exhausted budget
+    would arrive as a 500 — telling the caller the server broke and to retry,
+    when the truth is that this request has no allowance left and retrying will
+    fail identically.
+    """
+    monkeypatch.setenv("MAX_TOKEN_BUDGET", "1")
+    reset_settings_cache()
+    try:
+        response = direct.client.post("/api/v1/chat", json={"message": "hi"})
+    finally:
+        reset_settings_cache()
+
+    assert response.status_code == 429
+    assert "token budget" in response.json()["detail"]
+
+
+def test_a_spent_budget_fails_the_task_with_a_reason(
+    direct: ApiHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The asynchronous path has no caller to tell, so it must record instead."""
+    monkeypatch.setenv("MAX_TOKEN_BUDGET", "1")
+    reset_settings_cache()
+    try:
+        created = direct.client.post("/api/v1/tasks", json={"request": "do something"}).json()
+        fetched = direct.client.get(f"/api/v1/tasks/{created['task_id']}").json()
+    finally:
+        reset_settings_cache()
+
+    assert fetched["status"] == "failed"
+    assert fetched["failure_reason"]
 
 
 def test_task_status_endpoint(direct: ApiHarness) -> None:

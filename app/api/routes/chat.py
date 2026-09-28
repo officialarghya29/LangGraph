@@ -16,9 +16,11 @@ from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, Field
 
 from app.api.dependencies import GraphDep, PrincipalDep, SettingsDep, require_configured
+from app.core.exceptions import AppError
 from app.graph.checkpoints import thread_config
 from app.graph.state import initial_state
 from app.models.approval import ApprovalStatus
+from app.services.budget import budget_for, token_budget
 
 router = APIRouter(prefix="/api/v1", tags=["chat"])
 
@@ -77,7 +79,16 @@ async def chat(
     )
 
     try:
-        result: dict[str, Any] = await graph.ainvoke(state, thread_config(state["task_id"]))
+        # The same allowance the asynchronous path enforces. A limit that applied
+        # to one of two entry points would not be a limit.
+        with token_budget(budget_for(state, limit=settings.max_token_budget)):
+            result: dict[str, Any] = await graph.ainvoke(state, thread_config(state["task_id"]))
+    except AppError:
+        # A deliberate refusal — a spent token budget, a provider rejection, an
+        # input the graph rejected — keeps its own meaning. Converting it to a
+        # 500 here would hide a 429 behind a server error and tell the caller to
+        # retry something that will fail identically.
+        raise
     except Exception as exc:
         # The graph is designed not to raise, so this is genuinely unexpected.
         # The class name only: a message could carry a prompt fragment or a URL.

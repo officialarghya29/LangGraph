@@ -59,8 +59,9 @@ from app.graph.builder import build_all_agents, build_graph
 from app.graph.checkpoints import CheckpointHandle, open_checkpointer
 from app.observability.metrics import MetricRegistry
 from app.observability.tracing import build_tracer
+from app.services.budget import BudgetedProvider
 from app.services.cache import build_cache
-from app.services.llm import build_llm_provider
+from app.services.llm import LLMProvider, build_llm_provider
 from app.services.memory import build_memory_manager
 from app.services.task_store import PostgresTaskStore
 from app.tools.registry import build_default_registry
@@ -185,7 +186,10 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         logger.warning("startup.volatile_checkpoints")
 
     try:
-        provider = build_llm_provider(settings)
+        # Wrapped here rather than inside the factory, so every provider —
+        # including one a test substitutes later — is charged to the run's budget
+        # as long as it is wrapped before it reaches the graph.
+        provider: LLMProvider = BudgetedProvider(build_llm_provider(settings))
     except ConfigurationError as exc:
         application.state.provider = None
         application.state.provider_error = exc.message

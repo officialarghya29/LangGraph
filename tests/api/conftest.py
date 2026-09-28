@@ -26,6 +26,7 @@ from app.core.auth import issue_token
 from app.core.config import Settings, reset_settings_cache
 from app.graph.builder import build_all_agents, build_graph
 from app.main import create_app
+from app.services.budget import BudgetedProvider
 from app.services.llm import FakeLLMProvider
 from app.services.tasks import InMemoryTaskStore
 from tests.conftest import TRUNCATE_ALL
@@ -151,23 +152,28 @@ def harness(sql: Callable[..., list[tuple]]) -> Iterator[ApiHarness]:
 
     app = create_app()
     provider = FakeLLMProvider(responder=lambda messages: "{}")
+    # Wrapped exactly as the lifespan wraps the real provider, so token accounting
+    # and budget enforcement are exercised rather than bypassed by the harness.
+    # The unwrapped provider stays on the harness for rewiring, since the wrapper
+    # delegates to the same object.
+    budgeted = BudgetedProvider(provider)
 
     with TestClient(app) as client:
         # The lifespan built a real graph against the real provider path.
         # Replace only the model, so orchestration, persistence, and streaming
         # remain the genuine article.
-        app.state.provider = provider
+        app.state.provider = budgeted
         app.state.provider_error = None
         app.state.graph = build_graph(
             Settings(),
-            provider,
+            budgeted,
             app.state.tool_registry,
             checkpointer=app.state.checkpointer.saver,
             # The real, PostgreSQL-backed manager, so a recalled memory in a test
             # is a row that was genuinely written and read back.
             memory=getattr(app.state, "memory", None),
         )
-        app.state.agents = build_all_agents(provider, app.state.tool_registry)
+        app.state.agents = build_all_agents(budgeted, app.state.tool_registry)
 
         sql(TRUNCATE_ALL)
         yield ApiHarness(client, app, provider)

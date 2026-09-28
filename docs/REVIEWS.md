@@ -14,6 +14,34 @@ finding, and the difference between the two is whether someone can re-run it.
 
 ### Fixed
 
+**0. A configured limit that bounded nothing.** `MAX_TOKEN_BUDGET` was read from
+settings and never used, and the `prompt_tokens` / `completion_tokens` columns on
+tasks and agent runs were always zero: usage was parsed off every model response
+and then dropped. The README's own claim — that a bound you cannot name is not a
+bound — was false in exactly the way it warns about.
+
+Three pieces now: a `TokenBudget` accumulator, a `BudgetedProvider` decorator that
+charges every call including the router's and the critic's, and a
+`ContextVar`-scoped budget per run so two concurrent runs cannot pool their counts.
+Enforcement happens *before* a call, so a completion already paid for is not
+discarded; the run aborts loudly rather than continuing without model access and
+inventing an answer.
+
+Writing it surfaced two more defects:
+
+- **`/api/v1/chat` had no budget at all.** Only the asynchronous task path scoped
+  one, so the setting was enforceable through one of two doors. Both now build the
+  budget through one shared helper, so they cannot diverge again.
+- **The chat handler flattened deliberate refusals into 500s.** Its catch-all
+  converted every `AppError` — a spent budget, a provider rejection — into a
+  server error, telling the caller to retry something that would fail
+  identically. `AppError` now passes through to the registered handler and keeps
+  its own status.
+
+*Checked by* `tests/unit/test_budget.py`, `tests/graph/test_graph_execution.py`,
+and `tests/api/test_api.py`, which asserts the persisted token counts, the 429 on
+the chat path, and a failed task with a recorded reason.
+
 **1. The OpenAPI schema was served in every environment.**
 
 `/docs` and `/openapi.json` were enabled unconditionally. The schema is an
@@ -80,6 +108,12 @@ label, so a caller cannot mint unbounded metric series by requesting nonsense.
 
 ### Accepted risks
 
+**A provider's `Retry-After` in HTTP-date form is ignored.** The header permits
+both a delta and an absolute date, and only the delta is honoured. Converting a
+date would mean trusting the provider's clock against this machine's, where a few
+seconds of skew silently turns a short wait into a long one. Ignoring it falls
+back to the backoff curve, which at least fails in a known direction.
+
 **Child-row reads have no `LIMIT`.** `TaskStepRepository.list_for_task`,
 `AgentRunRepository.list_for_task`, and `ToolCallRepository.list_for_task` are
 bounded by `task_id` only. The graph caps iterations, tool calls, and wall-clock
@@ -100,6 +134,17 @@ unless it is switched on.
 ## Performance review
 
 ### Fixed
+
+**A throttle instruction was thrown away.** A provider that answers 429 or 503
+with `Retry-After` is saying how long to wait, and the value was discarded: the
+retry loop waited its own backoff, which for a short curve means retrying
+immediately and earning another rejection. The instruction is now parsed from the
+header and honoured as a *floor* beneath the curve, capped at a minute.
+
+*Checked by* `tests/unit/test_retry_after.py`. Writing it found an edge case in
+the first implementation: `NaN` passes a bare sign check, so a nonsense header
+would have reached `asyncio.sleep` and turned a throttle into a crash. The check
+is now an explicit finiteness test.
 
 **Memory scoring recomputed three invariant values per candidate.** Retrieval
 scans up to `memory_scan_limit` rows, and each row re-tokenised the query text,

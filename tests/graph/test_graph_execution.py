@@ -17,12 +17,13 @@ from langgraph.types import Command
 from pydantic import BaseModel
 
 from app.core.config import Settings
-from app.core.exceptions import ConfigurationError
+from app.core.exceptions import ConfigurationError, UsageLimitExceededError
 from app.graph.builder import build_graph
 from app.graph.checkpoints import thread_config
 from app.graph.state import initial_state
 from app.models.tool import AccessMode
-from app.services.llm import FakeLLMProvider
+from app.services.budget import BudgetedProvider, TokenBudget, token_budget
+from app.services.llm import FakeLLMProvider, LLMProvider
 from app.tools.base import Tool, ToolContext
 from app.tools.registry import ToolRegistry
 
@@ -233,7 +234,7 @@ def make_provider(**kwargs: Any) -> FakeLLMProvider:
     return FakeLLMProvider(responder=responder_for(**kwargs))
 
 
-def build(provider: FakeLLMProvider, registry: ToolRegistry | None = None) -> Any:
+def build(provider: LLMProvider, registry: ToolRegistry | None = None) -> Any:
     return build_graph(
         SETTINGS, provider, registry if registry is not None else workforce_registry()
     )
@@ -408,6 +409,51 @@ def test_a_plan_that_cannot_be_validated_fails_cleanly() -> None:
 
     assert result["final_answer"]
     assert result["agent_outputs"] == []
+
+
+# --------------------------------------------------------------------------- #
+# Token budget
+# --------------------------------------------------------------------------- #
+
+
+def test_a_run_is_charged_to_its_budget() -> None:
+    """The accounting has to cover the graph's own calls, not just an agent's.
+
+    Routing and answering both go through the provider, so a decorator around the
+    provider counts them without the graph knowing anything about budgets.
+    """
+    budget = TokenBudget(limit=1_000_000)
+    provider = BudgetedProvider(make_provider(route="direct"))
+
+    with token_budget(budget):
+        result = run(build(provider), "hello")
+
+    assert result["final_answer"]
+    assert budget.calls >= 2, "routing and answering are both model calls"
+    assert budget.spent > 0
+    # The budget here is standalone, so its totals are its own. That the totals
+    # also reach the task record — because the budget is handed the run's own
+    # ``execution_metadata.usage`` — is asserted end to end by the API suite,
+    # where the wiring lives.
+    assert budget.usage.total_tokens == budget.spent
+
+
+def test_a_spent_budget_aborts_the_run() -> None:
+    """An exhausted budget stops the run rather than quietly degrading it.
+
+    A run that carried on without model access would produce a plausible answer
+    built from nothing, which is the failure mode worth preventing. Aborting is
+    loud: the caller sees a usage-limit error, the task is marked failed with a
+    reason, and the token counts explaining it are already recorded.
+    """
+    budget = TokenBudget(limit=1)
+    provider = BudgetedProvider(make_provider(route="direct"))
+
+    with token_budget(budget), pytest.raises(UsageLimitExceededError) as captured:
+        run(build(provider), "hello")
+
+    assert "token budget" in str(captured.value)
+    assert budget.calls == 1, "the refusal happens before the next call, not after"
 
 
 def test_routing_failure_falls_back_to_a_direct_answer() -> None:

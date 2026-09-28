@@ -42,10 +42,23 @@ class AppError(Exception):
     #: Failure kind used by the retry policy when this error escapes.
     failure_kind: FailureKind = FailureKind.UNKNOWN
 
-    def __init__(self, message: str, *, detail: str | None = None) -> None:
+    #: Optional instruction from the failing service about how long to wait
+    #: before trying again, in seconds. A provider that says "retry in 30s" knows
+    #: something the backoff curve does not, so the retry policy honours it rather
+    #: than guessing. ``None`` means the service did not say.
+    retry_after: float | None = None
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        detail: str | None = None,
+        retry_after: float | None = None,
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.detail = detail
+        self.retry_after = retry_after
 
     def __str__(self) -> str:
         """Render the error without any sensitive payload."""

@@ -43,6 +43,7 @@ from app.models.approval import ApprovalStatus
 from app.models.execution import TaskStatus
 from app.observability.metrics import MetricRegistry
 from app.observability.tracing import Tracer
+from app.services.budget import budget_for, token_budget
 
 __all__ = ["PostgresTaskStore", "TaskRecord", "TaskStore", "execute_task_with_store"]
 
@@ -550,9 +551,13 @@ async def _execute_task(
         async def publish(event_type: str, payload: dict[str, object]) -> None:
             await store.append_event(task_id, event_type, payload)
 
-        # Bound to this run, not to the shared compiled graph, so two concurrent
-        # tasks never write into each other's event history.
-        with event_sink_for(publish):
+        # Both contexts are bound to this run, not to the shared compiled graph,
+        # so two concurrent tasks never write into each other's event history or
+        # pool their token counts. The budget writes into this state's usage
+        # object, which is the same one the terminal update reads below, so the
+        # task record ends up with the real numbers rather than zeros.
+        budget = budget_for(state, limit=settings.max_token_budget)
+        with event_sink_for(publish), token_budget(budget):
             result = await graph.ainvoke(state, thread_config(task_id))
     except Exception as exc:
         # The class name only. An exception string can carry a prompt fragment,

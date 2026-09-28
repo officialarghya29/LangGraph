@@ -15,7 +15,7 @@ import asyncio
 import json
 from abc import ABC, abstractmethod
 from collections import deque
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from enum import StrEnum
 from typing import Any, TypeVar
 
@@ -95,6 +95,37 @@ def _run_sync[R](coro: Coroutine[Any, Any, R]) -> R:
     except RuntimeError:
         return asyncio.run(coro)
     raise LLMError("synchronous provider calls are not allowed inside an event loop")
+
+
+#: Statuses where the provider is telling the client to come back later, and where
+#: a ``Retry-After`` header is meaningful.
+_THROTTLE_STATUSES = frozenset({429, 503})
+
+
+def _retry_after(headers: Mapping[str, str]) -> float | None:
+    """Return the delay the provider asked for, in seconds.
+
+    Only the numeric form is honoured. The header also permits an HTTP date, and
+    converting one would mean trusting the provider's clock relative to this
+    machine's — a skew of a few seconds would turn a short wait into a long one
+    or the reverse. A date is therefore ignored in favour of the backoff curve,
+    which at least fails in a known direction.
+
+    Args:
+        headers: The response headers.
+
+    Returns:
+        A positive number of seconds, or ``None`` when the header is absent,
+        malformed, or in a form this does not interpret.
+    """
+    raw = headers.get("retry-after")
+    if raw is None:
+        return None
+    try:
+        seconds = float(raw.strip())
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds > 0 else None
 
 
 def _strip_code_fence(text: str) -> str:
@@ -318,8 +349,12 @@ class OpenAICompatibleProvider(LLMProvider):
             if self._client is None:
                 await client.aclose()
 
-        if response.status_code == 429:
-            raise LLMRateLimitError("provider rate limited the request", detail=url)
+        if response.status_code in _THROTTLE_STATUSES:
+            raise LLMRateLimitError(
+                "provider rate limited the request",
+                detail=f"HTTP {response.status_code} from {url}",
+                retry_after=_retry_after(response.headers),
+            )
         if response.status_code >= 400:
             raise LLMError(
                 "provider returned an error",
@@ -424,8 +459,12 @@ class AnthropicProvider(LLMProvider):
             if self._client is None:
                 await client.aclose()
 
-        if response.status_code == 429:
-            raise LLMRateLimitError("provider rate limited the request", detail=url)
+        if response.status_code in _THROTTLE_STATUSES:
+            raise LLMRateLimitError(
+                "provider rate limited the request",
+                detail=f"HTTP {response.status_code} from {url}",
+                retry_after=_retry_after(response.headers),
+            )
         if response.status_code >= 400:
             raise LLMError(
                 "provider returned an error",

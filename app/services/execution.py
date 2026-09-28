@@ -12,6 +12,7 @@ repeat blindly.
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -19,10 +20,47 @@ from typing import Any
 from app.core.constants import FailureKind, backoff_delay, is_retryable
 from app.core.exceptions import classify_exception
 
-__all__ = ["RetryExhaustedError", "RetryPolicy", "retry_async"]
+__all__ = [
+    "MAX_RETRY_AFTER_SECONDS",
+    "RetryExhaustedError",
+    "RetryPolicy",
+    "retry_after_hint",
+    "retry_async",
+]
 
 #: Signature of the optional progress callback: (attempt, kind, exception).
 RetryCallback = Callable[[int, FailureKind, BaseException], None]
+
+#: Ceiling on a ``Retry-After`` instruction from a remote service, in seconds.
+#: The header is honoured because the service knows more than the backoff curve
+#: does — but only up to a point. A provider asking for an hour is, in practice,
+#: asking to fail slowly, and blocking a request that long is worse than
+#: surfacing the failure.
+MAX_RETRY_AFTER_SECONDS = 60.0
+
+
+def retry_after_hint(exc: BaseException) -> float | None:
+    """Return the service's requested delay, if it supplied a usable one.
+
+    Args:
+        exc: The failure that was just classified.
+
+    Returns:
+        A positive number of seconds, capped at :data:`MAX_RETRY_AFTER_SECONDS`,
+        or ``None`` when the failure carried no instruction.
+    """
+    hint = getattr(exc, "retry_after", None)
+    # ``isfinite`` rather than a range check: ``nan`` fails every comparison, so
+    # ``nan <= 0`` is false and a bare sign test would let it through to
+    # ``asyncio.sleep``, where it raises and turns a throttle into a crash.
+    if (
+        not isinstance(hint, int | float)
+        or isinstance(hint, bool)
+        or not math.isfinite(hint)
+        or hint <= 0
+    ):
+        return None
+    return min(float(hint), MAX_RETRY_AFTER_SECONDS)
 
 
 class RetryExhaustedError(Exception):
@@ -103,4 +141,12 @@ async def retry_async[T](
                 raise RetryExhaustedError(kind, attempt, exc) from exc
             if on_retry is not None:
                 on_retry(attempt, kind, exc)
-            await sleep(active.delay_for(kind, attempt))
+
+            # The backoff curve is the floor, not the answer: when the service
+            # said how long to wait, waiting less than that just earns another
+            # rejection.
+            delay = active.delay_for(kind, attempt)
+            hint = retry_after_hint(exc)
+            if hint is not None and hint > delay:
+                delay = hint
+            await sleep(delay)

@@ -24,7 +24,7 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 
 [![Ruff](https://img.shields.io/badge/Ruff-passing-D7FF64?style=for-the-badge&logo=ruff&logoColor=black)](#quality-gates)
 [![MyPy](https://img.shields.io/badge/MyPy-strict-2A6DB2?style=for-the-badge)](#quality-gates)
-[![Tests](https://img.shields.io/badge/tests-739%20passing-brightgreen?style=for-the-badge)](#quality-gates)
+[![Tests](https://img.shields.io/badge/tests-773%20passing-brightgreen?style=for-the-badge)](#quality-gates)
 
 [![Status](https://img.shields.io/badge/phases-34%20of%2045-yellow?style=for-the-badge)](#build-status)
 [![License](https://img.shields.io/badge/license-proprietary-red?style=for-the-badge)](#license)
@@ -41,10 +41,10 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 > — not mocks, and not a plan.
 >
 > ```console
-> $ ruff format --check .   →  130 files already formatted
+> $ ruff format --check .   →  133 files already formatted
 > $ ruff check .            →  All checks passed
-> $ mypy app scripts        →  Success: no issues found in 78 source files
-> $ pytest                  →  739 passed in 34s
+> $ mypy app scripts        →  Success: no issues found in 79 source files
+> $ pytest                  →  773 passed in 67s
 > $ python scripts/evaluate.py --quiet
 > rule-based baseline: accuracy=0.911 adversarial=0.429 macro_f1=0.920 ⟶
 >   approval_recall=1.000 p50=0.06ms p95=0.09ms
@@ -535,7 +535,10 @@ than warn.
 | `MAX_EXECUTION_TIME` | `300` | Wall-clock ceiling (seconds) |
 | `MAX_PARALLEL_TASKS` | `4` | Concurrency ceiling |
 | `MAX_RETRIES` | `3` | Retry ceiling |
+| `MAX_TOKEN_BUDGET` | `100000` | Tokens one run may spend on model calls |
 | `AUTH_ENABLED` | `true` | Authentication toggle |
+| `API_DOCS_ENABLED` | — | Serve `/docs` and the schema; unset means off in production |
+| `DASHBOARD_ENABLED` | `false` | Operator console |
 | `MEMORY_ENABLED` | `true` | Memory read and write |
 | `MEMORY_IMPORTANCE_THRESHOLD` | `0.5` | Minimum importance for a durable write |
 | `MEMORY_MIN_SCORE` | `0.15` | Retrieval floor; below this nothing is returned |
@@ -545,6 +548,28 @@ than warn.
 | `GITHUB_TOOL_ALLOW_WRITES` | `false` | GitHub write toggle |
 
 See [`.env.example`](.env.example) for the complete annotated list.
+
+### Budgets and throttling
+
+Two settings are worth explaining, because both bound behaviour that is easy to
+believe is bounded already.
+
+**`MAX_TOKEN_BUDGET` is enforced, not advisory.** Every model call is charged to
+the run's budget by a provider decorator, so the count covers the router and the
+critic as well as the agents. The budget is checked *before* each call: a call
+already paid for keeps its result, and what is prevented is starting another one.
+Both entry points — the asynchronous task path and the synchronous chat path —
+scope the same allowance, because a limit that applied to one of two doors would
+not be a limit. The totals reach the `tasks` row, so "why did this cost that" has
+an answer in the data.
+
+**A provider's `Retry-After` is honoured.** Backoff that ignores the service is
+backoff that guesses: waiting two seconds when the service asked for thirty does
+not retry sooner, it earns another rejection and spends a retry to do it. The
+instruction is treated as a floor beneath the backoff curve and capped at a
+minute, because a provider asking for an hour is in practice asking to fail
+slowly. The HTTP-date form of the header is deliberately ignored — converting it
+would mean trusting someone else's clock.
 
 ---
 
