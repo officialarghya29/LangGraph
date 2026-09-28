@@ -17,7 +17,10 @@ authors = [{ name = "Arghya Bose", email = "officialarghya29@gmail.com" }]
 # recorded in docs/TECH_STACK.md.
 dependencies = [
     "fastapi==0.141.1",
+    "httpx==0.28.1",
+    "langgraph==1.2.12",
     "pydantic==2.13.5",
+    "pydantic-settings==2.15.0",
     "uvicorn[standard]==0.54.0",
 ]
 
@@ -65,13 +68,16 @@ select = [
 ignore = [
     "D203",   # incompatible with D211
     "D213",   # incompatible with D212
+    "D107",   # constructor semantics are documented by the class docstring
 ]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "D103", "D100"]
+# Test doubles use obvious placeholder values (which trip the secret heuristics)
+# and are not a public API, so their docstrings are not enforced.
+"tests/**" = ["S101", "S105", "S106", "D100", "D101", "D102", "D103"]
 
 # --------------------------------------------------------------------------- #
 # MyPy

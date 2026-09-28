@@ -37,27 +37,34 @@ Typed state · Durable checkpointing · Human-in-the-loop approval · Provider-i
 ## Build status
 
 > [!WARNING]
-> **This repository is at Phase 0-1 of 45.** Implemented and verified: the project
-> skeleton, the dependency manifest, the quality gate, and `GET /health`.
+> **This repository is at Phase 21 of 45.** Working and verified end to end:
+> typed configuration, the LLM and embedding provider abstractions, the typed
+> graph state, the execution event model, the tool framework with its full
+> security pipeline, seven agents, the router, the planner, the critic, the
+> synthesizer, the LangGraph orchestration graph with bounded parallel dispatch
+> and classified retries, and human-in-the-loop approval with checkpoint/resume.
 >
-> Everything else documented below — the graph, agents, tools, memory,
-> checkpointing, approval workflow, authentication, and Docker stack — is
-> **designed but not yet written**. Each capability is marked `planned` in the
-> tables that follow. Nothing here is claimed to be production-ready.
+> Not yet written: the concrete tools (Phase 10), the memory manager (Phase 20),
+> durable PostgreSQL checkpointing, the HTTP API (Phase 23), authorization and
+> rate limiting, observability, Docker, and CI. Nothing here is claimed to be
+> production-ready.
+>
+> **The graph runs offline.** Tests drive the real compiled graph against a
+> deterministic fake provider, so the whole orchestration is exercised without
+> an API key or any network access.
 
 **Verified on this machine**
 
 | Gate | Command | Result |
 | :--- | :--- | :--- |
-| Formatting | `ruff format --check .` | 22 files already formatted |
+| Formatting | `ruff format --check .` | 65 files already formatted |
 | Linting | `ruff check .` | All checks passed |
-| Types | `mypy app scripts` | Success: no issues in 16 source files |
-| Tests | `pytest` | 2 passed |
-| Dependencies | `pip-audit` | No known vulnerabilities found |
+| Types | `mypy app scripts` | Success: no issues in 44 source files |
+| Tests | `pytest` | 232 passed |
 | Startup | `uvicorn app.main:app` | Application startup complete |
 | Endpoint | `curl /health` | `200 {"status":"ok"}` |
 
-**Status legend used throughout:** ✅ implemented and verified · 🔷 designed, not yet written · ⛔ blocked by a missing dependency on the host
+**Status legend used throughout:** ✅ implemented and verified · 🔶 partially implemented · 🔷 designed, not yet written · ⛔ blocked by a missing dependency on the host
 
 ---
 
@@ -119,9 +126,9 @@ runtime directly.
 | Layer | Responsibility | Status |
 | :--- | :--- | :--- |
 | **Edge / API** | HTTP surface, request validation, middleware, route handlers. Contains no business logic. | 🔷 |
-| **Orchestration** | Task lifecycle, LangGraph runtime, intent routing, planning, dispatch, criticism, synthesis. | 🔷 |
-| **Agents** | Research, coding, analysis, document, and executor agents behind a base contract. | 🔷 |
-| **Capability** | Tool registry, memory manager, checkpoint store, LLM and embedding abstractions. | 🔷 |
+| **Orchestration** | Task lifecycle, LangGraph runtime, intent routing, planning, dispatch, criticism, synthesis. | ✅ |
+| **Agents** | Research, coding, analysis, and executor agents behind a base contract. Document agent pending. | 🔶 |
+| **Capability** | Tool registry, checkpoint store, LLM and embedding abstractions. Memory manager pending. | 🔶 |
 | **Infrastructure** | PostgreSQL for durability, Redis for cache and rate limiting, event log for audit. | ⛔ |
 
 ### Directory-to-layer mapping
@@ -213,9 +220,9 @@ fashionable.
 | API framework | FastAPI | Async-native, Pydantic-validated, generates OpenAPI | ✅ |
 | ASGI server | Uvicorn | Standard FastAPI companion | ✅ |
 | Validation | Pydantic v2 | Runtime validation and the schema source for structured LLM output | ✅ |
-| Configuration | Pydantic Settings | Strongly typed config with `.env` loading | 🔷 |
-| Orchestration | LangGraph | The graph runtime this architecture is built around | 🔷 |
-| LLM integration | Provider abstraction over LangChain interfaces | Keeps agents vendor-neutral | 🔷 |
+| Configuration | Pydantic Settings | Strongly typed config with `.env` loading | ✅ |
+| Orchestration | LangGraph | The graph runtime this architecture is built around | ✅ |
+| LLM integration | Own provider abstraction; LangChain only for graph primitives | Keeps agents vendor-neutral | ✅ |
 | Database | PostgreSQL + SQLAlchemy + Alembic | Durable tasks, approvals, memory, checkpoints | ⛔ |
 | Cache / coordination | Redis | Rate limiting and short-lived coordination only | ⛔ |
 | Testing | pytest + pytest-asyncio | Async support for graph and API tests | ✅ |
@@ -231,13 +238,17 @@ Direct dependencies are pinned exactly; the full transitive set is recorded in
 | Package | Version | Scope |
 | :--- | :--- | :--- |
 | `fastapi` | 0.141.1 | runtime |
+| `langgraph` | 1.2.12 | runtime — orchestration |
 | `pydantic` | 2.13.5 | runtime |
+| `pydantic-settings` | 2.15.0 | runtime — configuration |
+| `httpx` | 0.28.1 | runtime — provider HTTP calls |
 | `uvicorn[standard]` | 0.54.0 | runtime |
 | `httpx2` | 2.13.1 | dev — test client transport |
 | `mypy` | 2.3.1 | dev |
 | `pytest` | 9.1.1 | dev |
 | `pytest-asyncio` | 1.4.0 | dev |
 | `ruff` | 0.16.9 | dev |
+| `pillow` | 12.3.0 | assets — regenerating the diagrams |
 
 > **Decision of note:** Starlette 1.7 deprecates `httpx` in favour of `httpx2`
 > for its test client. This project uses `httpx2`, and `httpx` was removed after
@@ -304,19 +315,20 @@ is never retried in a loop.
 
 | Classification | Retried? | Backoff | Status |
 | :--- | :--- | :--- | :--- |
-| `TRANSIENT` | Yes | Exponential | 🔷 |
-| `RATE_LIMIT` | Yes | Exponential, longer base | 🔷 |
-| `TIMEOUT` | Yes | Exponential | 🔷 |
-| `TOOL_FAILURE` | Yes, if idempotent | Exponential | 🔷 |
-| `MODEL_FAILURE` | Yes | Exponential | 🔷 |
-| `VALIDATION` | No | — | 🔷 |
-| `AUTHENTICATION` | No | — | 🔷 |
-| `DATABASE_FAILURE` | Yes, limited | Exponential | 🔷 |
-| `PERMANENT` | No | — | 🔷 |
-| `UNKNOWN` | Once | Fixed | 🔷 |
+| `TRANSIENT` | Yes | Exponential | ✅ |
+| `RATE_LIMIT` | Yes | Exponential, longer base | ✅ |
+| `TIMEOUT` | Yes | Exponential | ✅ |
+| `TOOL_FAILURE` | Yes, if idempotent | Exponential | ✅ |
+| `MODEL_FAILURE` | Yes | Exponential | ✅ |
+| `VALIDATION` | No | — | ✅ |
+| `AUTHENTICATION` | No | — | ✅ |
+| `DATABASE_FAILURE` | Yes, limited | Exponential | ✅ |
+| `PERMANENT` | No | — | ✅ |
+| `UNKNOWN` | Once | Fixed | ✅ |
 
-**Destructive actions are never retried automatically**, regardless of
-classification.
+Implemented in `app/core/constants.py` (classification table and backoff) and
+`app/services/execution.py` (the retry loop). **Destructive actions are never
+retried automatically**, regardless of classification.
 
 ---
 
@@ -532,14 +544,31 @@ suite runs offline and produces stable results.
 
 - [x] **Phase 0** — environment discovery
 - [x] **Phase 1** — base project, tooling, `GET /health`
-- [ ] **Phase 2** — typed configuration (Pydantic Settings)
+- [x] **Phase 2** — typed configuration (Pydantic Settings)
 - [ ] **Phase 3** — PostgreSQL models, repositories, Alembic ⛔
 - [ ] **Phase 4** — Redis cache service ⛔
-- [ ] **Phase 5** — LLM provider abstraction
-- [ ] **Phase 6** — embedding provider abstraction
-- [ ] **Phases 7-24** — state, events, tools, agents, graph, parallel execution, retries, critic, memory, checkpointing, human approval, API, streaming
-- [ ] **Phases 25-33** — authorization, rate limiting, observability, prompt injection, SSRF, filesystem, execution, database and GitHub hardening
-- [ ] **Phases 34-37** — testing, failure injection, evaluation, efficiency optimisation
+- [x] **Phase 5** — LLM provider abstraction (OpenAI, Anthropic, fake)
+- [x] **Phase 6** — embedding provider abstraction (local hashing, OpenAI)
+- [x] **Phase 7** — typed, serializable graph state
+- [x] **Phase 8** — structured execution events
+- [x] **Phase 9** — tool framework, registry, risk classification
+- [ ] **Phase 10** — concrete tools (web search, filesystem, execution, database, GitHub)
+- [ ] **Phase 11** — tool security pipeline end to end (framework done; per-tool policies pending)
+- [x] **Phase 12** — base agent contract
+- [x] **Phase 13** — planner agent
+- [x] **Phase 14** — structured intent routing
+- [x] **Phase 15** — specialist agents (research, coding, analysis, executor)
+- [x] **Phase 16** — LangGraph orchestration graph
+- [x] **Phase 17** — bounded parallel dispatch
+- [x] **Phase 18** — failure classification and retry policy
+- [x] **Phase 19** — critic agent
+- [ ] **Phase 20** — memory manager
+- [x] **Phase 21** — checkpointing and human approval ✅ (in-memory saver; durable PostgreSQL backend pending)
+- [ ] **Phase 22** — approval records persisted to the database
+- [ ] **Phase 23** — HTTP API
+- [ ] **Phase 24** — execution-event streaming
+- [ ] **Phases 25-33** — authorization, rate limiting, observability, prompt injection, SSRF, filesystem, execution, database and GitHub hardening (partial: tool risk gating and secret redaction done)
+- [ ] **Phases 34-37** — testing, failure injection, evaluation, efficiency optimisation (partial: 232 tests across state, tools, agents, routing, and graph paths)
 - [ ] **Phases 38-45** — Docker, migrations, CI/CD, documentation, control dashboard, final security/performance/architecture reviews
 
 </details>

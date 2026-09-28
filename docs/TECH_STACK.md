@@ -51,9 +51,9 @@ Measured on the development machine on 2026-09-28.
 | API framework | FastAPI | Async-native, Pydantic-validated, OpenAPI generated |
 | ASGI server | Uvicorn | Standard companion server for FastAPI |
 | Validation | Pydantic v2 | Runtime validation and settings; also the schema source for LLM structured output |
-| Configuration | Pydantic Settings | Strongly typed config with `.env` support *(Phase 2)* |
-| Orchestration | LangGraph | The graph runtime the architecture is built around *(Phase 16)* |
-| LLM integration | LangChain core interfaces, wrapped in an in-house provider abstraction | Keeps agents vendor-independent *(Phase 5)* |
+| Configuration | Pydantic Settings | Strongly typed config with `.env` support *(Phase 2 — done)* |
+| Orchestration | LangGraph | The graph runtime the architecture is built around *(Phase 16 — done)* |
+| LLM integration | In-house provider abstraction over direct HTTP. LangChain is used only for graph primitives, not for model access | Keeps agents vendor-independent, and avoids coupling the model layer to a framework's churn *(Phase 5 — done)* |
 | Database | PostgreSQL + SQLAlchemy + Alembic | Durable tasks, approvals, memory, and checkpoints *(Phases 3, 21)* |
 | Cache / coordination | Redis | Rate limiting and short-lived coordination; never sole durable storage *(Phase 4)* |
 | Testing | pytest (+ `pytest-asyncio`) | Standard; async support needed for graph and API tests |
@@ -71,8 +71,17 @@ records the full transitive set that was actually tested.
 | Package | Version | Reason |
 | --- | --- | --- |
 | `fastapi` | 0.141.1 | HTTP framework with Pydantic validation and generated OpenAPI |
+| `httpx` | 0.28.1 | HTTP client for the OpenAI and Anthropic provider adapters |
+| `langgraph` | 1.2.12 | The graph runtime: typed state, checkpoints, interrupts |
 | `pydantic` | 2.13.5 | Runtime validation; also the schema source for LLM structured output |
+| `pydantic-settings` | 2.15.0 | Typed configuration with `.env` loading |
 | `uvicorn[standard]` | 0.54.0 | ASGI server; extras add `httptools`, `uvloop`, `watchfiles`, `websockets`, `python-dotenv`, `PyYAML` |
+
+### Direct (assets)
+
+| Package | Version | Reason |
+| --- | --- | --- |
+| `pillow` | 12.3.0 | Renders the README diagrams. Build-time only |
 
 ### Direct (development only)
 

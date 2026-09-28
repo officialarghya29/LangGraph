@@ -40,12 +40,29 @@ NEXT PHASE:
 | --- | --- | --- |
 | 0 | Environment discovery | **Complete** |
 | 1 | Base project, tooling, `GET /health` | **Complete** |
-| 2 | Typed configuration (Pydantic Settings) | Not started |
+| 2 | Typed configuration (Pydantic Settings) | **Complete** |
 | 3 | PostgreSQL models, repositories, Alembic | Blocked — no PostgreSQL on host |
 | 4 | Redis cache service | Blocked — no Redis on host |
-| 5 | LLM provider abstraction | Not started |
-| 6 | Embedding provider abstraction | Not started |
-| 7-24 | State, events, tools, agents, graph, parallelism, retries, critic, memory, checkpointing, approval, API, streaming | Not started |
+| 5 | LLM provider abstraction | **Complete** |
+| 6 | Embedding provider abstraction | **Complete** |
+| 7 | Typed, serializable graph state | **Complete** |
+| 8 | Structured execution events | **Complete** |
+| 9 | Tool framework, registry, risk classification | **Complete** |
+| 10 | Concrete tools | Not started |
+| 11 | Tool security pipeline end to end | Partial — pipeline done, per-tool policies pending |
+| 12 | Base agent contract | **Complete** |
+| 13 | Planner agent | **Complete** |
+| 14 | Structured intent routing | **Complete** |
+| 15 | Specialist agents | Partial — research, coding, analysis, executor done; document agent pending |
+| 16 | LangGraph orchestration graph | **Complete** |
+| 17 | Bounded parallel dispatch | **Complete** |
+| 18 | Failure classification and retry policy | **Complete** |
+| 19 | Critic agent | **Complete** |
+| 20 | Memory manager | Not started |
+| 21 | Checkpointing and human approval | Partial — in-memory saver verified; durable PostgreSQL backend pending |
+| 22 | Persist approval records | Not started |
+| 23 | HTTP API | Not started |
+| 24 | Execution-event streaming | Not started |
 | 25-33 | Authorization, rate limiting, observability, security hardening | Not started |
 | 34-37 | Testing, failure injection, evaluation, optimization | Not started |
 | 38-39 | Docker, migration verification | Blocked — no Docker on host |
@@ -218,3 +235,91 @@ and use for model training are all expressly prohibited.
 The seven PNGs in `docs/assets/` are build artifacts of
 `scripts/generate_assets.py`. Both the script and its output are committed, so
 the diagrams can be reviewed as code and rebuilt deterministically.
+
+---
+
+## Phases 2-21 — the orchestration core
+
+```
+PHASE:              2, 5, 6, 7, 8, 9, 12, 13, 14, 15, 16, 17, 18, 19, 21
+STATUS:             Complete (15 partial: document agent pending;
+                    21 partial: durable backend pending)
+FILES CREATED:      app/core/config.py, app/core/constants.py,
+                    app/core/exceptions.py, app/services/llm.py,
+                    app/services/embeddings.py, app/services/execution.py,
+                    app/models/{tool,execution,agent,approval,memory}.py,
+                    app/schemas/{plans,events}.py, app/graph/state.py,
+                    app/graph/router.py, app/graph/nodes.py,
+                    app/graph/builder.py, app/graph/checkpoints.py,
+                    app/tools/base.py, app/tools/registry.py,
+                    app/agents/base.py, app/agents/{planner,critic,
+                    synthesizer,researcher,coder,analyst,executor}.py,
+                    tests/unit/{test_config,test_exceptions,test_llm,
+                    test_embeddings,test_state,test_plans,test_events,
+                    test_tools}.py, tests/agents/test_agents.py,
+                    tests/graph/{test_routing,test_graph_execution}.py
+FILES MODIFIED:     pyproject.toml, docs/DEVELOPMENT_PLAN.md,
+                    docs/TECH_STACK.md, README.md
+DEPENDENCIES:       Added langgraph 1.2.12, pydantic-settings 2.15.0,
+                    httpx 0.28.1 (runtime). langchain-core 1.6.5 arrives
+                    transitively with langgraph and is not imported directly.
+COMMANDS RUN:       uv pip install -e ".[dev,assets]"
+                    ruff format . && ruff check .
+                    mypy app scripts
+                    pytest
+TESTS RUN:          232 tests across unit, agents, and graph suites
+TEST RESULTS:       PASS
+                      ruff format --check ..... 65 files already formatted
+                      ruff check .............. All checks passed
+                      mypy app scripts ........ Success: no issues in 44 files
+                      pytest .................. 232 passed
+ISSUES FOUND:       1. `state.get(key) or default` treated a legitimate retry
+                       ceiling of 0 as unset, letting a retry loop run that
+                       should have been stopped.
+                    2. The executor crashed the run when its target tool was
+                       not registered.
+                    3. Class methods `effective_risk()`/`requires_approval()`
+                       read class attributes, so a test double that set the
+                       access mode per instance silently bypassed the approval
+                       gate and the test passed for the wrong reason.
+                    4. `input_model`/`output_model` declared as instance
+                       variables on a generic base could not be overridden by
+                       a subclass class attribute under strict MyPy.
+                    5. Two `str_replace` edits merged statements into
+                       docstrings, producing syntax errors.
+                    6. A blocking `time.sleep` in the fake provider serialised
+                       the very work the concurrency test measured.
+ISSUES FIXED:       All six. Notably (1) and (3) were real defects rather
+                    than test noise: both would have let work proceed that the
+                    configured limits should have stopped.
+KNOWN LIMITATIONS:  - Checkpointing uses the in-memory saver. Interrupt and
+                      resume are real, but a process restart loses in-flight
+                      runs until the PostgreSQL saver is wired up.
+                    - Concrete tools do not exist yet, so agents declare tool
+                      allow-lists that a live registry cannot yet satisfy.
+                      Calling `tools()` without registering them raises, which
+                      is the intended failure mode.
+                    - The document agent is not written.
+                    - No HTTP API yet, so the graph is reachable only from
+                      Python.
+NEXT PHASE:         10 (concrete tools), then 20 (memory), 23 (API)
+```
+
+### Design decisions recorded
+
+- **Structured output is implemented once, on the provider base class**, by
+  instructing the model to emit JSON and validating against a Pydantic schema,
+  with the validation error fed back for a bounded number of attempts. This
+  keeps structured generation identical across vendors instead of depending on
+  each vendor's tool-calling format.
+- **The tool pipeline is enforced in `Tool.execute`**, not in each tool, so no
+  individual tool can skip validation, the approval gate, or redaction.
+- **Routing flags are derived, not trusted.** `requires_planning` comes from the
+  route, and the approval route forces `requires_approval`. A model cannot
+  misclassify a request by getting one field wrong.
+- **Limits live on the state.** `iteration_limit` and `retry_limit` are copied
+  into the state at run start so the conditional-edge routing functions are pure
+  functions of state and can be tested without building a graph.
+- **The critic never rewrites.** It reports; the orchestrator decides. A failed
+  verdict retries while budget remains and then delivers anyway, with the
+  unresolved criticism passed to the synthesizer as an explicit caveat.
