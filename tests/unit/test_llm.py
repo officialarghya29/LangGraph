@@ -28,6 +28,8 @@ from app.services.llm import (
     Role,
     _extract_json,
     build_llm_provider,
+    catalogue_status,
+    closest_model_names,
     is_reasoning_model,
 )
 from app.services.resilience import RetryingProvider
@@ -887,3 +889,56 @@ async def test_structured_output_forwards_the_sampling_parameters() -> None:
     assert seen[0]["temperature"] == 0.9
     assert seen[0]["max_tokens"] == 77
     await client.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# The catalogue, and what a missing model says
+# --------------------------------------------------------------------------- #
+
+
+async def test_the_catalogue_reports_what_the_vendor_serves() -> None:
+    """Present, empty, and unavailable are three different answers."""
+    catalogue = ("gpt-6.1-sol", "gpt-6-luna")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json={"data": [{"id": name} for name in catalogue]}, request=request
+        )
+
+    provider = OpenAICompatibleProvider(api_key="k", model="gpt-6.1-sol")
+    provider._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        assert await catalogue_status(provider) == catalogue
+    finally:
+        await provider.aclose()
+
+    # A vendor that publishes no catalogue leaves the question unanswered rather
+    # than answered "no", which is the difference between silence and a warning
+    # on every deployment of a provider that does not offer one.
+    assert await catalogue_status(FakeLLMProvider()) == ()
+
+
+async def test_an_unreachable_catalogue_is_unknown_rather_than_empty() -> None:
+    """A 503 is not evidence that the model disappeared."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "down"}, request=request)
+
+    provider = OpenAICompatibleProvider(api_key="k", model="gpt-6.1-sol")
+    provider._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        assert await catalogue_status(provider) is None
+    finally:
+        await provider.aclose()
+
+
+def test_the_closest_names_name_the_likely_successor() -> None:
+    """A retired name is usually one version away from a live one."""
+    models = ("gpt-6.1-sol", "gpt-6-luna", "claude-sonnet-5-5", "text-embedding-3-small")
+
+    closest = closest_model_names("gpt-6.1-sun", models)
+
+    assert closest
+    assert closest[0] == "gpt-6.1-sol"
+    assert len(closest) <= 3
+    assert closest_model_names("nothing-like-it", ("gpt-6.1-sol",), count=3) == []

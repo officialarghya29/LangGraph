@@ -736,6 +736,16 @@ recommends Opus for "most workloads"; Sonnet is the default here because a singl
 run makes many calls (router, planner, workers, critic, synthesizer) and pays for
 each of them.
 
+**A retired model name is found at boot, not at the first paid call.** Outside
+development the process asks the vendor what it serves — one request, no tokens —
+and logs `startup.model_missing` with the nearest live names when the configured
+model is not in the list. It runs in the background, so a slow vendor delays
+nothing, and it stays silent when the question cannot be answered: a provider
+that publishes no catalogue or an endpoint that is briefly down is not evidence
+that the model disappeared, and a warning that fires on every deployment is a
+warning nobody reads. Development skips it so the test suite never needs the
+network; the CI live job is where the name is checked before it ships.
+
 ### Budgets and throttling
 
 Two settings are worth explaining, because both bound behaviour that is easy to

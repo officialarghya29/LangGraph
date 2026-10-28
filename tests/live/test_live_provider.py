@@ -28,12 +28,10 @@ one. Run it explicitly::
 
 from __future__ import annotations
 
-import difflib
-
 import pytest
 
 from app.core.config import get_settings
-from app.services.llm import Message, Role, build_llm_provider
+from app.services.llm import Message, Role, build_llm_provider, closest_model_names
 
 pytestmark = pytest.mark.live
 
@@ -81,25 +79,8 @@ async def test_the_configured_model_is_still_served() -> None:
     assert models, f"{settings.llm_provider} returned an empty model catalogue"
     assert settings.llm_model_name in models, (
         f"{settings.llm_model_name!r} is not served by {settings.llm_provider}. "
-        f"Closest names in the catalogue: {_closest(settings.llm_model_name, models)}"
+        f"Closest names in the catalogue: {closest_model_names(settings.llm_model_name, models)}"
     )
-
-
-def _closest(name: str, models: tuple[str, ...]) -> list[str]:
-    """Return the catalogue entries most similar to ``name``.
-
-    A retired name is usually one tier or one version away from a live one, so the
-    useful part of the failure message is the three nearest strings rather than a
-    list of ninety.
-
-    Args:
-        name: The configured model name.
-        models: The identifiers the vendor serves.
-
-    Returns:
-        Up to three near matches, best first; empty when nothing is close.
-    """
-    return difflib.get_close_matches(name, models, n=3, cutoff=0.4)
 
 
 async def test_the_configured_model_accepts_the_request_this_adapter_sends() -> None:

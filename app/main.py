@@ -24,9 +24,10 @@ Startup policy, which is the interesting decision here:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -40,7 +41,7 @@ from app.api.routes.events import router as events_router
 from app.api.routes.health import router as health_router
 from app.api.routes.metrics import router as metrics_router
 from app.api.routes.tasks import router as tasks_router
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.core.exceptions import (
     AppError,
     ApprovalRequiredError,
@@ -61,7 +62,12 @@ from app.observability.metrics import MetricRegistry
 from app.observability.tracing import build_tracer
 from app.services.budget import BudgetedProvider
 from app.services.cache import build_cache
-from app.services.llm import LLMProvider, build_llm_provider
+from app.services.llm import (
+    LLMProvider,
+    build_llm_provider,
+    catalogue_status,
+    closest_model_names,
+)
 from app.services.memory import build_memory_manager
 from app.services.resilience import RetryingProvider
 from app.services.task_store import PostgresTaskStore
@@ -101,6 +107,34 @@ async def app_error_handler(request: Request, exc: Exception) -> JSONResponse:
     if exc.detail:
         body["context"] = exc.detail
     return JSONResponse(status_code=status_code, content=body)
+
+
+async def _warn_if_model_is_missing(provider: LLMProvider, settings: Settings) -> None:
+    """Log a warning when the configured model is no longer served.
+
+    The commonest way a working deployment stops working is a model name that the
+    vendor retired or renamed, and the failure arrives at the first inference —
+    after being paid for — as a 404 the operator has to trace back to
+    configuration. The catalogue costs one request and no tokens, so the name is
+    checked once, in the background, and the warning names the nearest live
+    models instead of leaving the operator to guess.
+
+    Silence is the default in every other case: no catalogue, an unreachable
+    endpoint, or a provider that does not publish one is not evidence about the
+    model, and a startup that fails because a vendor was briefly down would be a
+    worse bug than the one this catches.
+    """
+    models = await catalogue_status(provider)
+    if models is None or settings.llm_model_name in models:
+        return
+    logger.warning(
+        "startup.model_missing",
+        extra={
+            "model": settings.llm_model_name,
+            "provider": settings.llm_provider,
+            "closest": ", ".join(closest_model_names(settings.llm_model_name, models)) or "none",
+        },
+    )
 
 
 @asynccontextmanager
@@ -238,6 +272,14 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         application.state.metrics.set_gauge("registered_agents", len(application.state.agents))
         logger.info("startup.graph_ready", extra={"agents": len(application.state.agents)})
 
+        # Asked in the background so a slow vendor cannot delay serving, and
+        # outside development so the test suite never needs the network: the CI
+        # live job is the place a model name is checked before it ships.
+        if settings.app_env != "development":
+            application.state.catalogue_check = asyncio.create_task(
+                _warn_if_model_is_missing(provider, settings)
+            )
+
     logger.info("startup.complete")
 
     try:
@@ -248,6 +290,13 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         # is a resource the process owns rather than one it may abandon. Closed
         # before the database so an in-flight model call fails on its own timeout
         # rather than on a closed event loop.
+        catalogue_check = getattr(application.state, "catalogue_check", None)
+        if catalogue_check is not None and not catalogue_check.done():
+            # Cancelled before the client closes, so a vendor request outstanding
+            # at shutdown fails on this cancellation rather than on a closed pool.
+            catalogue_check.cancel()
+            with suppress(asyncio.CancelledError):
+                await catalogue_check
         active_provider = getattr(application.state, "provider", None)
         if active_provider is not None:
             await active_provider.aclose()

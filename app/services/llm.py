@@ -17,7 +17,9 @@ fields are legal rather than sending a fixed shape and hoping.
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
+import logging
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Callable, Coroutine, Mapping, Sequence
@@ -31,6 +33,7 @@ from pydantic import BaseModel, ValidationError
 
 from app.core.config import Settings
 from app.core.exceptions import (
+    AppError,
     ConfigurationError,
     LLMError,
     LLMRateLimitError,
@@ -48,8 +51,12 @@ __all__ = [
     "Role",
     "TokenUsage",
     "build_llm_provider",
+    "catalogue_status",
+    "closest_model_names",
     "is_reasoning_model",
 ]
+
+logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -243,6 +250,51 @@ def _model_ids(payload: Any) -> tuple[str, ...]:
         if isinstance(entry, dict) and isinstance(entry.get("id"), str)
     ]
     return tuple(ids)
+
+
+def closest_model_names(model: str, models: Sequence[str], *, count: int = 3) -> list[str]:
+    """Return the catalogue entries most similar to a model name.
+
+    A retired name is usually one tier or one version away from a live one, so the
+    useful half of "your model is gone" is the three names it is closest to.
+
+    Args:
+        model: The configured name.
+        models: The names the vendor serves.
+        count: How many near matches to return at most.
+
+    Returns:
+        Up to ``count`` candidates, best first; empty when nothing is close.
+    """
+    return difflib.get_close_matches(model, list(models), n=count, cutoff=0.4)
+
+
+async def catalogue_status(provider: LLMProvider) -> tuple[str, ...] | None:
+    """Return what the vendor serves, or ``None`` when that cannot be known.
+
+    The tri-state is the point. An empty tuple means the vendor answered and
+    serves nothing, which is worth reporting; ``None`` means the question could
+    not be asked — no key, no endpoint, a timeout — which is not evidence about
+    the model and must not be reported as if it were.
+
+    Args:
+        provider: The provider whose catalogue to read.
+
+    Returns:
+        The served model identifiers, or ``None`` when the listing failed.
+    """
+    try:
+        models = await provider.alist_models()
+    except AppError as exc:
+        # A provider that does not expose a catalogue, or a network that will not
+        # reach it, is not a fault of this process. The first real call will
+        # report the real problem if there is one.
+        logger.debug("llm.catalogue_unavailable", extra={"reason": exc.message})
+        return None
+    except Exception as exc:  # pragma: no cover - a defect in a third-party client
+        logger.debug("llm.catalogue_failed", extra={"reason": type(exc).__name__})
+        return None
+    return models
 
 
 def _strip_code_fence(text: str) -> str:

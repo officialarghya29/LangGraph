@@ -704,6 +704,20 @@ converted every component of every candidate existed only because JSONB could
 return an integer or a string, so it is gone, and a test now asserts that the
 column refuses what the reader used to have to survive.
 
+What is left of the scan — about 45 ms — is not one thing either, which is worth
+writing down because it is the obvious place to look next and the obvious
+assumption is wrong. Split by measuring each stage separately on the same 500
+rows: 1.5 ms for the query, 15 ms for the driver decoding the vectors, 17 ms for
+SQLAlchemy building an ORM instance per row, and 8 ms for the domain model built
+from each of those. "Vector decode" is a third of it. The biggest single piece is
+the ORM, and removing it was tried: selecting the eleven columns retrieval needs,
+which `_to_item` can already consume because it reads by name, measured 36.6 ms
+against 42.2 ms — **5.6 ms, 13%, for a second read path** with its own column list
+to keep in step with the model. Reverted, and recorded here beside the other two
+rejections. What would actually move it is a vector extension or numpy: both
+change the arithmetic to something that does not round exactly like Python
+floats, which is the one property the ranking has been made to depend on.
+
 ## Verification
 
 | Phase | Scope | Status |
@@ -714,7 +728,7 @@ column refuses what the reader used to have to survive.
 | — | Deep scan | Complete — thirteen findings fixed, one verified non-defect, five settings documented and two configuration defects closed |
 | — | Deep scan, third pass | Complete — seven findings fixed, all in the model layer or found from it; two settings added, two configuration defects closed |
 | — | Deep scan, fourth pass | Complete — four findings fixed, each measured rather than assumed: 264 ms of handshake removed per model call, one database session removed per stream poll, a template line that parsed as a value, an uncalled list branch. Three of the four now have a test that fails without the fix |
-| — | Deep scan, fifth pass | Complete — four findings fixed in the paths the fourth pass opened: one query instead of one per tier, a dot product 1.7× faster with bit-identical output, a fivefold cheaper idle stream, and a live check that CI now actually runs. Three measurement defects corrected — two benchmarks and the durable figure they contradicted; two optimisations measured and rejected, both recorded so they are not re-derived; the embedding column moved from JSONB to a float array, 139–154 ms to 43–49 ms |
+| — | Deep scan, fifth pass | Complete — four findings fixed in the paths the fourth pass opened: one query instead of one per tier, a dot product 1.7× faster with bit-identical output, a fivefold cheaper idle stream, and a live check that CI now actually runs. Three measurement defects corrected — two benchmarks and the durable figure they contradicted; three optimisations measured and rejected (heap, stored norm, column-only reads), each recorded so it is not re-derived; the embedding column moved from JSONB to a float array, 139–154 ms to 43–49 ms; a startup check that names a model the vendor no longer serves |
 
 Migration verification, which was blocked alongside the container work, was
 completed without a container runtime: the revision applies to an empty database,
