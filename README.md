@@ -746,6 +746,20 @@ that the model disappeared, and a warning that fires on every deployment is a
 warning nobody reads. Development skips it so the test suite never needs the
 network; the CI live job is where the name is checked before it ships.
 
+The same answer is published to `/metrics` as `configured_model_available`,
+labelled with the provider and the model, so an alert can watch it instead of
+somebody reading logs:
+
+```console
+$ curl -s http://127.0.0.1:8000/metrics | grep configured_model_available
+configured_model_available{model="gpt-6.1-terra",provider="openai"} 1
+```
+
+`1` means the vendor still lists it, `0` means it does not, and **no series at
+all** means the catalogue could not be read. That third state is deliberate: the
+series is not created when the answer is unknown, because `0` would assert that
+the model is gone and would fire on a vendor outage as readily as on a retirement.
+
 ### Budgets and throttling
 
 Two settings are worth explaining, because both bound behaviour that is easy to

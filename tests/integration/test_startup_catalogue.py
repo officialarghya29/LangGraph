@@ -173,6 +173,15 @@ async def test_a_retired_model_is_reported_through_the_wrappers(
     assert warnings[0].__dict__["model"] == "gpt-6.1-retired"
     assert "gpt-6.1-sol" in warnings[0].__dict__["closest"]
 
+    # The verdict also has to reach the registry the exporter reads, which is the
+    # wiring a unit test cannot check: the check is handed the application's own
+    # registry by the lifespan, and a None there would leave the alert harmless
+    # and silent.
+    gauge = application.state.metrics.gauge(
+        "configured_model_available", provider="openai", model="gpt-6.1-retired"
+    )
+    assert gauge == 0.0
+
 
 async def test_development_never_calls_a_vendor_at_startup(environment: None) -> None:
     """The suite runs offline; a development boot must not reach for a catalogue."""

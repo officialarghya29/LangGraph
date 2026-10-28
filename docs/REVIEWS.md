@@ -724,9 +724,20 @@ the ORM, and removing it was tried: selecting the eleven columns retrieval needs
 which `_to_item` can already consume because it reads by name, measured 36.6 ms
 against 42.2 ms — **5.6 ms, 13%, for a second read path** with its own column list
 to keep in step with the model. Reverted, and recorded here beside the other two
-rejections. What would actually move it is a vector extension or numpy: both
-change the arithmetic to something that does not round exactly like Python
-floats, which is the one property the ranking has been made to depend on.
+rejections.
+
+numpy was then measured instead of assumed. Converting each decoded row and
+computing with `np.dot` takes **6.76 ms** for 500 rows of 128 doubles against
+**7.67 ms** for the same work in Python, and the best case — one contiguous
+matrix, which the store cannot hand over — is 7.05 ms. So the premise that numpy
+is the faster path is wrong at this size: there is no speedup to trade anything
+for, because the cost is converting the driver's lists and not the arithmetic.
+It also does not round the same way. `np.dot` accumulates in a different order,
+so 366 of 500 scores differed in the last bit (max |delta| 1.1e-16). On vectors
+that are near-copies of each other — what a re-embedded memory looks like — that
+difference reordered **all 500 positions** and changed the top ten. The property
+is not "numpy is faster and slightly less exact"; it is "numpy is not faster, and
+it forfeits the property". A vector extension would share the second half of that.
 
 ## Verification
 
@@ -738,6 +749,7 @@ floats, which is the one property the ranking has been made to depend on.
 | — | Deep scan | Complete — thirteen findings fixed, one verified non-defect, five settings documented and two configuration defects closed |
 | — | Deep scan, third pass | Complete — seven findings fixed, all in the model layer or found from it; two settings added, two configuration defects closed |
 | — | Deep scan, fourth pass | Complete — four findings fixed, each measured rather than assumed: 264 ms of handshake removed per model call, one database session removed per stream poll, a template line that parsed as a value, an uncalled list branch. Three of the four now have a test that fails without the fix |
+| — | Deep scan, sixth pass | Complete — CI had been failing on every push since September, and the first failure hid four more: a missing `asyncio` extra (greenlet), the type check run without the `assets` extra, the asset job run without the fonts the diagrams are drawn with, and a production-guard test that read `AUTH_ENABLED` from the CI environment. The live job was also green while unable to run at all: it skipped on an unreachable database, not on the absent credential. Two further findings from scanning what the suite does not pin — a rate-limit row shadowed by a shorter prefix, and two docstrings claiming a ranking effect that no column provides. The startup verdict now also reaches `/metrics` as a gauge; numpy was measured and rejected, with the tie reordering recorded |
 | — | Deep scan, fifth pass | Complete — four findings fixed in the paths the fourth pass opened: one query instead of one per tier, a dot product 1.7× faster with bit-identical output, a fivefold cheaper idle stream, and a live check that CI now actually runs. Three measurement defects corrected — two benchmarks and the durable figure they contradicted; three optimisations measured and rejected (heap, stored norm, column-only reads), each recorded so it is not re-derived; the embedding column moved from JSONB to a float array, 139–154 ms to 43–49 ms; a startup check that names a model the vendor no longer serves |
 
 Migration verification, which was blocked alongside the container work, was

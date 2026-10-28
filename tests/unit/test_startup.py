@@ -16,6 +16,7 @@ import pytest
 
 from app.core.config import Settings
 from app.main import _warn_if_model_is_missing
+from app.observability.metrics import MetricRegistry
 from app.services.llm import FakeLLMProvider, LLMError
 
 
@@ -71,6 +72,33 @@ async def test_a_served_model_is_not_warned_about(caplog: pytest.LogCaptureFixtu
         await _warn_if_model_is_missing(provider, settings_for("gpt-6.1-sol"))  # type: ignore[arg-type]
 
     assert caplog.text == ""
+
+
+async def _gauge_for(models: tuple[str, ...] | None, configured: str) -> float | None:
+    """Return the gauge the check published for one scenario."""
+    registry = MetricRegistry()
+    await _warn_if_model_is_missing(  # type: ignore[arg-type]
+        Catalogue(models), settings_for(configured), registry
+    )
+    return registry.gauge("configured_model_available", provider="openai", model=configured)
+
+
+async def test_a_served_model_publishes_one() -> None:
+    """An alert needs a series to watch, not only a log line to read."""
+    assert await _gauge_for(("gpt-6.1-sol",), "gpt-6.1-sol") == 1.0
+
+
+async def test_a_retired_model_publishes_zero() -> None:
+    assert await _gauge_for(("gpt-6.1-sol",), "gpt-6.1-sun") == 0.0
+
+
+async def test_an_unreadable_catalogue_leaves_the_gauge_unset() -> None:
+    """Absent is not zero: nobody asked, so nothing was established.
+
+    Publishing ``0`` here would make a vendor outage indistinguishable from a
+    retired model, and the alert this exists for would fire on both.
+    """
+    assert await _gauge_for(None, "gpt-6.1-sol") is None
 
 
 async def test_a_catalogue_that_cannot_be_read_is_not_a_verdict(

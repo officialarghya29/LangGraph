@@ -109,7 +109,11 @@ async def app_error_handler(request: Request, exc: Exception) -> JSONResponse:
     return JSONResponse(status_code=status_code, content=body)
 
 
-async def _warn_if_model_is_missing(provider: LLMProvider, settings: Settings) -> None:
+async def _warn_if_model_is_missing(
+    provider: LLMProvider,
+    settings: Settings,
+    metrics: MetricRegistry | None = None,
+) -> None:
     """Log a warning when the configured model is no longer served.
 
     The commonest way a working deployment stops working is a model name that the
@@ -119,13 +123,37 @@ async def _warn_if_model_is_missing(provider: LLMProvider, settings: Settings) -
     checked once, in the background, and the warning names the nearest live
     models instead of leaving the operator to guess.
 
+    The answer is also published as ``configured_model_available`` so an alert can
+    watch it: a log line is only noticed by someone reading logs. The series is
+    labelled with the provider and the model, both of which are low-cardinality
+    and change once per deployment.
+
     Silence is the default in every other case: no catalogue, an unreachable
     endpoint, or a provider that does not publish one is not evidence about the
     model, and a startup that fails because a vendor was briefly down would be a
-    worse bug than the one this catches.
+    worse bug than the one this catches. When the catalogue cannot be read the
+    gauge is left unset rather than set to zero — an absent series means nobody
+    has asked, where ``0`` would assert that the model is gone.
+
+    Args:
+        provider: The provider whose catalogue to read, as wrapped by the
+            lifespan.
+        settings: The configuration naming the model to look for.
+        metrics: The registry to publish the verdict to, when one exists.
     """
     models = await catalogue_status(provider)
-    if models is None or settings.llm_model_name in models:
+    if models is None:
+        return
+
+    available = settings.llm_model_name in models
+    if metrics is not None:
+        metrics.set_gauge(
+            "configured_model_available",
+            1.0 if available else 0.0,
+            provider=settings.llm_provider,
+            model=settings.llm_model_name,
+        )
+    if available:
         return
     logger.warning(
         "startup.model_missing",
@@ -277,7 +305,7 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         # live job is the place a model name is checked before it ships.
         if settings.app_env != "development":
             application.state.catalogue_check = asyncio.create_task(
-                _warn_if_model_is_missing(provider, settings)
+                _warn_if_model_is_missing(provider, settings, application.state.metrics)
             )
 
     logger.info("startup.complete")
