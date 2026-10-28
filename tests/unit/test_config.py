@@ -331,8 +331,17 @@ def test_production_rejects_disabled_auth() -> None:
 
 
 def test_production_requires_a_jwt_secret() -> None:
+    """Built through the helper, so the other invariants are satisfied explicitly.
+
+    This test used to pass ``app_env`` and ``trust_identity_header`` and let
+    ``auth_enabled`` come from wherever it came from. That is the process
+    environment: the CI job exports ``AUTH_ENABLED=false``, so the guard fired on
+    authentication first and the assertion about the secret never ran — a test
+    that passes on a developer machine and fails on every runner, in a job that
+    was already failing for a different reason, which is how it stayed invisible.
+    """
     with pytest.raises(ConfigurationError, match="JWT_SECRET"):
-        make_settings(app_env="production", trust_identity_header=False)
+        safe_production(jwt_secret=None)
 
 
 def test_production_rejects_a_trusted_identity_header() -> None:

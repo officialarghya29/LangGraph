@@ -26,7 +26,13 @@ dependencies = [
     # driver behind the `postgresql+asyncpg` scheme the engine builder requires;
     # it is named explicitly rather than left to the dialect, because a missing
     # driver is a startup failure, not an optional feature.
-    "sqlalchemy==2.1.1",
+    #
+    # The `asyncio` extra is what pulls in greenlet, and `sqlalchemy.ext.asyncio`
+    # refuses to import without it. It was installed by hand on the development
+    # machine, so nothing here missed it; CI did, and failed at the first import
+    # of the engine. Naming the extra is the difference between "it works here"
+    # and "it installs".
+    "sqlalchemy[asyncio]==2.1.1",
     "asyncpg==0.31.0",
     "alembic==1.20.0",
     # The durable checkpointer. Its separate distribution is what makes a run

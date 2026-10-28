@@ -1197,7 +1197,10 @@ cd LangGraph
 
 uv venv --python 3.12 .venv
 source .venv/bin/activate
-uv pip install -e ".[dev]"
+# `assets` is installed too because the type check covers scripts/, and the
+# diagram generator imports Pillow. Without it, `mypy app scripts` reports the
+# import as missing and then fails again on the value that became `Any`.
+uv pip install -e ".[dev,assets]"
 
 cp .env.example .env
 ```

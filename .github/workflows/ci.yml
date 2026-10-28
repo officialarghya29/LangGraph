@@ -41,10 +41,15 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           enable-cache: true
 
+      # `assets` as well as `dev`: the type check below covers `scripts/`, and the
+      # diagram generator imports Pillow. A runner that installs only `dev`
+      # reports `PIL` as a missing import and then fails a second time on the
+      # `Any` that the missing import made of every value it returned — two errors
+      # with one cause, and neither of them a defect in the code.
       - name: Install
         run: |
           uv venv
-          uv pip install -e ".[dev]"
+          uv pip install -e ".[dev,assets]"
 
       - name: Formatting
         run: .venv/bin/ruff format --check .
@@ -190,10 +195,13 @@ jobs:
   live:
     name: Live provider
     # Not on pull requests: a fork has no access to the secret, so the job would
-    # skip every time and report a green check that never tested anything. The
-    # suite skips itself when the credential is empty, which is what makes this
-    # safe to run on a repository that has not configured one — it reports a
-    # skip, not a pass.
+    # skip every time and report a green check that never tested anything.
+    #
+    # With no credential configured the suite skips, and a skipped suite exits
+    # zero — GitHub shows this job green either way, so the step below announces
+    # the absence out loud instead of letting a green check imply a real call.
+    # The step itself still passes: an unconfigured secret on a public repository
+    # is a missing configuration, not a broken build.
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -218,7 +226,11 @@ jobs:
           uv pip install -e ".[dev]"
 
       - name: One real call
-        run: .venv/bin/python -m pytest -m live -q -rs
+        run: |
+          if [ -z "$LLM_API_KEY" ]; then
+            echo "::warning title=Live provider not exercised::LLM_API_KEY is empty, so all three live tests skip. This job proves nothing until OPENAI_API_KEY is set as a repository secret."
+          fi
+          .venv/bin/python -m pytest -m live -q -rs
 
   # ------------------------------------------------------------------------- #
   # The committed diagrams must match the script that generates them
@@ -239,6 +251,16 @@ jobs:
         run: |
           uv venv
           uv pip install -e ".[assets]"
+
+      # The generator draws with the Ubuntu font family, which is present on a
+      # desktop Ubuntu install and absent from the runner image. Without this the
+      # script dies inside Pillow with `OSError: cannot open resource`, which
+      # reads like a corrupt asset rather than a missing font. The package is
+      # what puts the exact files the script names at /usr/share/fonts/truetype.
+      - name: Install the fonts the diagrams are drawn with
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends fonts-ubuntu
 
       # The asset script audits its own layout and exits non-zero on overlapping
       # or overflowing labels, so this step fails for a drawing defect as well as
