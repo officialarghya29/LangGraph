@@ -148,8 +148,8 @@ RATE_LIMIT_POLICIES: tuple[tuple[str, str, int], ...] = (
 )
 
 
-def _policy_for(method: str, path: str) -> int | None:
-    """Return the multiplier for a request, or ``None`` when it is unlimited.
+def _match_policy(method: str, path: str) -> tuple[str, int] | None:
+    """Return the most specific policy for a request, as ``(prefix, multiplier)``.
 
     The **longest** matching prefix wins, not the first one listed. First-match
     made ``POST /api/v1/tasks/`` unreachable: ``/api/v1/tasks/{id}/approve``
@@ -158,16 +158,29 @@ def _policy_for(method: str, path: str) -> int | None:
     budget for decisions never existed. Ordering the table carefully would fix
     the symptom and leave the next entry to be broken the same way; matching by
     specificity makes the table order-insensitive.
+
+    Args:
+        method: The request method.
+        path: The request path.
+
+    Returns:
+        The matched prefix and its multiplier, or ``None`` when unlimited.
     """
-    best: int | None = None
-    best_length = -1
+    best: tuple[str, int] | None = None
     for expected_method, prefix, multiplier in RATE_LIMIT_POLICIES:
         if expected_method not in {"*", method}:
             continue
-        if path.startswith(prefix) and len(prefix) > best_length:
-            best = multiplier
-            best_length = len(prefix)
+        if not path.startswith(prefix):
+            continue
+        if best is None or len(prefix) > len(best[0]):
+            best = (prefix, multiplier)
     return best
+
+
+def _policy_for(method: str, path: str) -> int | None:
+    """Return the multiplier for a request, or ``None`` when it is unlimited."""
+    match = _match_policy(method, path)
+    return None if match is None else match[1]
 
 
 def _identity(scope: Scope, settings: Settings) -> str:
@@ -216,11 +229,12 @@ class RateLimitMiddleware:
         settings = get_settings()
         path = str(scope.get("path", ""))
         method = str(scope.get("method", ""))
-        multiplier = _policy_for(method, path)
+        policy = _match_policy(method, path)
 
-        if multiplier is None:
+        if policy is None:
             await self.app(scope, receive, send)
             return
+        prefix, multiplier = policy
 
         application = scope.get("app")
         cache: Cache | None = getattr(getattr(application, "state", None), "cache", None)
@@ -229,9 +243,12 @@ class RateLimitMiddleware:
             return
 
         limit = settings.rate_limit_requests * multiplier
-        identity = (
-            f"{method}:{path.split('/')[3] if '/' in path else 'root'}:{_identity(scope, settings)}"
-        )
+        # Keyed by the policy that matched, not by a path segment. The segment
+        # was ``tasks`` for both creating a task and deciding one, so the two
+        # operations counted against one counter while applying two different
+        # limits: whichever request came last decided whether the other was
+        # refused, and "approvals are cheaper" was unenforceable by construction.
+        identity = f"{method}:{prefix}:{_identity(scope, settings)}"
 
         try:
             allowed, remaining = await cache.check_rate_limit(

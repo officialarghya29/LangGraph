@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.api.middleware import RATE_LIMIT_POLICIES, _policy_for
+from app.api.middleware import RATE_LIMIT_POLICIES, _match_policy, _policy_for
 
 
 def test_creating_a_task_gets_the_ordinary_budget() -> None:
@@ -37,6 +37,22 @@ def test_a_method_only_matches_its_own_policy() -> None:
     """Creating by GET would otherwise inherit the creation budget's limit."""
     assert _policy_for("GET", "/api/v1/tasks") is None
     assert _policy_for("POST", "/api/v1/events/abc") is None
+
+
+def test_creating_and_deciding_count_against_different_budgets() -> None:
+    """One counter per policy, or the two limits fight over the same count.
+
+    The bucket used to be a path segment, which is ``tasks`` for both, so a
+    client's approvals spent its creation budget and the doubled allowance for
+    decisions was unenforceable whatever multiplier was configured.
+    """
+    created = _match_policy("POST", "/api/v1/tasks")
+    approved = _match_policy("POST", "/api/v1/tasks/abc/approve")
+    streamed = _match_policy("GET", "/api/v1/events/abc")
+
+    assert created is not None and approved is not None and streamed is not None
+    scopes = {created[0], approved[0], streamed[0]}
+    assert len(scopes) == 3, scopes
 
 
 def test_every_row_resolves_to_itself() -> None:
