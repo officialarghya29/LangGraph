@@ -218,7 +218,14 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         # intended model is the one running.
         logger.info(
             "startup.model_ready",
-            extra={"provider": settings.llm_provider, "model": settings.llm_model_name},
+            extra={
+                "provider": settings.llm_provider,
+                "model": settings.llm_model_name,
+                # Included because it is the one sampling setting that can be set
+                # and still not travel: it is sent only to a model that reasons.
+                # Logged next to the model, which is what decides that.
+                "reasoning_effort": settings.llm_reasoning_effort or "vendor-default",
+            },
         )
         application.state.graph = build_graph(
             settings,
@@ -237,6 +244,13 @@ async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         yield
     finally:
         logger.info("shutdown.begin")
+        # The provider holds a pooled HTTP client once it has made a call, which
+        # is a resource the process owns rather than one it may abandon. Closed
+        # before the database so an in-flight model call fails on its own timeout
+        # rather than on a closed event loop.
+        active_provider = getattr(application.state, "provider", None)
+        if active_provider is not None:
+            await active_provider.aclose()
         executor = getattr(application.state, "sql_executor", None)
         if executor is not None:
             await executor.close()

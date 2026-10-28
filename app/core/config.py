@@ -26,6 +26,7 @@ __all__ = [
     "DEFAULT_LLM_MODELS",
     "AppEnv",
     "LogLevel",
+    "ReasoningEffortName",
     "Settings",
     "get_settings",
     "reset_settings_cache",
@@ -35,6 +36,16 @@ AppEnv = Literal["development", "staging", "production"]
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
 LLMProviderName = Literal["openai", "anthropic", "local"]
 EmbeddingProviderName = Literal["local", "openai"]
+
+#: Reasoning-effort values the OpenAI-compatible endpoint accepts.
+#:
+#: The union, not a per-model matrix: which of these a given model allows is
+#: documented per model, and it changes between point releases — ``gpt-6-astra``
+#: rejects ``none`` outright with a 400, while ``gpt-6.1-terra`` accepts it. A
+#: matrix copied into this file would be wrong on the next release and would then
+#: reject a value the vendor accepts, so the choice is validated for shape here and
+#: left to the vendor to enforce for the configured model.
+ReasoningEffortName = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 
 #: Model a provider is called with when the operator does not name one.
 #:
@@ -116,6 +127,16 @@ class Settings(BaseSettings):
     #: model is spent on the model's own reasoning and starves the answer, and the
     #: right value depends entirely on which model is configured.
     llm_max_output_tokens: int | None = Field(default=None, ge=1, le=200_000)
+    #: How hard the model is asked to think before answering, on the providers that
+    #: expose the choice. Unset means the vendor's own default, which is documented
+    #: per model (``medium`` for the shipped OpenAI default) and is the only value
+    #: that stays right across a lineup the operator does not control.
+    #:
+    #: Sent only to a model that is known to reason: an ordinary model rejects the
+    #: field, and a local server may reject any field it does not implement. That
+    #: makes it a setting which can be set and still not travel — so the resolved
+    #: value is logged at start-up, next to the model it applies to.
+    llm_reasoning_effort: ReasoningEffortName | None = None
 
     # --- Embeddings -------------------------------------------------------- #
     embedding_provider: EmbeddingProviderName = "local"
@@ -407,6 +428,34 @@ class Settings(BaseSettings):
             return None
         return value
 
+    @field_validator("llm_reasoning_effort", mode="before")
+    @classmethod
+    def _normalise_effort(cls, value: object) -> object:
+        """Lowercase the effort, and read a blank one as unset.
+
+        Both belong before coercion. ``HIGH`` is not one of the ``Literal`` members,
+        so a validator that ran afterwards would never see it: the type check
+        rejects it first, with a message about an invalid value rather than about
+        capitalisation. And ``LLM_REASONING_EFFORT=`` is how the template ships it,
+        which is not a member at all — the same defect as ``API_DOCS_ENABLED=`` and
+        ``LLM_MAX_OUTPUT_TOKENS=``, on a setting added after both were fixed.
+
+        An endpoint rejects ``HIGH`` with the same class of error it uses for an
+        unknown value, and the environment is exactly where a shouted value comes
+        from. Matching the documented spelling is cheap; diagnosing a 400 caused by
+        a value that differs only in case is not.
+
+        Args:
+            value: The raw input, before type coercion.
+
+        Returns:
+            ``None`` for blank input, otherwise the trimmed lowercase text.
+        """
+        if isinstance(value, str):
+            text = value.strip().lower()
+            return text or None
+        return value
+
     @field_validator(
         "app_name",
         "otel_service_name",
@@ -474,6 +523,32 @@ class Settings(BaseSettings):
                 "PYTHON_EXECUTION_ENABLED requires a sandbox, and none is configured"
             )
 
+        return self
+
+    @model_validator(mode="after")
+    def _reasoning_effort_has_somewhere_to_go(self) -> Settings:
+        """Refuse a reasoning-effort setting the chosen provider cannot carry.
+
+        ``reasoning_effort`` is an OpenAI-compatible request field. The Anthropic
+        Messages API has no equivalent — its thinking control is a token budget on
+        a ``thinking`` block, not a named tier — so setting the effort alongside
+        ``LLM_PROVIDER=anthropic`` configures nothing and says nothing: accepted by
+        the settings layer, absent from every request, and discovered only by
+        reading the adapter. Refusing at construction is the same choice this file
+        makes for every other setting that only one vendor understands.
+
+        Returns:
+            The validated settings.
+
+        Raises:
+            ConfigurationError: If the effort is set for a provider without the
+                field.
+        """
+        if self.llm_reasoning_effort and self.llm_provider == "anthropic":
+            raise ConfigurationError(
+                "LLM_REASONING_EFFORT is an OpenAI-compatible request field and has "
+                "no effect with LLM_PROVIDER=anthropic"
+            )
         return self
 
     @property

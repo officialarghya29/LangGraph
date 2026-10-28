@@ -150,4 +150,5 @@ addopts = "-ra --strict-markers --strict-config"
 markers = [
     "integration: requires external services (PostgreSQL, Redis)",
     "evaluation: benchmark and quality evaluation cases",
+    "live: calls a real vendor endpoint; skips unless a credential is configured",
 ]

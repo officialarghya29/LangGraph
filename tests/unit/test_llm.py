@@ -17,6 +17,7 @@ from app.core.exceptions import (
     LLMTimeoutError,
     StructuredOutputError,
 )
+from app.services.budget import BudgetedProvider
 from app.services.llm import (
     AnthropicProvider,
     FakeLLMProvider,
@@ -28,6 +29,7 @@ from app.services.llm import (
     build_llm_provider,
     is_reasoning_model,
 )
+from app.services.resilience import RetryingProvider
 
 
 class Verdict(BaseModel):
@@ -438,9 +440,43 @@ def test_the_factory_passes_the_sampling_settings_to_the_provider() -> None:
     assert provider.default_max_tokens == 1234
 
 
+def test_the_factory_passes_the_reasoning_effort_to_the_provider() -> None:
+    """Third of the three sampling settings, and the newest: read nowhere else."""
+    settings = build_settings(
+        llm_provider="openai", llm_api_key="key", llm_reasoning_effort="xhigh"
+    )
+
+    assert build_llm_provider(settings).default_reasoning_effort == "xhigh"
+
+
 # --------------------------------------------------------------------------- #
 # Sampling parameters the target model will accept
 # --------------------------------------------------------------------------- #
+
+
+def _ok_handler(request: httpx.Request) -> httpx.Response:
+    """Answer any request with a well-formed completion."""
+    return httpx.Response(200, json=openai_ok_body(), request=request)
+
+
+def pooled_clients(monkeypatch: pytest.MonkeyPatch) -> list[httpx.AsyncClient]:
+    """Record every client a provider builds for itself.
+
+    Patching the class rather than injecting a client is the point: an injected
+    client is not owned by the provider, and ownership is what these tests are
+    about. The list is returned so a test can assert both how many were built and
+    whether they were closed.
+    """
+    original = httpx.AsyncClient
+    built: list[httpx.AsyncClient] = []
+
+    def counting(**kwargs: object) -> httpx.AsyncClient:
+        client = original(transport=httpx.MockTransport(_ok_handler), **kwargs)
+        built.append(client)
+        return client
+
+    monkeypatch.setattr(httpx, "AsyncClient", counting)
+    return built
 
 
 def anthropic_ok_body(content: str = "hello") -> dict[str, object]:
@@ -497,6 +533,7 @@ async def openai_body(
     call_max_tokens: int | None = None,
     provider_temperature: float = 0.0,
     provider_max_tokens: int | None = None,
+    provider_effort: str | None = None,
 ) -> dict[str, object]:
     """Return the body an OpenAI-compatible call to ``model`` sends."""
     return await _capture(
@@ -507,6 +544,7 @@ async def openai_body(
             client=client,
             default_temperature=provider_temperature,
             default_max_tokens=provider_max_tokens,
+            default_reasoning_effort=provider_effort,
         ),
         call_temperature=call_temperature,
         call_max_tokens=call_max_tokens,
@@ -590,6 +628,134 @@ async def test_an_ordinary_model_keeps_both_parameters() -> None:
     assert body["temperature"] == 0.4
     assert body["max_tokens"] == 512
     assert "max_completion_tokens" not in body
+
+
+async def test_consecutive_calls_share_one_http_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A client per call pays a TLS handshake per call.
+
+    Measured against a real endpoint, a fresh client cost about 110 ms more per
+    request than a reused one. A run makes five or more model calls, so the old
+    behaviour spent half a second of every run on handshakes that a kept client
+    does once.
+    """
+    built = pooled_clients(monkeypatch)
+    provider = OpenAICompatibleProvider(api_key="k", model="gpt-4o-mini")
+    try:
+        await provider.ainvoke(user("one"))
+        await provider.ainvoke(user("two"))
+
+        assert len(built) == 1, "a client was built per call rather than kept"
+        assert built[0].is_closed is False
+    finally:
+        await provider.aclose()
+
+    assert built[0].is_closed, "shutdown left the pooled client open"
+
+
+async def test_a_provider_that_owns_its_client_releases_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An owned pool is a resource the process must not simply abandon."""
+    built = pooled_clients(monkeypatch)
+    provider = AnthropicProvider(api_key="k", model="claude-sonnet-5-5")
+
+    await provider.ainvoke(user("one"))
+    owned = provider._client
+    assert built == [owned]
+    assert owned is not None
+
+    await provider.aclose()
+
+    assert owned.is_closed
+    assert provider._client is None, "a closed client must not be reused"
+
+
+async def test_a_client_supplied_by_the_caller_is_not_closed() -> None:
+    """Ownership: closing someone else's client breaks the next user of it."""
+    client = httpx.AsyncClient(transport=httpx.MockTransport(_ok_handler))
+    provider = OpenAICompatibleProvider(api_key="k", model="gpt-4o-mini", client=client)
+
+    await provider.ainvoke(user("one"))
+    await provider.aclose()
+
+    assert client.is_closed is False
+    await client.aclose()
+
+
+async def test_closing_twice_is_harmless(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Shutdown paths are not always reached once."""
+    pooled_clients(monkeypatch)
+    provider = OpenAICompatibleProvider(api_key="k", model="gpt-4o-mini")
+    await provider.ainvoke(user("one"))
+
+    await provider.aclose()
+    await provider.aclose()
+
+    assert provider._client is None
+
+
+async def test_the_wrappers_release_the_pool_they_wrapped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The object the application holds is always a wrapper, never the provider.
+
+    Decompiled naively, shutdown would hold a :class:`RetryingProvider`, and a
+    wrapper that did not delegate would leave the pool open for the life of the
+    process — which is exactly the leak the pooling replaced with a smaller one.
+    """
+    pooled_clients(monkeypatch)
+    inner = OpenAICompatibleProvider(api_key="k", model="gpt-4o-mini")
+    await inner.ainvoke(user("one"))
+    pooled = inner._client
+    assert pooled is not None
+
+    wrapped = RetryingProvider(BudgetedProvider(inner), sleep=lambda _seconds: None)
+    await wrapped.aclose()
+
+    assert pooled.is_closed
+
+
+async def test_a_configured_effort_reaches_a_reasoning_model() -> None:
+    """``LLM_REASONING_EFFORT`` is a setting nothing else can express.
+
+    Without it every call to the shipped default runs at the model's documented
+    ``medium``, which is a reasonable floor and useless as a lever: the difference
+    between a router choosing a worker and a critic deciding whether to accept the
+    work is entirely in how much thinking is permitted.
+    """
+    body = await openai_body("gpt-6.1-sol", provider_effort="high")
+
+    assert body["reasoning_effort"] == "high"
+
+
+async def test_an_effort_is_not_sent_to_a_model_that_does_not_reason() -> None:
+    """An ordinary model rejects the field rather than ignoring it.
+
+    The setting stays configured and does not travel, which is the case the
+    start-up log exists to make visible.
+    """
+    body = await openai_body("gpt-4o-mini", provider_effort="high")
+
+    assert "reasoning_effort" not in body
+
+
+async def test_no_effort_is_sent_unless_it_is_configured() -> None:
+    """Unset means the model's own default, not a value this module invents."""
+    body = await openai_body("gpt-6.1-sol")
+
+    assert "reasoning_effort" not in body
+
+
+async def test_the_decorators_carry_the_effort_they_wrapped() -> None:
+    """A wrapper that dropped it would make the setting depend on composition."""
+    inner = OpenAICompatibleProvider(
+        api_key="k", model="gpt-6.1-sol", default_reasoning_effort="low"
+    )
+
+    assert BudgetedProvider(inner).default_reasoning_effort == "low"
+    assert RetryingProvider(inner, sleep=lambda _seconds: None).default_reasoning_effort == "low"
 
 
 async def test_the_provider_temperature_applies_when_a_call_states_none() -> None:

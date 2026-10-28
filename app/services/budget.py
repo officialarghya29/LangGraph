@@ -237,11 +237,16 @@ class BudgetedProvider(LLMProvider):
             # neither still composes, and neither is consulted for a decision.
             default_temperature=getattr(inner, "default_temperature", 0.0),
             default_max_tokens=getattr(inner, "default_max_tokens", None),
+            default_reasoning_effort=getattr(inner, "default_reasoning_effort", None),
         )
         self.inner = inner
         # Instance attribute shadowing the class default, so a log line names the
         # real provider rather than "provider".
         self.name = f"budgeted:{inner.name}"
+
+    async def aclose(self) -> None:
+        """Release the wrapped provider's pool; see the retry decorator."""
+        await self.inner.aclose()
 
     async def ainvoke(
         self,

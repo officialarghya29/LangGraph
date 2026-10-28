@@ -77,12 +77,23 @@ class RetryingProvider(LLMProvider):
             # configuration it wrapped.
             default_temperature=getattr(inner, "default_temperature", 0.0),
             default_max_tokens=getattr(inner, "default_max_tokens", None),
+            default_reasoning_effort=getattr(inner, "default_reasoning_effort", None),
         )
         self.inner = inner
         self.max_retries = max_retries
         self._sleep = sleep
         self._on_retry = on_retry
         self.name = f"retrying:{inner.name}"
+
+    async def aclose(self) -> None:
+        """Release the wrapped provider's pool.
+
+        Delegated rather than reimplemented: the pool belongs to the innermost
+        provider, and a wrapper that held no connection of its own has nothing
+        else to release. Without this, shutdown would close the pool only when it
+        happened to hold the undecorated provider — which it never does.
+        """
+        await self.inner.aclose()
 
     @property
     def policy(self) -> RetryPolicy:

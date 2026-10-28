@@ -367,6 +367,53 @@ def test_development_tolerates_unsafe_settings() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Reasoning effort
+# --------------------------------------------------------------------------- #
+
+
+def test_a_blank_effort_means_the_vendors_own_default() -> None:
+    """The template ships it blank, so the blank has to parse.
+
+    ``LLM_REASONING_EFFORT=`` is not one of the accepted values, and without this
+    the copied template would refuse to start — the same defect as
+    ``API_DOCS_ENABLED=`` and ``LLM_MAX_OUTPUT_TOKENS=``, on a setting added after
+    both were fixed.
+    """
+    assert make_settings(llm_reasoning_effort="   ").llm_reasoning_effort is None
+
+
+def test_the_effort_is_normalised_to_the_documented_spelling() -> None:
+    """``HIGH`` is the same intent and a different request field value."""
+    assert make_settings(llm_reasoning_effort="HIGH").llm_reasoning_effort == "high"
+
+
+def test_an_unknown_effort_is_refused_at_startup() -> None:
+    """A typo would otherwise become a 400 from the vendor on every call."""
+    with pytest.raises(ValidationError):
+        make_settings(llm_reasoning_effort="maximum")
+
+
+def test_the_effort_is_refused_for_a_provider_without_the_field() -> None:
+    """Configured and inert is the failure mode this project keeps finding.
+
+    The Anthropic Messages API has no ``reasoning_effort``: its thinking control is
+    a token budget on a ``thinking`` block. Accepting the setting there would leave
+    an operator believing they had turned a dial that no request carries.
+    """
+    with pytest.raises(ConfigurationError, match="LLM_REASONING_EFFORT"):
+        make_settings(llm_provider="anthropic", llm_reasoning_effort="high")
+
+
+def test_the_effort_is_allowed_for_a_local_openai_compatible_server() -> None:
+    """Not every local runtime is a llama; some do implement the field."""
+    settings = make_settings(
+        llm_provider="local", llm_base_url="http://localhost:11434/v1", llm_reasoning_effort="low"
+    )
+
+    assert settings.llm_reasoning_effort == "low"
+
+
+# --------------------------------------------------------------------------- #
 # Caching
 # --------------------------------------------------------------------------- #
 

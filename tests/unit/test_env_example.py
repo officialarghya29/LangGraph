@@ -75,6 +75,24 @@ def test_the_documented_defaults_match_the_code() -> None:
         assert int(stated.group(1)) == getattr(settings, name.lower()), name
 
 
+def test_no_comment_sits_where_a_value_should_be() -> None:
+    """A comment after an empty value is not a comment to the dotenv parser.
+
+    ``KEY=   # explain`` looks like a value with a trailing comment, and the parser
+    treats the text after the ``=`` as the value when there is nothing before the
+    ``#``. Both occurrences in this template were real: ``LLM_BASE_URL`` was set to
+    the sentence "# only for a self-hosted, OpenAI-compatible endpoint", and
+    ``LLM_REASONING_EFFORT`` then failed to start the process. The first was inert
+    only because the hosted providers ignore ``LLM_BASE_URL``; with
+    ``LLM_PROVIDER=local`` it is handed to the client as the endpoint.
+    """
+    offenders = [
+        line for line in TEMPLATE.read_text().splitlines() if re.match(r"^[A-Z_]+=\s+#", line)
+    ]
+
+    assert offenders == [], f"a comment is being parsed as a value: {offenders}"
+
+
 def test_the_template_parses_as_configuration() -> None:
     """Copying it must produce a working configuration, not a startup error."""
     loaded = Settings(_env_file=str(TEMPLATE))
