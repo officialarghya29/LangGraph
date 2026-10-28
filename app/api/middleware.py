@@ -149,11 +149,25 @@ RATE_LIMIT_POLICIES: tuple[tuple[str, str, int], ...] = (
 
 
 def _policy_for(method: str, path: str) -> int | None:
-    """Return the multiplier for a request, or ``None`` when it is unlimited."""
+    """Return the multiplier for a request, or ``None`` when it is unlimited.
+
+    The **longest** matching prefix wins, not the first one listed. First-match
+    made ``POST /api/v1/tasks/`` unreachable: ``/api/v1/tasks/{id}/approve``
+    starts with ``/api/v1/tasks``, which is declared earlier, so every approval,
+    rejection, and cancellation was limited at the creation rate and the doubled
+    budget for decisions never existed. Ordering the table carefully would fix
+    the symptom and leave the next entry to be broken the same way; matching by
+    specificity makes the table order-insensitive.
+    """
+    best: int | None = None
+    best_length = -1
     for expected_method, prefix, multiplier in RATE_LIMIT_POLICIES:
-        if expected_method in {"*", method} and path.startswith(prefix):
-            return multiplier
-    return None
+        if expected_method not in {"*", method}:
+            continue
+        if path.startswith(prefix) and len(prefix) > best_length:
+            best = multiplier
+            best_length = len(prefix)
+    return best
 
 
 def _identity(scope: Scope, settings: Settings) -> str:

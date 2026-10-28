@@ -734,7 +734,16 @@ class MemoryRepository(_ChildRepository):
         return result.scalars().all()
 
     async def mark_accessed(self, record_ids: Sequence[uuid.UUID]) -> None:
-        """Record that memories were retrieved, for recency ranking."""
+        """Record that memories were retrieved.
+
+        This used to claim it fed recency ranking, and it does not: the recency
+        term in :func:`~app.services.memory.score_candidate` is derived from
+        ``created_at``, which never changes, so the counter and the timestamp are
+        written on every retrieval and read by nothing. Kept because the count is
+        real usage data an operator can query, and because turning it into a
+        ranking signal would change which memories win a tie — a product decision
+        rather than a fix.
+        """
         if not record_ids:
             return
         await self._session.execute(

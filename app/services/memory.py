@@ -391,7 +391,13 @@ class InMemoryMemoryStore(MemoryStore):
         return rows[:limit]
 
     async def mark_accessed(self, memory_ids: Sequence[str]) -> None:
-        """Record retrieval, which raises recency for the next ranking."""
+        """Record retrieval by moving the access timestamp forward.
+
+        ``updated_at`` is the closest this in-memory record has to the durable
+        store's ``accessed_at``, and like that column it is not read by the
+        ranking, which measures recency from ``created_at``. The docstring used to
+        say this raised recency; it does not, and neither does the durable store.
+        """
         now = datetime.now(UTC)
         for memory_id in memory_ids:
             existing = self._items.get(memory_id)
