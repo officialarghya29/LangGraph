@@ -944,6 +944,39 @@ def test_a_rejection_says_when_to_retry(
     assert int(blocked.headers["Retry-After"]) > 0
 
 
+def test_a_decision_is_not_blocked_by_the_creation_budget(
+    harness: ApiHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The two operations are limited separately, and used to share a counter.
+
+    With one request per window, creating a task had already spent the bucket that
+    approving one also counted against, so a client at its creation limit could
+    not approve the work it had just started. The decision gets its own budget; a
+    non-429 answer is the assertion, because the route's own status for a task
+    that has already finished is a different question.
+    """
+    from app.core.config import reset_settings_cache
+
+    monkeypatch.setenv("RATE_LIMIT_REQUESTS", "1")
+    reset_settings_cache()
+    harness.rewire(responder("direct"))
+    headers = {"X-User-Id": "decision-budget"}
+
+    created = harness.client.post("/api/v1/tasks", json={"request": "work"}, headers=headers)
+    assert created.status_code == 202
+    assert (
+        harness.client.post("/api/v1/tasks", json={"request": "work"}, headers=headers).status_code
+        == 429
+    )
+
+    decision = harness.client.post(
+        f"/api/v1/tasks/{created.json()['task_id']}/cancel", headers=headers
+    )
+    reset_settings_cache()
+
+    assert decision.status_code != 429, decision.text
+
+
 def test_rate_limits_are_per_caller(direct: ApiHarness) -> None:
     """One noisy caller must not consume another's budget."""
     first = direct.client.post("/api/v1/chat", json={"message": "hi"}, headers={"X-User-Id": "a"})
