@@ -95,6 +95,28 @@ def test_the_sampling_settings_are_read_by_the_code(field: str) -> None:
     assert readers, f"{field} is declared but never read"
 
 
+def test_every_declared_setting_is_read_somewhere() -> None:
+    """The general form of the check above, over all settings.
+
+    A setting exists to change behaviour. One that is parsed, range-validated,
+    documented in the template, and then never consulted is worse than a missing
+    setting: it looks like a control, so it is the thing an operator reaches for
+    when something is wrong, and turning it changes nothing. Two were found this
+    way — ``LLM_MAX_RETRIES`` and ``TRACE_HISTORY_SIZE`` — both declared and both
+    inert, and neither is visible in any behavioural test.
+
+    Reading source text is a blunt instrument. It is used because it is the only
+    instrument that observes this property at all, and a false positive here costs
+    one line of explanation while a false negative costs a silently dead knob.
+    """
+    sources = [path.read_text() for path in _APP_SOURCES]
+    unread = sorted(
+        name for name in Settings.model_fields if not any(f".{name}" in text for text in sources)
+    )
+
+    assert unread == [], f"settings declared but never read: {unread}"
+
+
 def test_a_blank_ceiling_means_the_vendor_default() -> None:
     """``LLM_MAX_OUTPUT_TOKENS=`` is how the template ships it.
 

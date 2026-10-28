@@ -191,15 +191,15 @@ async def test_a_reasoning_model_reaches_the_socket_without_a_temperature() -> N
     shipped default model is one of them — so this is the difference between the
     system working and every call failing.
     """
-    with scripted((200, {}, completion(model="gpt-5.6-terra"))) as server:
+    with scripted((200, {}, completion(model="gpt-6.1-sol"))) as server:
         provider = OpenAICompatibleProvider(
-            api_key=API_KEY, model="gpt-5.6-terra", base_url=server.base_url
+            api_key=API_KEY, model="gpt-6.1-sol", base_url=server.base_url
         )
         await provider.ainvoke(MESSAGES, temperature=0.3, max_tokens=256)
 
     body = server.received[0]["body"]
 
-    assert body["model"] == "gpt-5.6-terra"
+    assert body["model"] == "gpt-6.1-sol"
     assert "temperature" not in body
     assert body["max_completion_tokens"] == 256
     assert "max_tokens" not in body

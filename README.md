@@ -662,7 +662,7 @@ meaningful to the vendor that serves it, so a single default is necessarily wron
 for every provider but one: `LLM_PROVIDER=anthropic` on its own sent an OpenAI
 model name to the Messages API and failed with a model-not-found error that
 pointed at the model rather than at the configuration. Unset now resolves to
-`gpt-5.6-terra` for `openai`, `claude-sonnet-5-5` for `anthropic`, and
+`gpt-6.1-sol` for `openai`, `claude-sonnet-5-5` for `anthropic`, and
 `llama3.1:8b` for a local server, and the resolved name is logged at startup
 because it is no longer visible in the environment.
 
@@ -685,10 +685,13 @@ required on Anthropic either way, where the Messages API has no server-side
 default and one is supplied if nothing else does.
 
 The shipped names are the balanced tier of each vendor's current line at the time
-of writing — `gpt-5.6-luna` and `gpt-5.6-sol`, `claude-opus-5-5` and
-`claude-fable-5-1` are drop-in alternatives. Model lineups move faster than
+of writing — `gpt-6.1-terra`, `gpt-6-luna` and `gpt-6-astra`, `claude-opus-5-5`
+and `claude-fable-5-1` are drop-in alternatives. Model lineups move faster than
 documentation does, so treat the defaults as a starting point to check against
-the vendor's current list rather than as an endorsement.
+the vendor's current list rather than as an endorsement. Anthropic's own guide
+recommends Opus for "most workloads"; Sonnet is the default here because a single
+run makes many calls (router, planner, workers, critic, synthesizer) and pays for
+each of them.
 
 ### Budgets and throttling
 

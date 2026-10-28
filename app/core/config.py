@@ -44,14 +44,24 @@ EmbeddingProviderName = Literal["local", "openai"]
 #: model to the Messages API and failed with a model-not-found error that pointed
 #: at the model rather than at the configuration.
 #:
-#: The OpenAI entry is the model OpenAI's own documentation badges as the default
-#: for balanced work, and it is served over ``/v1/chat/completions``. Cheaper and
-#: more expensive siblings (``gpt-5.6-luna``, ``gpt-5.6-sol``) are drop-in names.
-#: The Anthropic entry is the current balanced model; ``claude-opus-5-5`` and
-#: ``claude-fable-5-1`` are the larger alternatives.
+#: The OpenAI entry is the tier OpenAI's own guide calls "balanced speed, cost,
+#: and intelligence" for complex work, and it is served over
+#: ``/v1/chat/completions`` like every other name here. ``gpt-6-astra`` is the
+#: larger sibling and ``gpt-6.1-terra`` / ``gpt-6-luna`` the cheaper ones, all
+#: drop-in names: the adapter picks the legal sampling fields from the name, and
+#: every ``gpt-6`` name is a reasoning model.
+#:
+#: The Anthropic entry is the vendor's "best combination of speed and
+#: intelligence" tier; ``claude-opus-5-5`` and ``claude-fable-5-1`` are the
+#: larger alternatives. Note that Anthropic's own guide recommends Opus for
+#: "most workloads" — Sonnet is chosen here because this system makes many calls
+#: per run (router, planner, workers, critic, synthesizer) and pays for every one.
+#:
+#: Model lineups move faster than documentation does. These are a starting point
+#: to check against the vendor's current list, not an endorsement of a snapshot.
 DEFAULT_LLM_MODELS: MappingProxyType[str, str] = MappingProxyType(
     {
-        "openai": "gpt-5.6-terra",
+        "openai": "gpt-6.1-sol",
         "anthropic": "claude-sonnet-5-5",
         "local": "llama3.1:8b",
     }

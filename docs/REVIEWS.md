@@ -420,7 +420,7 @@ OpenAI name, in a system whose whole claim is that the provider is swappable.
 Setting `LLM_PROVIDER=anthropic` and leaving the model alone — the natural thing
 to do — sent a GPT model to the Messages API and failed with a model-not-found
 error that named the model rather than the configuration. The default is now keyed
-by provider (`gpt-5.6-terra`, `claude-sonnet-5-5`, `llama3.1:8b` for a local
+by provider (`gpt-6.1-sol`, `claude-sonnet-5-5`, `llama3.1:8b` for a local
 server), resolved in one place, and asserted against the provider enum so adding a
 provider without adding a model fails in the test suite rather than on the first
 request.

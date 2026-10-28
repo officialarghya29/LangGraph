@@ -417,7 +417,7 @@ def test_the_factory_gives_each_provider_a_model_its_vendor_serves() -> None:
     openai = build_settings(llm_provider="openai", llm_api_key="key")
     anthropic = build_settings(llm_provider="anthropic", llm_api_key="key")
 
-    assert build_llm_provider(openai).default_model == "gpt-5.6-terra"
+    assert build_llm_provider(openai).default_model == "gpt-6.1-sol"
     assert build_llm_provider(anthropic).default_model == "claude-sonnet-5-5"
     assert "gpt" not in build_llm_provider(anthropic).default_model
 
@@ -536,9 +536,11 @@ async def anthropic_body(
 @pytest.mark.parametrize(
     ("model", "reasoning"),
     [
+        ("gpt-6.1-sol", True),
+        ("gpt-6.1-terra", True),
+        ("gpt-6-luna", True),
+        ("gpt-6-astra", True),
         ("gpt-5.6-terra", True),
-        ("gpt-5.6-luna", True),
-        ("gpt-5.6-sol", True),
         ("o3-mini", True),
         ("gpt-4o-mini", False),
         ("gpt-4.1", False),
@@ -567,15 +569,15 @@ async def test_a_reasoning_model_is_never_sent_a_temperature() -> None:
     the shipped default model is one of these, so getting this wrong makes every
     call in the system fail.
     """
-    body = await openai_body("gpt-5.6-terra", call_temperature=0.4)
+    body = await openai_body("gpt-6.1-sol", call_temperature=0.4)
 
     assert "temperature" not in body
-    assert body["model"] == "gpt-5.6-terra"
+    assert body["model"] == "gpt-6.1-sol"
 
 
 async def test_a_reasoning_model_is_given_the_ceiling_under_the_right_name() -> None:
     """``max_tokens`` is rejected as an unsupported parameter on these models."""
-    body = await openai_body("gpt-5.6-terra", call_max_tokens=512)
+    body = await openai_body("gpt-6.1-sol", call_max_tokens=512)
 
     assert body["max_completion_tokens"] == 512
     assert "max_tokens" not in body

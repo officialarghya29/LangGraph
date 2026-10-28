@@ -13,8 +13,13 @@ subjects will pass forever after the subject list changes.
 
 from __future__ import annotations
 
-import pytest
+from typing import cast
 
+import pytest
+from starlette.types import Scope
+
+from app.api.middleware import _identity
+from app.core.auth import ANONYMOUS_USER_ID, issue_token
 from app.core.config import Settings
 from app.core.exceptions import ConfigurationError, PermissionDeniedError, ToolError
 from app.core.security import redact, validate_outbound_url
@@ -303,3 +308,96 @@ def test_identity_header_trust_is_development_only() -> None:
     )
 
     assert settings.trust_identity_header is False
+
+
+# --------------------------------------------------------------------------- #
+# The rate-limit bucket
+# --------------------------------------------------------------------------- #
+
+
+def scope_from(
+    client: tuple[str, int] | None = None, headers: dict[str, str] | None = None
+) -> Scope:
+    """Build the slice of an ASGI scope that bucket selection reads.
+
+    ``headers`` is always present, because the ASGI specification requires it:
+    an empty list is what a real request without headers carries.
+    """
+    scope: dict[str, object] = {
+        "type": "http",
+        "headers": [
+            (name.lower().encode(), value.encode()) for name, value in (headers or {}).items()
+        ],
+    }
+    if client is not None:
+        scope["client"] = client
+    return cast(Scope, scope)
+
+
+def test_a_forwarded_header_cannot_choose_a_bucket() -> None:
+    """The bucket comes from the peer address, and no header can move it.
+
+    Honouring ``X-Forwarded-For`` looks like the fix for running behind a proxy
+    and is instead a rate-limit bypass: the header is caller-supplied, so anyone
+    could send a new value per request and never reach a limit. The cost of the
+    choice is the mirror image — behind a proxy that does not preserve the peer
+    address, every client shares one bucket — which is why it is recorded rather
+    than quietly improved.
+    """
+    settings = Settings(_env_file=None, auth_enabled=False, trust_identity_header=False)
+    buckets = {
+        _identity(scope_from(("203.0.113.7", 5000), {"X-Forwarded-For": claim}), settings)
+        for claim in ("9.9.9.9", "8.8.8.8", "203.0.113.7", "")
+    }
+
+    assert buckets == {"203.0.113.7"}
+
+
+def test_a_request_with_nothing_to_attribute_still_lands_in_a_bucket() -> None:
+    """Unattributable is not exempt: the fallback is a shared bucket, not none."""
+    settings = Settings(_env_file=None, auth_enabled=True, jwt_secret="a-strong-value")
+
+    assert _identity(scope_from(), settings) == ANONYMOUS_USER_ID
+
+
+def test_a_bearer_token_decides_the_bucket_so_a_proxy_cannot_pool_clients() -> None:
+    """The documented reason a subject is preferred over an address.
+
+    Behind a proxy every request arrives from one address, so an address-keyed
+    limit becomes a global one and a single caller can exhaust it for everyone.
+    Two subjects behind the same address are two buckets.
+    """
+    settings = Settings(_env_file=None, auth_enabled=True, jwt_secret="a-strong-value")
+    first = issue_token("alice", settings)
+    second = issue_token("bob", settings)
+    address = ("203.0.113.7", 5000)
+
+    alice = _identity(scope_from(address, {"Authorization": f"Bearer {first}"}), settings)
+    bob = _identity(scope_from(address, {"Authorization": f"Bearer {second}"}), settings)
+
+    assert alice == "alice"
+    assert bob == "bob"
+    assert alice != bob
+
+
+def test_the_development_identity_header_is_also_a_rate_limit_bypass() -> None:
+    """Which is a second reason to refuse it outside development.
+
+    It is refusable as authentication bypass already. Worth recording that
+    accepting it also hands every caller a fresh bucket on demand, so the two
+    consequences are weighed together rather than the first alone.
+    """
+    settings = Settings(_env_file=None, auth_enabled=False, trust_identity_header=True)
+    address = ("203.0.113.7", 5000)
+
+    assert _identity(scope_from(address, {"X-User-Id": "a"}), settings) == "a"
+    assert _identity(scope_from(address, {"X-User-Id": "b"}), settings) == "b"
+    # The pair is not merely discouraged outside development; it is refused.
+    with pytest.raises(ConfigurationError):
+        Settings(
+            _env_file=None,
+            app_env="production",
+            auth_enabled=False,
+            trust_identity_header=True,
+            jwt_secret="a-strong-value",
+        )
