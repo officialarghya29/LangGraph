@@ -671,6 +671,16 @@ are now built at the configured width, including the query vector; the index
 arithmetic keeps its period, so the ties survive and the tests still assert what
 they were written to assert.
 
+The startup check was nearly shipped as one that could never speak. It is handed
+the provider the lifespan built, which is a retrying provider wrapping a budgeted
+provider wrapping the real one — and neither decorator forwarded
+``alist_models``, so both inherited the interface's empty catalogue and every
+deployment would have compared the configured model against nothing. A unit test
+now pins the delegation, and the integration test asks a stub vendor through the
+real wrapper stack rather than calling the service function directly, which is
+what made it visible: the first version patched that function and proved only
+that a patched function runs.
+
 That measurement is what settled the next question rather than a preference. The
 obvious optimisation was to stop recomputing each candidate's vector norm during
 the scan, which costs a square root over 256 terms per row: 8.47 ms against

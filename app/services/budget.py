@@ -248,6 +248,17 @@ class BudgetedProvider(LLMProvider):
         """Release the wrapped provider's pool; see the retry decorator."""
         await self.inner.aclose()
 
+    async def alist_models(self) -> tuple[str, ...]:
+        """Ask the wrapped provider what it serves.
+
+        Delegated for the same reason ``aclose`` is: the catalogue belongs to the
+        provider that has an endpoint, and the interface's empty default would
+        answer "nothing" from a wrapper that simply inherited it. That is the
+        difference between a startup check and a startup check that never runs.
+        Listing costs no tokens, so there is nothing to charge for here.
+        """
+        return await self.inner.alist_models()
+
     async def ainvoke(
         self,
         messages: Sequence[Message],

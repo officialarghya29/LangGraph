@@ -95,6 +95,17 @@ class RetryingProvider(LLMProvider):
         """
         await self.inner.aclose()
 
+    async def alist_models(self) -> tuple[str, ...]:
+        """Ask the wrapped provider what it serves.
+
+        Not retried: the check that uses this runs at startup, in the background,
+        and reports nothing when the answer is unavailable — so a retry loop would
+        spend seconds to produce the same silence. Inheriting the interface
+        default instead would be worse: the wrapper would answer "no catalogue"
+        for a provider that has one.
+        """
+        return await self.inner.alist_models()
+
     @property
     def policy(self) -> RetryPolicy:
         """Return the retry policy applied to every call."""

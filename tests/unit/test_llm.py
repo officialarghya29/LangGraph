@@ -942,3 +942,28 @@ def test_the_closest_names_name_the_likely_successor() -> None:
     assert closest[0] == "gpt-6.1-sol"
     assert len(closest) <= 3
     assert closest_model_names("nothing-like-it", ("gpt-6.1-sol",), count=3) == []
+
+
+async def test_the_provider_decorators_forward_the_catalogue() -> None:
+    """A wrapper that inherits the empty default hides the model list entirely.
+
+    Both decorators sit between the application and the provider that owns the
+    endpoint, and the interface offers an empty catalogue by default. Inheriting
+    it made every deployment report "no catalogue" — the startup check would have
+    run and never said anything, which is worse than not having it, because it
+    looks like a check that passed.
+    """
+
+    class Served(FakeLLMProvider):
+        async def alist_models(self) -> tuple[str, ...]:
+            return ("gpt-6.1-sol",)
+
+    inner = Served()
+    budgeted = BudgetedProvider(inner)
+    retrying = RetryingProvider(budgeted, max_retries=1)
+
+    try:
+        assert await budgeted.alist_models() == ("gpt-6.1-sol",)
+        assert await retrying.alist_models() == ("gpt-6.1-sol",)
+    finally:
+        await retrying.aclose()
