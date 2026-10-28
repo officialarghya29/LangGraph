@@ -351,8 +351,8 @@ class TaskStore:
         """Apply changes to a record, or return ``None`` if it is absent."""
         raise NotImplementedError
 
-    async def list(self, *, user_id: str | None = None, limit: int = 50) -> Sequence[TaskRecord]:
-        """Return recent records, newest first."""
+    async def list(self, *, user_id: str, limit: int = 50) -> Sequence[TaskRecord]:
+        """Return one owner's recent records, newest first."""
         raise NotImplementedError
 
     # --- Durable side trail --------------------------------------------- #
@@ -365,6 +365,25 @@ class TaskStore:
     async def list_events(self, task_id: str, *, after_seq: int = 0) -> Sequence[dict[str, object]]:
         """Return persisted events after a sequence number."""
         return []
+
+    async def poll(
+        self, task_id: str, *, user_id: str, after_seq: int = 0
+    ) -> tuple[Sequence[dict[str, object]], TaskRecord | None]:
+        """Return new events and the task's current record in one read.
+
+        The streaming route asks both questions on every poll, which used to mean
+        two connections out of the pool and two transactions per interval, per
+        connected client. One round trip is not merely tidier here: a session
+        acquisition measured at roughly 2 ms against a local server, and at a
+        half-second interval with fifty viewers that is a hundred acquisitions a
+        second spent on nothing.
+
+        The two reads sharing a transaction also makes the pair consistent: a
+        status read in a later transaction could see the task finish while the
+        event that says why was written after the first read.
+        """
+        events = await self.list_events(task_id, after_seq=after_seq)
+        return events, await self.get_for_user(task_id, user_id)
 
     async def request_approval(
         self, task_id: str, *, requested_action: str, risk_level: str = "HIGH"
@@ -561,18 +580,20 @@ class PostgresTaskStore(TaskStore):
             task = await TaskRepository(session).update(key, **coerced)
             return None if task is None else self._to_record(task)
 
-    async def list(self, *, user_id: str | None = None, limit: int = 50) -> list[TaskRecord]:
-        """Return recent tasks, newest first, optionally scoped to one owner."""
-        async with self._database.session() as session:
-            if user_id is None:
-                # Internal use only — the dashboard's aggregate view. It is never
-                # reachable from a task-scoped request handler.
-                tasks = await TaskRepository(session).list_by_status("pending", limit=limit)
-                tasks = list(tasks) + list(
-                    await TaskRepository(session).list_by_status("running", limit=limit)
-                )
-                return [self._to_record(task) for task in tasks[:limit]]
+    async def list(self, *, user_id: str, limit: int = 50) -> list[TaskRecord]:
+        """Return one owner's recent tasks, newest first.
 
+        ``user_id`` is required, and used to be optional. The optional form was an
+        aggregate view that nothing called, and it did not do what its docstring
+        said: it read the oldest ``limit`` pending tasks and then the oldest
+        ``limit`` running ones, threw away the tail, and returned them in that
+        order — so the answer was neither newest-first, nor capped at ``limit``
+        rows read, nor even guaranteed to contain a running task. Reading two
+        collections in one order and truncating is not a merge, and the merging
+        version would still have been a second way to ask an unscoped question
+        that no route is allowed to ask.
+        """
+        async with self._database.session() as session:
             owner = await UserRepository(session).get_by_external_id(user_id)
             if owner is None:
                 return []
@@ -802,6 +823,38 @@ class PostgresTaskStore(TaskStore):
                 }
                 for event in events
             ]
+
+    async def poll(
+        self, task_id: str, *, user_id: str, after_seq: int = 0
+    ) -> tuple[Sequence[dict[str, object]], TaskRecord | None]:
+        """Return new events and the owner's record from one transaction.
+
+        Overridden rather than inherited so the two reads share a session. The
+        ownership check is inlined from :meth:`get_for_user` for the same reason
+        it exists there: a malformed id and somebody else's task are both ``None``.
+        """
+        try:
+            key = uuid.UUID(task_id)
+        except ValueError:
+            return [], None
+
+        async with self._database.session() as session:
+            rows = await EventRepository(session).list_for_task(key, after_seq=after_seq)
+            events = [
+                {
+                    "seq": event.seq,
+                    "type": event.event_type,
+                    "payload": event.payload,
+                    "created_at": event.created_at.isoformat(),
+                }
+                for event in rows
+            ]
+
+            owner = await UserRepository(session).get_by_external_id(user_id)
+            if owner is None:
+                return events, None
+            task = await TaskRepository(session).get_for_user(key, uuid.UUID(str(owner.id)))
+            return events, (None if task is None else self._to_record(task))
 
     async def list_pending_approvals(self) -> Sequence[dict[str, object]]:
         """Return every unresolved approval, oldest first, for the dashboard."""

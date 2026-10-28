@@ -540,6 +540,64 @@ arguments, which are model-authored and can carry a credential.
 
 ---
 
+### Found by the fourth pass, and fixed
+
+This pass was aimed at cost rather than at correctness, and the theme is that
+**the expensive thing was usually a second copy of something the code already
+had.** Two of the four findings are a repeated acquisition of a resource that one
+call could have covered; one is a branch that duplicated a question the schema
+already answered; one is a measurement that turned a guess into a number.
+
+**A TLS handshake per model call.** Both adapters built an `httpx` client for each
+request and closed it afterwards. Nothing was wrong with the answer, and the cost
+was invisible in any single test: it is the connection that was thrown away.
+Measured on the adapter itself against a real endpoint with a deliberately invalid
+key — so the numbers are handshake and round trip rather than generation — a
+client per call cost 652 ms and a kept client 388 ms, a difference of 264 ms on
+*every* call, in a system that calls the same host five or more times per run.
+The pool is now created on first use and closed at shutdown. The ownership rule is
+explicit because the alternative is a bug that appears only under composition: a
+client injected by a caller is never closed, since a provider that closed it would
+break the next one handed the same client.
+
+**Two database sessions per stream poll.** Following a task asked whether anything
+had happened and then, separately, whether the task was still there — two pool
+connections and two transactions per interval, per connected viewer, twenty-four
+hundred times an hour each. A session acquisition measured at 2.1 ms against a
+local server, so the second one was 2.1 ms of every poll *and* another connection
+out of a pool of ten. The two reads are now one transaction, which is also the
+only version where they agree with each other: the status could previously be read
+before the event that explained it was written. One consequence was worth handling
+rather than accepting — a failed read is not the same answer as "this task is
+gone", so a poll that raises is retried on the next tick and only a successful
+poll reporting no task ends the stream.
+
+**A comment that was parsed as a value.** `KEY=   # explanation` is not a comment
+to the dotenv parser: with nothing before the `#`, the text after the `=` *is* the
+value. Two lines in the template had that shape, one of them added by the same
+change that should have known better. `LLM_BASE_URL` was therefore set to the
+sentence "# only for a self-hosted, OpenAI-compatible endpoint" — inert for the
+hosted providers, which ignore it, and handed straight to the client as the
+endpoint under `LLM_PROVIDER=local` — and `LLM_REASONING_EFFORT` failed to start
+the process outright, which is how it was found. Both moved to their own lines, and
+the shape is now refused by a test rather than by a reader.
+
+**A list branch that nothing called, doing something else.** `TaskStore.list`
+accepted an optional owner and, with it unset, read the oldest `limit` pending
+tasks, then the oldest `limit` running ones, concatenated them and truncated by
+list length. Its docstring promised newest-first; the result was neither that, nor
+capped at `limit` rows read, nor even guaranteed to contain a running task behind
+a large enough pending backlog. No caller used it — the one route that lists tasks
+always passes a principal — so the honest fix was to require the owner and delete
+the branch, with an integration test pinning the ordering and the scoping the
+remaining query actually has.
+
+**A documented behaviour the code had already outgrown.** The README stated that
+the HTTP-date form of `Retry-After` was deliberately ignored. The adapter
+interprets it, against the response's own `Date` header, exactly so that two
+clocks are never subtracted. The documentation was the older of the two and is now
+the accurate one.
+
 ## Verification
 
 | Phase | Scope | Status |
@@ -549,6 +607,7 @@ arguments, which are model-authored and can carry a credential.
 | 45 | Architecture review | Complete — no layer violations; stale documentation corrected |
 | — | Deep scan | Complete — thirteen findings fixed, one verified non-defect, five settings documented and two configuration defects closed |
 | — | Deep scan, third pass | Complete — seven findings fixed, all in the model layer or found from it; two settings added, two configuration defects closed |
+| — | Deep scan, fourth pass | Complete — four findings fixed, each measured rather than assumed: 264 ms of handshake removed per model call, one database session removed per stream poll, a template line that parsed as a value, an uncalled list branch. Three of the four now have a test that fails without the fix |
 
 Migration verification, which was blocked alongside the container work, was
 completed without a container runtime: the revision applies to an empty database,

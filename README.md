@@ -630,6 +630,7 @@ than warn.
 | `LLM_API_KEY` | — | Provider credential |
 | `LLM_TEMPERATURE` | `0.0` | Sampling temperature for calls that do not state one |
 | `LLM_MAX_OUTPUT_TOKENS` | — | Output ceiling; unset uses the vendor's own default |
+| `LLM_REASONING_EFFORT` | — | `none` / `minimal` / `low` / `medium` / `high` / `xhigh` / `max`; sent only to a model that reasons, refused with `LLM_PROVIDER=anthropic` |
 | `LLM_MAX_RETRIES` | `2` | Attempts per model call, separate from `MAX_RETRIES` |
 | `EMBEDDING_PROVIDER` | `local` | Embedding backend; `local` needs no credential |
 | `DATABASE_URL` | local Postgres | Durable task, approval, memory, and checkpoint storage |
@@ -684,6 +685,15 @@ case where a limit is genuinely required; unset means the vendor's default. It i
 required on Anthropic either way, where the Messages API has no server-side
 default and one is supplied if nothing else does.
 
+**`LLM_REASONING_EFFORT` is the one sampling setting that can be set and still not
+travel.** It is an OpenAI-compatible field, so it is sent only to a model that is
+known to reason — a model that does not rejects the field rather than ignoring
+it — and it is refused outright with `LLM_PROVIDER=anthropic`, whose Messages API
+has no equivalent. Because a setting that silently does nothing is the failure
+this configuration layer exists to prevent, the resolved value is logged at
+start-up beside the model it applies to:
+`startup.model_ready model=gpt-6.1-sol reasoning_effort=high`.
+
 The shipped names are the balanced tier of each vendor's current line at the time
 of writing — `gpt-6.1-terra`, `gpt-6-luna` and `gpt-6-astra`, `claude-opus-5-5`
 and `claude-fable-5-1` are drop-in alternatives. Model lineups move faster than
@@ -712,8 +722,21 @@ backoff that guesses: waiting two seconds when the service asked for thirty does
 not retry sooner, it earns another rejection and spends a retry to do it. The
 instruction is treated as a floor beneath the backoff curve and capped at a
 minute, because a provider asking for an hour is in practice asking to fail
-slowly. The HTTP-date form of the header is deliberately ignored — converting it
-would mean trusting someone else's clock.
+slowly. Both permitted forms are understood. The HTTP-date form is measured
+against the response's own `Date` header rather than this machine's clock, since
+the header expresses a relative wait and subtracting two different clocks
+reintroduces exactly the skew the value is meant to remove; without a `Date`
+header there is nothing to measure it against, so the backoff curve applies.
+
+**One connection pool per provider, not one per call.** The adapter used to build
+an `httpx` client around each request and close it afterwards, which spends a TCP
+connection and a TLS handshake on every model call. Measured against a real
+endpoint with a deliberately invalid key — so the timing is handshake and round
+trip, not generation — that cost 652 ms per call against 388 ms with a kept
+client: about 264 ms of pure overhead, repeated for every step of a run on a path
+that calls the same host five or more times in a row. The pool is created on first
+use, closed at shutdown, and a client injected by a caller is never closed by the
+provider, because it belongs to whoever passed it in.
 
 ---
 
@@ -926,6 +949,7 @@ one is failing.
 | **Assets** | The generated diagrams | An audit that measures every drawn label and fails on overlap or overflow |
 | **Configuration drift** | `.env.example`, `docker-compose.yml`, the `Dockerfile`, `.dockerignore` | Every documented key is compared against the settings layer in both directions, and the container's environment is checked for names that do not exist — a typo there is accepted silently and configures nothing |
 | **Concurrency** | Two runs in flight against one compiled graph | Separate event sinks, token budgets, and ceilings; the same request is asserted to cost the same whether or not it had company |
+| **Live** | One real model call against the configured vendor | Skipped unless `LLM_API_KEY` resolves to a value; asserts the model accepts the payload the adapter builds and that the name that answered belongs to the family that was asked for. It is the only check that can catch a retired model name, and it is excluded from the default run because it costs money and needs a network |
 | **Ceilings** | `MAX_TOOL_CALLS`, `MAX_EXECUTION_TIME`, `MAX_TOKEN_BUDGET` | Each refusal is asserted to happen *before* the work, and to leave a caller with a reason rather than a stack trace |
 
 Two testing decisions are worth calling out, because both were found by getting

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 
 import pytest
@@ -30,6 +31,7 @@ from app.database.repositories import (
     ToolCallRepository,
     UserRepository,
 )
+from app.services.task_store import PostgresTaskStore
 
 #: An error either the driver or the repository raises for a bad write. Which one
 #: depends on whether the constraint is reported at flush or mapped first.
@@ -296,6 +298,83 @@ async def test_tasks_can_be_listed_by_status(session: AsyncSession) -> None:
     completed = await repo.list_by_status("completed")
 
     assert [task.id for task in completed] == [finished.id]
+
+
+async def test_a_users_task_list_is_newest_first_and_only_theirs(
+    database: Database, sql: Callable[..., list[tuple[object, ...]]]
+) -> None:
+    """The list an operator sees, which used to be two collections concatenated.
+
+    The aggregate form this replaced read the oldest pending tasks and then the
+    oldest running ones and truncated the concatenation by list length, so its
+    ordering was not the newest-first its docstring promised and a long enough
+    backlog of pending tasks hid every running one. This asserts the shape the
+    per-user query actually has: one collection, one order, one owner.
+    """
+    async with database.session() as session:
+        alice = await UserRepository(session).get_or_create("alice")
+        bob = await UserRepository(session).get_or_create("bob")
+        repo = TaskRepository(session)
+        oldest = await repo.create(user_id=alice.id, request="oldest")
+        middle = await repo.create(user_id=alice.id, request="middle")
+        newest = await repo.create(user_id=alice.id, request="newest")
+        await repo.create(user_id=bob.id, request="not alice's")
+        await session.commit()
+
+    # Distinct, explicit timestamps: three rows created in the same millisecond
+    # would make the ordering assertion depend on the tie-break, not on the order.
+    for task, minutes in ((oldest, 30), (middle, 20), (newest, 10)):
+        sql(
+            "UPDATE tasks SET created_at = now() - make_interval(mins => %s) WHERE id = %s",
+            (minutes, task.id),
+        )
+
+    store = PostgresTaskStore(database)
+    listed = await store.list(user_id="alice", limit=10)
+
+    assert [record.task_id for record in listed] == [
+        str(newest.id),
+        str(middle.id),
+        str(oldest.id),
+    ]
+    # Scoped to the owner: bob's task is absent rather than fourth.
+    assert [record.request for record in listed] == ["newest", "middle", "oldest"]
+
+    capped = await store.list(user_id="alice", limit=2)
+    assert [record.task_id for record in capped] == [str(newest.id), str(middle.id)]
+
+
+async def test_polling_a_stream_returns_events_and_ownership_together(database: Database) -> None:
+    """One read per poll, and the two answers agree with each other.
+
+    The streaming route asks for new events and for the task's status on every
+    interval. Measured against a local server, a session acquisition costs about
+    2 ms, so the second one was 2 ms of every poll for every viewer — and the
+    separate transactions could show a task finished next to events written after
+    the status was read.
+    """
+    async with database.session() as session:
+        alice = await UserRepository(session).get_or_create("alice")
+        task = await TaskRepository(session).create(user_id=alice.id, request="watch me")
+        await EventRepository(session).append(task_id=task.id, event_type="task_started")
+        await EventRepository(session).append(task_id=task.id, event_type="task_completed")
+        await session.commit()
+
+    store = PostgresTaskStore(database)
+    events, record = await store.poll(str(task.id), user_id="alice")
+
+    assert [event["type"] for event in events] == ["task_started", "task_completed"]
+    assert record is not None
+    assert record.task_id == str(task.id)
+
+    # The same call, from somebody who does not own the task: the record is
+    # withheld so the caller can stop, and the events are not what it acts on.
+    after_resume, other_record = await store.poll(str(task.id), user_id="mallory")
+    assert other_record is None
+    assert len(after_resume) == 2
+
+    _, malformed = await store.poll("not-a-uuid", user_id="alice")
+    assert malformed is None
 
 
 # --------------------------------------------------------------------------- #

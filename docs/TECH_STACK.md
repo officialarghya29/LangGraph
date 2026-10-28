@@ -153,9 +153,16 @@ are stated where they would otherwise be assumed:
   vendor and encoded here from that documentation: `temperature` and `max_tokens`
   are withheld from reasoning models because the vendor's own error text and its
   models page say those requests fail. That reasoning is sound, and it has been
-  checked against a scripted server that echoes what it receives — but no live
-  endpoint has confirmed it, and neither default model name has been sent
-  anywhere. Treat the shipped names as a starting point to verify against the
-  vendor's current lineup rather than as a tested configuration.
+  checked against a scripted server that echoes what it receives.
+
+  What has since happened is narrower than a passing live call and is worth
+  stating exactly: `tests/live/` makes one real request when a credential is
+  configured, and with a deliberately invalid credential against the real
+  endpoint it reaches `HTTP 401` — which proves the endpoint path, the wire
+  format, and the transport work, and proves nothing about whether the inference
+  is accepted. No request has been *answered* by a model, because no key exists on
+  this host. Run `pytest tests/live -m live` with a key to close that gap; until
+  then treat the shipped names as a starting point to verify against the vendor's
+  current lineup rather than as a tested configuration.
 - ~~Frontend framework for the control dashboard — Phase 42.~~ Settled: no
   framework. See the table above.

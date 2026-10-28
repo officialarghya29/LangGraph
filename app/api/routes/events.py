@@ -89,30 +89,38 @@ async def _event_stream(
             logger.info("stream.client_disconnected", extra={"task_id": task_id})
             return
 
+        degraded = False
         try:
-            events = await store.list_events(task_id, after_seq=last_seq)
+            # One read for both questions. They used to be two, which meant two
+            # pool connections and two transactions per interval per viewer, and
+            # a status that could disagree with the events it was read beside.
+            events, record = await store.poll(task_id, user_id=principal_user, after_seq=last_seq)
         except Exception as exc:
             logger.warning(
                 "stream.read_failed",
                 extra={"task_id": task_id, "error": type(exc).__name__},
             )
-            events = []
+            events, record, degraded = [], None, True
+
+        if record is None and not degraded:
+            # Ownership changed or the task was deleted mid-stream. Checked before
+            # anything is written: the events are read in the same transaction, so
+            # sending them first would hand a former owner the tail of a task they
+            # no longer hold.
+            yield _format_event(
+                {"seq": last_seq + 1, "type": "stream_closed", "payload": {"reason": "gone"}}
+            )
+            return
 
         for event in events:
             last_seq = max(last_seq, int(str(event["seq"])))
             yield _format_event(event)
             idle_for = 0.0
 
-        record = await store.get_for_user(task_id, principal_user)
-        if record is None:
-            # Ownership changed or the task was deleted mid-stream. Ending the
-            # stream is the only safe move; continuing could leak later events.
-            yield _format_event(
-                {"seq": last_seq + 1, "type": "stream_closed", "payload": {"reason": "gone"}}
-            )
-            return
-
-        if record.status.value in _TERMINAL and not events:
+        # ``record is None`` with ``degraded`` set is a failed read rather than an
+        # answer, so the loop falls through to the tail and tries again next tick.
+        # Ending the stream there would turn one bad poll into a dropped client.
+        if record is not None and record.status.value in _TERMINAL and not events:
             yield _format_event(
                 {
                     "seq": last_seq + 1,

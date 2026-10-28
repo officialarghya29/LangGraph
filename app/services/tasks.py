@@ -57,10 +57,13 @@ class InMemoryTaskStore(TaskStore):
         self._records[task_id] = updated
         return updated
 
-    async def list(self, *, user_id: str | None = None, limit: int = 50) -> Sequence[TaskRecord]:
-        """Return recent records, newest first, optionally scoped to one user."""
-        records = list(self._records.values())
-        if user_id is not None:
-            records = [record for record in records if record.user_id == user_id]
+    async def list(self, *, user_id: str, limit: int = 50) -> Sequence[TaskRecord]:
+        """Return one user's recent records, newest first.
+
+        Scoped rather than optionally scoped, matching the durable store: there is
+        no caller that wants every owner's tasks, and an optional scope is how an
+        unscoped query gets written by accident.
+        """
+        records = [record for record in self._records.values() if record.user_id == user_id]
         records.sort(key=lambda record: record.created_at, reverse=True)
         return records[:limit]
