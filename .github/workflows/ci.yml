@@ -169,8 +169,56 @@ jobs:
       # The report is printed on every run so a regression is visible in the log
       # rather than only in a failed test. The score itself is asserted by
       # tests/evaluation/, which is where a threshold belongs.
+      #
+      # The benchmark half of this report is the one that moves when a hot path is
+      # changed — the transport adapter and the stream poll are both in it — so the
+      # numbers are printed next to the routing score rather than only failing an
+      # assertion in the test job.
       - name: Report
-        run: .venv/bin/python scripts/evaluate.py --iterations 100
+        run: .venv/bin/python scripts/evaluate.py --iterations 100 --json evaluation.json
+
+      - name: Keep the numbers
+        uses: actions/upload-artifact@v4
+        with:
+          name: evaluation-report
+          path: evaluation.json
+          retention-days: 14
+
+  # ------------------------------------------------------------------------- #
+  # One real vendor call
+  # ------------------------------------------------------------------------- #
+  live:
+    name: Live provider
+    # Not on pull requests: a fork has no access to the secret, so the job would
+    # skip every time and report a green check that never tested anything. The
+    # suite skips itself when the credential is empty, which is what makes this
+    # safe to run on a repository that has not configured one — it reports a
+    # skip, not a pass.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      # Configured as a repository secret. Absent, the suite skips in one line;
+      # present, this is the only job that can notice a model name the vendor has
+      # retired, which no scripted server can.
+      LLM_PROVIDER: openai
+      LLM_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      APP_ENV: development
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+
+      - name: Install
+        run: |
+          uv venv
+          uv pip install -e ".[dev]"
+
+      - name: One real call
+        run: .venv/bin/python -m pytest -m live -q -rs
 
   # ------------------------------------------------------------------------- #
   # The committed diagrams must match the script that generates them

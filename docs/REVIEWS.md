@@ -598,6 +598,56 @@ interprets it, against the response's own `Date` header, exactly so that two
 clocks are never subtracted. The documentation was the older of the two and is now
 the accurate one.
 
+### Found by the fifth pass, and fixed
+
+This pass followed the cost into two paths the fourth had only touched, and the
+pattern held: the expensive part was a repeated acquisition — of a query, of a
+poll, of a Python frame per multiply.
+
+**A retrieval that ran one query per tier.** `PostgresStore.candidates` looped
+over the tiers being scanned, ran the same statement once each, then sorted the
+union in Python so it could return `limit` rows. For the default two tiers that
+read up to `2 × limit` rows to return `limit`, and put the ordering in a second
+place that had to agree with the database. One query with `kind IN (...)` and the
+`LIMIT` the database already understands: measured on 700 stored rows as 3
+queries returning 700 rows against 2 returning 501 — the second being the
+identity lookup that is genuinely separate.
+
+**A dot product built one generator frame per multiplication.** Retrieval is
+exact cosine over Python floats, so the numerator runs 500 × 256 times per scan.
+`sum(map(operator.mul, a, b))` sums the same products in the same order as the
+generator expression it replaced — the results are bit-identical, which matters
+because a reformulation that rounded differently would reorder exact ties between
+near-duplicate memories — and measured **1.7× faster**: 27.9 µs against 14.1 µs
+per 256-wide product, which is 7 ms of a retrieval. The end-to-end retrieval
+benchmark went from 27 ms to 16 ms, and both the comparison and the exactness are
+now assertions rather than a claim in a commit message.
+
+**An idle stream polling at the active rate.** The interval was a constant, which
+is a compromise nobody wins: 400 ms is a database poll every 400 ms per viewer for
+a task waiting ten minutes on a human. It now doubles after each poll that finds
+nothing, up to two seconds, and resets to the floor when an event arrives — so the
+latency is where the activity is and the cost is not. A failed poll counts as idle
+as well, so an unhealthy database is not hammered by every connected client at the
+floor rate. Idle cost per viewer drops fivefold; the worst-case delay before a
+client learns a task finished is two seconds.
+
+**A live check that nothing ran.** `tests/live/` existed and no job invoked it. The
+marker is now excluded from the default run rather than merely skipped — a
+developer with a real key in `.env` would otherwise have spent money on every full
+suite — and CI has a job that sets the credential from a repository secret and
+runs `pytest -m live`. Absent the secret it reports a skip rather than a pass,
+which is the difference between "not configured" and "verified".
+
+**Two ways a benchmark could have lied.** The end-to-end recall measurement was
+seeded with the shared fixture's three-dimensional vectors while the embedder
+produces 256 — a length mismatch makes the cosine short-circuit before the dot
+product, so the first number it produced (1.3 ms) described a bug rather than a
+retrieval. And the evaluation job printed routing alongside benchmarks but kept
+no record of either; the JSON report is now uploaded as an artifact. Both are the
+same lesson as the rest of this pass: an unmeasured optimisation and a
+mismeasured one are equally worthless, and the second is more convincing.
+
 ## Verification
 
 | Phase | Scope | Status |
@@ -608,6 +658,7 @@ the accurate one.
 | — | Deep scan | Complete — thirteen findings fixed, one verified non-defect, five settings documented and two configuration defects closed |
 | — | Deep scan, third pass | Complete — seven findings fixed, all in the model layer or found from it; two settings added, two configuration defects closed |
 | — | Deep scan, fourth pass | Complete — four findings fixed, each measured rather than assumed: 264 ms of handshake removed per model call, one database session removed per stream poll, a template line that parsed as a value, an uncalled list branch. Three of the four now have a test that fails without the fix |
+| — | Deep scan, fifth pass | Complete — four findings fixed in the paths the fourth pass opened: one query instead of one per tier, a dot product 1.7× faster with bit-identical output, a fivefold cheaper idle stream, and a live check that CI now actually runs. Two measurement defects corrected; one optimisation measured, rejected, and recorded |
 
 Migration verification, which was blocked alongside the container work, was
 completed without a container runtime: the revision applies to an empty database,

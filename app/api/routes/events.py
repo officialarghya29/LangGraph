@@ -37,8 +37,18 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1", tags=["events"])
 
-#: How often the durable log is polled for new events.
+#: How often the durable log is polled while a task is producing events.
 POLL_INTERVAL_SECONDS = 0.4
+#: Ceiling the interval backs off to when nothing is happening.
+#:
+#: A fixed interval is a compromise nobody wins: fast enough to feel live on a
+#: busy task and it is a poll every 400 ms per viewer for a task that has been
+#: waiting on a human for ten minutes; slow enough to be cheap and the first
+#: event of a run arrives visibly late. Backing off resolves that, because the
+#: cost and the latency are wanted at opposite ends of the same run. The cap is
+#: deliberately small — it is the delay before a client learns a task finished,
+#: and two seconds is the most that a person will not notice.
+MAX_POLL_INTERVAL_SECONDS = 2.0
 #: A comment is sent this often so an idle stream is not closed by a proxy.
 HEARTBEAT_SECONDS = 15.0
 #: Hard ceiling on one connection. A client reconnects with ``after_seq``.
@@ -48,6 +58,27 @@ BATCH_SIZE = 200
 
 #: Statuses after which no further event can arrive.
 _TERMINAL = {TaskStatus.COMPLETED.value, TaskStatus.FAILED.value, TaskStatus.CANCELLED.value}
+
+
+def _next_interval(current: float, *, produced: bool) -> float:
+    """Return the interval to wait after a poll.
+
+    Doubling rather than stepping through a table: the interesting range is one
+    order of magnitude wide, and two doublings reach it from the floor.
+
+    Args:
+        current: The interval just used, in seconds.
+        produced: Whether the poll returned anything new.
+
+    Returns:
+        The floor after a poll that found work, otherwise the next interval up to
+        the cap. A failed read counts as idle, so an unhealthy database is polled
+        at the same reduced rate as an idle one instead of being hammered by every
+        connected client at the floor interval.
+    """
+    if produced:
+        return POLL_INTERVAL_SECONDS
+    return min(current * 2, MAX_POLL_INTERVAL_SECONDS)
 
 
 def _format_event(event: dict[str, object]) -> str:
@@ -75,6 +106,7 @@ async def _event_stream(
     last_seq = after_seq
     started = asyncio.get_running_loop().time()
     idle_for = 0.0
+    interval = POLL_INTERVAL_SECONDS
 
     yield _format_event(
         {
@@ -140,8 +172,12 @@ async def _event_stream(
             )
             return
 
-        await asyncio.sleep(POLL_INTERVAL_SECONDS)
-        idle_for += POLL_INTERVAL_SECONDS
+        await asyncio.sleep(interval)
+        idle_for += interval
+        # Computed from what this poll returned, so a run that is producing events
+        # keeps the floor and a task parked on a human costs a fifth as much to
+        # watch. ``degraded`` counts as idle for the reason given above.
+        interval = _next_interval(interval, produced=bool(events))
         if idle_for >= HEARTBEAT_SECONDS:
             idle_for = 0.0
             # A comment frame keeps the connection alive through an idle proxy.

@@ -30,6 +30,7 @@ from app.evaluation.benchmarks import (  # noqa: E402
     BenchmarkResult,
     TimingResult,
     benchmark_suite,
+    dot_product_comparison,
     scoring_comparison,
 )
 from app.evaluation.harness import (  # noqa: E402
@@ -72,14 +73,15 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def _report_markdown(
     report: EvaluationReport,
     suite: tuple[TimingResult, ...],
-    comparison: BenchmarkResult,
+    comparisons: tuple[BenchmarkResult, ...],
 ) -> str:
     """Render the full report as Markdown.
 
     Args:
         report: The routing evaluation.
         suite: The measured hot paths.
-        comparison: The prepared-versus-unprepared scoring comparison.
+        comparisons: The paired comparisons, each of which also asserts that the
+            two implementations agree.
 
     Returns:
         The rendered Markdown.
@@ -95,7 +97,7 @@ def _report_markdown(
         "",
         *[f"- {result.summary()}" for result in suite],
         "",
-        f"- {comparison.summary()}",
+        *[f"- {comparison.summary()}" for comparison in comparisons],
         "",
     ]
     return "\n".join(lines)
@@ -104,14 +106,14 @@ def _report_markdown(
 def _raw_payload(
     report: EvaluationReport,
     suite: tuple[TimingResult, ...],
-    comparison: BenchmarkResult,
+    comparisons: tuple[BenchmarkResult, ...],
 ) -> dict[str, Any]:
     """Return the machine-readable form of the report.
 
     Args:
         report: The routing evaluation.
         suite: The measured hot paths.
-        comparison: The prepared-versus-unprepared scoring comparison.
+        comparisons: The paired comparisons.
 
     Returns:
         A JSON-serialisable dictionary.
@@ -158,12 +160,14 @@ def _raw_payload(
                 }
                 for result in suite
             },
-            "scoring": {
-                "name": comparison.name,
-                "equivalent": comparison.equivalent,
-                "speedup": comparison.speedup,
-                "baseline_mean_ms": comparison.baseline.mean_ms,
-                "candidate_mean_ms": comparison.candidate.mean_ms,
+            "comparisons": {
+                comparison.name: {
+                    "equivalent": comparison.equivalent,
+                    "speedup": comparison.speedup,
+                    "baseline_mean_ms": comparison.baseline.mean_ms,
+                    "candidate_mean_ms": comparison.candidate.mean_ms,
+                }
+                for comparison in comparisons
             },
         },
     }
@@ -183,17 +187,21 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     report = asyncio.run(RouteEvaluator().evaluate(RuleBasedRouter()))
     suite = benchmark_suite(iterations=args.iterations)
-    comparison = scoring_comparison(iterations=args.iterations)
+    comparisons = (
+        scoring_comparison(iterations=args.iterations),
+        dot_product_comparison(iterations=args.iterations * 2),
+    )
 
     if args.quiet:
         print(report.headline())
-        print(comparison.summary())
+        for comparison in comparisons:
+            print(comparison.summary())
     else:
-        print(_report_markdown(report, suite, comparison))
+        print(_report_markdown(report, suite, comparisons))
 
     if args.json is not None:
         args.json.write_text(
-            json.dumps(_raw_payload(report, suite, comparison), indent=2) + "\n",
+            json.dumps(_raw_payload(report, suite, comparisons), indent=2) + "\n",
             encoding="utf-8",
         )
         print(f"wrote {args.json}")

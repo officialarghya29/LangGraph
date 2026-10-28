@@ -706,14 +706,24 @@ class MemoryRepository(_ChildRepository):
         user_id: uuid.UUID,
         *,
         kind: str | None = None,
+        kinds: Sequence[str] | None = None,
         conversation_id: uuid.UUID | None = None,
         task_id: uuid.UUID | None = None,
         limit: int = 200,
     ) -> Sequence[MemoryRecord]:
-        """Return a user's memories, newest first, with optional narrowings."""
+        """Return a user's memories, newest first, with optional narrowings.
+
+        ``kinds`` exists so retrieval can narrow to several tiers in one query.
+        It used to loop over the kinds and call this once per kind, which fetched
+        up to ``limit`` rows per tier and then sorted them in Python to keep
+        ``limit`` — twice the rows read, in a second place that could order them
+        differently from the database.
+        """
         statement = select(MemoryRecord).where(MemoryRecord.user_id == user_id)
         if kind is not None:
             statement = statement.where(MemoryRecord.kind == kind)
+        if kinds is not None:
+            statement = statement.where(MemoryRecord.kind.in_(tuple(kinds)))
         if conversation_id is not None:
             statement = statement.where(MemoryRecord.conversation_id == conversation_id)
         if task_id is not None:

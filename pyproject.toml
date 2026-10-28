@@ -146,9 +146,14 @@ asyncio_mode = "auto"
 # the loop keeps the fixture scopes and the engine's lifetime consistent.
 asyncio_default_fixture_loop_scope = "session"
 asyncio_default_test_loop_scope = "session"
-addopts = "-ra --strict-markers --strict-config"
+# ``live`` is excluded from the default run rather than only skipped when the
+# credential is missing. A developer whose ``.env`` holds a real key would
+# otherwise spend money and a network round trip on every full-suite run, which is
+# how a test that is meant to be opt-in quietly becomes part of the gate. A
+# command-line ``-m`` replaces this one, so ``pytest -m live`` still works.
+addopts = "-ra --strict-markers --strict-config -m 'not live'"
 markers = [
     "integration: requires external services (PostgreSQL, Redis)",
     "evaluation: benchmark and quality evaluation cases",
-    "live: calls a real vendor endpoint; skips unless a credential is configured",
+    "live: calls a real vendor endpoint; excluded by default, skips without a credential",
 ]

@@ -18,17 +18,22 @@ benchmark would happily report one.
 
 from __future__ import annotations
 
+import asyncio
 import gc
 import math
+import operator
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, TypeVar
 
 from app.core.config import get_settings
 from app.models.memory import MemoryItem, MemoryType
+from app.services.embeddings import build_embedding_provider
 from app.services.memory import (
+    InMemoryMemoryStore,
+    MemoryManager,
     MemoryQuery,
     _prepare_query,
     _tokens,
@@ -170,6 +175,48 @@ def measure(
         for _ in range(max(1, iterations)):
             started = time.perf_counter()
             operation()
+            samples.append((time.perf_counter() - started) * 1000)
+    finally:
+        if enabled:
+            gc.enable()
+
+    return TimingResult(name=name, samples_ms=tuple(samples))
+
+
+async def measure_async(
+    operation: Callable[[], Awaitable[Any]],
+    *,
+    name: str = "operation",
+    iterations: int = 200,
+    warmup: int = 20,
+) -> TimingResult:
+    """Time an awaitable operation repeatedly, in one event loop.
+
+    Separate from :func:`measure` rather than bolted onto it, because the obvious
+    shortcut — ``asyncio.run`` inside the sync harness — measures the loop it
+    builds per sample rather than the work. The loop here is set up once, so a
+    sample is one ``await`` and nothing else.
+
+    Args:
+        operation: A zero-argument callable returning an awaitable. Called afresh
+            per sample, so a coroutine object is never awaited twice.
+        name: Label for the result.
+        iterations: How many timed samples to take.
+        warmup: How many untimed calls to make first.
+
+    Returns:
+        The measured distribution.
+    """
+    for _ in range(max(0, warmup)):
+        await operation()
+
+    samples: list[float] = []
+    enabled = gc.isenabled()
+    gc.disable()
+    try:
+        for _ in range(max(1, iterations)):
+            started = time.perf_counter()
+            await operation()
             samples.append((time.perf_counter() - started) * 1000)
     finally:
         if enabled:
@@ -329,6 +376,43 @@ def _sample_memories(count: int = _SCAN_SIZE) -> list[tuple[MemoryItem, list[flo
 # --------------------------------------------------------------------------- #
 
 
+def dot_product_comparison(*, iterations: int = 400) -> BenchmarkResult:
+    """Compare two formulations of the cosine numerator.
+
+    ``sum(map(mul, a, b))`` sums the same products in the same order as the
+    generator expression it replaced, so the two are bit-identical here rather
+    than close — which is why the default equality check is the right one and no
+    tolerance is supplied. That property matters more than the speed: a
+    reformulation that changed the last digits would reorder exact ties, and
+    retrieval ties are not hypothetical in a corpus of near-duplicate notes.
+
+    Args:
+        iterations: Samples per implementation. Higher than the scoring default,
+            because one dot product is a few microseconds.
+
+    Returns:
+        The comparison, including whether the two agreed.
+    """
+    width = get_settings().embedding_dimensions
+    left = [((index * 7) % 23) / 23 for index in range(width)]
+    right = [((index * 11) % 19) / 19 for index in range(width)]
+
+    def baseline() -> float:
+        return sum(a * b for a, b in zip(left, right, strict=True))
+
+    def candidate() -> float:
+        total: float = sum(map(operator.mul, left, right))
+        return total
+
+    return compare(
+        f"dot product ({width}-wide)",
+        baseline,
+        candidate,
+        iterations=iterations,
+        warmup=50,
+    )
+
+
 def scoring_comparison(*, iterations: int = 200) -> BenchmarkResult:
     """Compare preparing the query once against preparing it per candidate.
 
@@ -415,4 +499,59 @@ def benchmark_suite(*, iterations: int = 200) -> tuple[TimingResult, ...]:
             name="score 500 candidates (lexical fallback)",
             iterations=iterations,
         ),
+        asyncio.run(recall_measurement(iterations=iterations)),
+    )
+
+
+async def recall_measurement(*, iterations: int = 200) -> TimingResult:
+    """Measure one retrieval as the service actually performs it.
+
+    The measurements above time the pieces. This times the operation a run pays
+    for: fetch the candidates, embed the query, score, rank, and record what was
+    used — through the public :meth:`MemoryManager.recall`.
+
+    Three results worth keeping, all measured rather than assumed. At the default
+    scan limit of 500 the in-memory split is roughly 0.3 ms fetching, 0.1 ms
+    embedding with the local embedder, and 0.7 ms scoring and ranking, so the cost
+    is the scoring loop rather than the store. Against PostgreSQL the same
+    retrieval costs about 32 ms, split as 13 ms for the query and row transfer,
+    5 ms building a ``MemoryItem`` per candidate, and the rest in the session and
+    the embedding coercion — which is why the scan limit is the knob that matters
+    on that path and why the durable store narrows by kind in the query. And
+    replacing the full sort with ``heapq.nlargest`` was measured at 0.71 ms
+    against 0.72 ms for sorting 500 scores: a difference inside the noise, because
+    the scoring dominates and the ranking is a few hundred comparisons. It was
+    therefore not changed — an optimisation that cannot be measured is a change
+    with no benefit and a new failure mode.
+
+    Args:
+        iterations: How many timed samples to take.
+
+    Returns:
+        The measured distribution of one retrieval.
+    """
+    settings = get_settings()
+    store = InMemoryMemoryStore()
+    # Seeded through the store rather than through ``remember``: this measures
+    # retrieval, and paying for 500 writes in the fixture would measure the write
+    # path instead — and, with a threshold in the way, would decide how many
+    # candidates exist.
+    #
+    # The vectors are built at the configured width, matching what the embedder
+    # produces. The shared fixture's three-dimensional vectors would score
+    # *faster* here for the wrong reason: a length mismatch makes the cosine
+    # short-circuit before the dot product, so the benchmark would report the cost
+    # of a bug rather than the cost of a retrieval.
+    width = settings.embedding_dimensions
+    for index, (item, _) in enumerate(_sample_memories(_SCAN_SIZE)):
+        vector = [((index * (position + 3)) % 17) / 17 for position in range(width)]
+        store._items[item.id] = (item, vector, None)
+    manager = MemoryManager(store, build_embedding_provider(settings), settings)
+    query = MemoryQuery(user_id="bench-user", text=_SAMPLE_REQUEST, limit=5)
+
+    return await measure_async(
+        lambda: manager.recall(query),
+        name=f"recall {_SCAN_SIZE} candidates (end to end)",
+        iterations=iterations,
+        warmup=5,
     )

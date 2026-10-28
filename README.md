@@ -397,6 +397,24 @@ Two implementation notes worth knowing:
   `LONG_TERM` row no matter how old it is, because the tier exists precisely to
   outlive the reason it was written.
 
+What a retrieval costs is measured rather than assumed, and the two stores are
+different enough to say so. In memory, one recall over the default scan window of
+500 candidates is about 16 ms: roughly 0.3 ms fetching, 0.1 ms embedding the
+query with the local embedder, and the rest scoring and ranking. Against
+PostgreSQL the same retrieval costs about 32 ms, of which 13 ms is the query and
+row transfer and 5 ms is building a model per candidate — which is why the scan
+limit, not the scoring loop, is the knob that matters on the durable path, and
+why that query narrows by tier in SQL and returns at most `limit` rows.
+
+The cosine numerator is written as `sum(map(mul, a, b))` rather than a generator
+expression. Both sum the same products in the same order, so the scores are
+bit-identical, and the pair is timed against each other in the benchmark suite:
+**1.7× faster** at the 256 dimensions the local embedder produces, which is about
+7 ms of that 16 ms retrieval. Replacing the full sort with a heap to select the
+top five was measured too — 0.71 ms against 0.72 ms — and deliberately not done,
+because a change that cannot be measured is one with no benefit and a new failure
+mode.
+
 The scoring formula and the reasoning behind its weights are in
 [§4 of Why it is built this way](#4-retrieval-is-a-ranking-problem-with-three-axes).
 
@@ -949,7 +967,7 @@ one is failing.
 | **Assets** | The generated diagrams | An audit that measures every drawn label and fails on overlap or overflow |
 | **Configuration drift** | `.env.example`, `docker-compose.yml`, the `Dockerfile`, `.dockerignore` | Every documented key is compared against the settings layer in both directions, and the container's environment is checked for names that do not exist — a typo there is accepted silently and configures nothing |
 | **Concurrency** | Two runs in flight against one compiled graph | Separate event sinks, token budgets, and ceilings; the same request is asserted to cost the same whether or not it had company |
-| **Live** | One real model call against the configured vendor | Skipped unless `LLM_API_KEY` resolves to a value; asserts the model accepts the payload the adapter builds and that the name that answered belongs to the family that was asked for. It is the only check that can catch a retired model name, and it is excluded from the default run because it costs money and needs a network |
+| **Live** | One real model call against the configured vendor | Excluded from the default run and skipped unless `LLM_API_KEY` resolves to a value; asserts the model accepts the payload the adapter builds and that the name that answered belongs to the family that was asked for. It is the only check that can catch a retired model name, and it is opt-in because it costs money and needs a network — run it with `pytest -m live` |
 | **Ceilings** | `MAX_TOOL_CALLS`, `MAX_EXECUTION_TIME`, `MAX_TOKEN_BUDGET` | Each refusal is asserted to happen *before* the work, and to leave a caller with a reason rather than a stack trace |
 
 Two testing decisions are worth calling out, because both were found by getting

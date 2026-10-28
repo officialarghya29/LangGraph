@@ -19,9 +19,11 @@ It is deliberately one call with a short, cheap, checkable answer. A broader liv
 suite would be a second product; a single call answers the question that matters,
 which is "is this configuration accepted at all".
 
-Run it with a key, explicitly::
+The ``live`` marker is excluded from the default run in ``pyproject.toml``, so a
+key in a developer's ``.env`` cannot quietly turn every full-suite run into a paid
+one. Run it explicitly::
 
-    LLM_API_KEY=... python -m pytest tests/live -m live
+    LLM_API_KEY=... python -m pytest -m live
 """
 
 from __future__ import annotations

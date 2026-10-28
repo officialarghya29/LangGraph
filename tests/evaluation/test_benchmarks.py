@@ -13,6 +13,7 @@ holds regardless of how fast the host is.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Callable
 
 import pytest
@@ -25,8 +26,10 @@ from app.evaluation.benchmarks import (
     agrees_within,
     benchmark_suite,
     compare,
+    dot_product_comparison,
     measure,
     percentile,
+    recall_measurement,
     scoring_comparison,
 )
 from app.services.memory import MemoryQuery, _prepare_query, build_memory_manager, score_candidate
@@ -36,6 +39,9 @@ from app.services.memory import MemoryQuery, _prepare_query, build_memory_manage
 #: performance target.
 SCORE_BUDGET_MS = 40.0
 LEXICAL_BUDGET_MS = 60.0
+#: One full retrieval over the default scan window, in memory. Measured at about
+#: 16 ms after the dot-product change and 27 ms before it; 120 ms is the alarm.
+RECALL_BUDGET_MS = 120.0
 
 
 def _counter() -> Callable[[], int]:
@@ -228,8 +234,36 @@ def test_the_suite_measures_every_hot_path() -> None:
     """Each named operation is measured and reported."""
     results = benchmark_suite(iterations=10)
 
-    assert len(results) == 5
+    assert len(results) == 6
     names = " ".join(result.name for result in results)
     assert "tokenise" in names
     assert "score 500 candidates (vectors)" in names
+    assert "recall 500 candidates (end to end)" in names
     assert all(result.iterations > 0 for result in results)
+
+
+def test_a_retrieval_stays_within_budget() -> None:
+    """The operation a run actually pays for, measured through the public API.
+
+    The piecewise benchmarks above measure the parts and would stay green if
+    retrieval grew a second scan, an extra store round trip, or a per-candidate
+    rebuild of the query context. This one is the guard on the whole path.
+    """
+    result = asyncio.run(recall_measurement(iterations=20))
+
+    assert result.mean_ms < RECALL_BUDGET_MS, result.summary()
+
+
+def test_the_dot_product_reformulation_is_equivalent_and_faster() -> None:
+    """The one hot loop that was cheap to improve, with its exactness asserted.
+
+    Both formulations sum the same products in the same order, so the results are
+    bit-identical rather than merely close. That is the property worth pinning:
+    a faster numerator that rounded differently would reorder exact ties between
+    near-duplicate memories, which is a behaviour change disguised as an
+    optimisation.
+    """
+    result = dot_product_comparison(iterations=100)
+
+    assert result.equivalent, result.summary()
+    assert result.speedup > 1.2, result.summary()
