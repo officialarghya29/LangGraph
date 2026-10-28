@@ -218,6 +218,33 @@ def _retry_after_date(value: str, served_at: str | None) -> float | None:
     return seconds if seconds > 0 else None
 
 
+def _model_ids(payload: Any) -> tuple[str, ...]:
+    """Extract the model identifiers from a ``/models`` response.
+
+    Both vendors answer with ``{"data": [{"id": ...}, ...]}``; everything else in
+    the object differs. Parsed leniently by design: this exists to answer "does
+    the configured name still exist", and a stricter parser would turn a harmless
+    extra field into a failure of the check.
+
+    Args:
+        payload: The decoded response body.
+
+    Returns:
+        The identifiers, in the order the vendor returned them.
+    """
+    if not isinstance(payload, dict):
+        raise LLMError("provider returned an unexpected model list", detail=type(payload).__name__)
+    entries = payload.get("data")
+    if not isinstance(entries, list):
+        raise LLMError("provider returned an unexpected model list", detail="no data array")
+    ids = [
+        entry["id"]
+        for entry in entries
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str)
+    ]
+    return tuple(ids)
+
+
 def _strip_code_fence(text: str) -> str:
     """Remove a surrounding Markdown code fence, if present."""
     stripped = text.strip()
@@ -361,6 +388,17 @@ class LLMProvider(ABC):
         return _run_sync(
             self.ainvoke(messages, model=model, temperature=temperature, max_tokens=max_tokens)
         )
+
+    async def alist_models(self) -> tuple[str, ...]:
+        """Return the model identifiers the vendor currently serves.
+
+        Empty on the interface, because a provider is not obliged to offer a
+        catalogue and the fake has none. Where it is implemented it answers the
+        one question no scripted test can: whether the configured model name still
+        exists. That question costs a request and no inference, which is why it is
+        worth asking on every live run rather than only when a call fails.
+        """
+        return ()
 
     async def aclose(self) -> None:
         """Release the connection pool, if this provider owns one.
@@ -531,6 +569,33 @@ class OpenAICompatibleProvider(LLMProvider):
             self._client = httpx.AsyncClient(timeout=self._timeout)
         return self._client
 
+    async def alist_models(self) -> tuple[str, ...]:
+        """Return the model identifiers this endpoint serves.
+
+        ``/models`` on the OpenAI-compatible surface. It is the cheapest way to
+        answer "does the configured name still exist" — no tokens, no inference —
+        and it is the only check that would have caught a retired model name before
+        the first real call spent a request finding out.
+        """
+        url = f"{self._base_url}/models"
+        headers = {"Authorization": f"Bearer {self._api_key}"}
+        try:
+            response = await self._http_client().get(url, headers=headers)
+        except httpx.TimeoutException as exc:
+            raise LLMTimeoutError("provider did not respond in time", detail=url) from exc
+        except httpx.HTTPError as exc:
+            raise LLMError("provider request failed", detail=str(exc)) from exc
+
+        if response.status_code >= 400:
+            raise LLMError(
+                "provider refused the model listing",
+                detail=f"HTTP {response.status_code} from {url}",
+            )
+        try:
+            return _model_ids(response.json())
+        except ValueError as exc:
+            raise LLMError("provider returned an unexpected model list", detail=str(exc)) from exc
+
     def _payload(
         self,
         messages: Sequence[Message],
@@ -687,6 +752,35 @@ class AnthropicProvider(LLMProvider):
         if self._client is None:
             self._client = httpx.AsyncClient(timeout=self._timeout)
         return self._client
+
+    async def alist_models(self) -> tuple[str, ...]:
+        """Return the model identifiers this account can call.
+
+        The same shape as the OpenAI list — ``data[].id`` — behind a different
+        authentication header, which is why the parsing is shared and the request
+        is not.
+        """
+        url = f"{self._base_url}/models"
+        headers = {
+            "x-api-key": self._api_key,
+            "anthropic-version": "2023-06-01",
+        }
+        try:
+            response = await self._http_client().get(url, headers=headers)
+        except httpx.TimeoutException as exc:
+            raise LLMTimeoutError("provider did not respond in time", detail=url) from exc
+        except httpx.HTTPError as exc:
+            raise LLMError("provider request failed", detail=str(exc)) from exc
+
+        if response.status_code >= 400:
+            raise LLMError(
+                "provider refused the model listing",
+                detail=f"HTTP {response.status_code} from {url}",
+            )
+        try:
+            return _model_ids(response.json())
+        except ValueError as exc:
+            raise LLMError("provider returned an unexpected model list", detail=str(exc)) from exc
 
     async def ainvoke(
         self,

@@ -400,20 +400,29 @@ Two implementation notes worth knowing:
 What a retrieval costs is measured rather than assumed, and the two stores are
 different enough to say so. In memory, one recall over the default scan window of
 500 candidates is about 16 ms: roughly 0.3 ms fetching, 0.1 ms embedding the
-query with the local embedder, and the rest scoring and ranking. Against
-PostgreSQL the same retrieval costs about 32 ms, of which 13 ms is the query and
-row transfer and 5 ms is building a model per candidate — which is why the scan
-limit, not the scoring loop, is the knob that matters on the durable path, and
-why that query narrows by tier in SQL and returns at most `limit` rows.
+query with the local embedder, and the rest scoring and ranking.
+
+Against PostgreSQL the same retrieval over 500 rows of 256-dimensional vectors
+costs about 140 ms, and almost none of it is the work the in-memory figure
+measures. The query without the vectors is about 10 ms; the vectors cost about
+130 ms more, of which roughly 55 ms is transferring them as text and 95 ms is
+parsing 128 000 numbers back out of JSONB. Scoring, which is essentially the
+whole cost in memory, is 10 ms of it. That is why the scan limit, not the scoring
+loop, is the knob that matters on the durable path, and why that query narrows by
+tier in SQL and returns at most `limit` rows. It is also why the next lever there is a binary
+vector column rather than JSONB — storing the embedding as a float array would
+remove the parse entirely — which is a migration with a backfill and is not taken
+here, because nothing at this scale needs it yet.
 
 The cosine numerator is written as `sum(map(mul, a, b))` rather than a generator
 expression. Both sum the same products in the same order, so the scores are
 bit-identical, and the pair is timed against each other in the benchmark suite:
-**1.7× faster** at the 256 dimensions the local embedder produces, which is about
-7 ms of that 16 ms retrieval. Replacing the full sort with a heap to select the
-top five was measured too — 0.71 ms against 0.72 ms — and deliberately not done,
-because a change that cannot be measured is one with no benefit and a new failure
-mode.
+**1.7× faster** at the 256 dimensions the local embedder produces, which is
+several milliseconds of that 16 ms retrieval — the exact share moves with the
+machine, so the ratio is what is quoted and the absolute is "about". Replacing
+the full sort with a heap to select the top five was measured too — 0.71 ms
+against 0.72 ms — and deliberately not done, because a change that cannot be
+measured is one with no benefit and a new failure mode.
 
 The scoring formula and the reasoning behind its weights are in
 [§4 of Why it is built this way](#4-retrieval-is-a-ranking-problem-with-three-axes).

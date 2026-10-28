@@ -23,6 +23,7 @@ from app.evaluation.benchmarks import (
     _SAMPLE_REQUEST,
     TimingResult,
     _sample_memories,
+    _sample_query_embedding,
     agrees_within,
     benchmark_suite,
     compare,
@@ -35,9 +36,9 @@ from app.evaluation.benchmarks import (
 from app.services.memory import MemoryQuery, _prepare_query, build_memory_manager, score_candidate
 
 #: A 500-candidate scan must stay in the low milliseconds. The measured mean on
-#: the development host is roughly 2 ms; 40 ms is a regression alarm, not a
-#: performance target.
-SCORE_BUDGET_MS = 40.0
+#: the development host is 10 to 16 ms at 256 dimensions, the high end being a cold
+#: CPU that has not ramped; 60 ms is a regression alarm, not a performance target.
+SCORE_BUDGET_MS = 60.0
 LEXICAL_BUDGET_MS = 60.0
 #: One full retrieval over the default scan window, in memory. Measured at about
 #: 16 ms after the dot-product change and 27 ms before it; 120 ms is the alarm.
@@ -180,7 +181,7 @@ def test_prepared_and_unprepared_scoring_agree_on_every_score() -> None:
     a tie.
     """
     memories = _sample_memories(200)
-    query_embedding = [0.5, 0.25, 0.75]
+    query_embedding = _sample_query_embedding()
     manager = build_memory_manager(get_settings(), embeddings=None)
     query = MemoryQuery(user_id="bench-user", text=_SAMPLE_REQUEST, limit=10)
 
@@ -205,7 +206,7 @@ def test_prepared_and_unprepared_scoring_agree_on_every_score() -> None:
 def test_a_500_candidate_scan_stays_within_budget() -> None:
     """Scoring a full scan is milliseconds, not seconds."""
     memories = _sample_memories()
-    context = _prepare_query(_SAMPLE_REQUEST, [0.5, 0.25, 0.75])
+    context = _prepare_query(_SAMPLE_REQUEST, _sample_query_embedding())
 
     result = measure(
         lambda: [score_candidate(context, item, embedding) for item, embedding in memories],

@@ -28,6 +28,8 @@ one. Run it explicitly::
 
 from __future__ import annotations
 
+import difflib
+
 import pytest
 
 from app.core.config import get_settings
@@ -58,6 +60,46 @@ def live_provider() -> object:
             "the scripted transport tests cover the request and response contract"
         )
     return build_llm_provider(settings)
+
+
+async def test_the_configured_model_is_still_served() -> None:
+    """The cheapest possible check, and the one that fails first in real life.
+
+    A retired or renamed model is the commonest reason a working deployment stops
+    working, and finding out by inference means paying for the privilege of a
+    model-not-found error. The catalogue costs one request and no tokens.
+
+    Listing is not availability: a model can be listed and not enabled for this
+    account, and only the call below establishes that. This is the check that
+    names the problem, not the one that proves the system works.
+    """
+    provider = live_provider()  # type: ignore[assignment]
+    settings = get_settings()
+
+    models = await provider.alist_models()
+
+    assert models, f"{settings.llm_provider} returned an empty model catalogue"
+    assert settings.llm_model_name in models, (
+        f"{settings.llm_model_name!r} is not served by {settings.llm_provider}. "
+        f"Closest names in the catalogue: {_closest(settings.llm_model_name, models)}"
+    )
+
+
+def _closest(name: str, models: tuple[str, ...]) -> list[str]:
+    """Return the catalogue entries most similar to ``name``.
+
+    A retired name is usually one tier or one version away from a live one, so the
+    useful part of the failure message is the three nearest strings rather than a
+    list of ninety.
+
+    Args:
+        name: The configured model name.
+        models: The identifiers the vendor serves.
+
+    Returns:
+        Up to three near matches, best first; empty when nothing is close.
+    """
+    return difflib.get_close_matches(name, models, n=3, cutoff=0.4)
 
 
 async def test_the_configured_model_accepts_the_request_this_adapter_sends() -> None:

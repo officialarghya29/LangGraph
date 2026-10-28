@@ -648,6 +648,40 @@ no record of either; the JSON report is now uploaded as an artifact. Both are th
 same lesson as the rest of this pass: an unmeasured optimisation and a
 mismeasured one are equally worthless, and the second is more convincing.
 
+### A durable number that had never been re-derived
+
+The same pass put a figure on durable retrieval that turned out to be wrong in
+the same way as the in-memory one. It read "about 32 ms, of which 13 ms is the
+query and row transfer and 5 ms is building a model per candidate", and it could
+only have been taken against rows whose vectors never exercised the transfer
+path — because the vectors are, in fact, nearly the whole cost. Measured on 500
+rows of 256-dimensional vectors, three times over: 139, 144, and 154 ms per scan,
+with the same query and the same ordering costs 7 to 10 ms without the vector
+column. Splitting those 130 ms further, by asking the server for the same values
+as text and parsing them here: about 55 ms is the transfer and about 95 ms is
+the client turning 128 000 numbers back into floats. The scoring loop, which is
+the dominant cost in memory, is about 10 ms of the durable scan.
+
+The same defect was still in the scoring benchmark itself. Its samples were
+three-dimensional while the embedder produces 256, so "score 500 candidates
+(vectors)" reported 1.6 ms for work that costs ten — the dot product it timed was
+three multiplications long, and the exact ties the ranking tests rely on came
+from that arithmetic rather than from anything the service would see. The samples
+are now built at the configured width, including the query vector; the index
+arithmetic keeps its period, so the ties survive and the tests still assert what
+they were written to assert.
+
+That measurement is what settled the next question rather than a preference. The
+obvious optimisation was to stop recomputing each candidate's vector norm during
+the scan, which costs a square root over 256 terms per row: 8.47 ms against
+3.14 ms for 500 candidates, a real 63% of the scoring stage. Storing the norm
+alongside the vector was written, migrated, and tested, and then reverted — it
+buys 5 ms of 140 on the path production actually uses, in exchange for a schema
+column, a nullable fallback for every row written before it, and a second source
+of truth for a derived number. The honest description is "inside the noise of the
+thing it sits inside". Both the heap and the norm are recorded here so the next
+person does not derive the same two numbers and ship the second one.
+
 ## Verification
 
 | Phase | Scope | Status |
@@ -658,7 +692,7 @@ mismeasured one are equally worthless, and the second is more convincing.
 | — | Deep scan | Complete — thirteen findings fixed, one verified non-defect, five settings documented and two configuration defects closed |
 | — | Deep scan, third pass | Complete — seven findings fixed, all in the model layer or found from it; two settings added, two configuration defects closed |
 | — | Deep scan, fourth pass | Complete — four findings fixed, each measured rather than assumed: 264 ms of handshake removed per model call, one database session removed per stream poll, a template line that parsed as a value, an uncalled list branch. Three of the four now have a test that fails without the fix |
-| — | Deep scan, fifth pass | Complete — four findings fixed in the paths the fourth pass opened: one query instead of one per tier, a dot product 1.7× faster with bit-identical output, a fivefold cheaper idle stream, and a live check that CI now actually runs. Two measurement defects corrected; one optimisation measured, rejected, and recorded |
+| — | Deep scan, fifth pass | Complete — four findings fixed in the paths the fourth pass opened: one query instead of one per tier, a dot product 1.7× faster with bit-identical output, a fivefold cheaper idle stream, and a live check that CI now actually runs. Three measurement defects corrected — two benchmarks and the durable figure they contradicted; two optimisations measured and rejected, both recorded so they are not re-derived |
 
 Migration verification, which was blocked alongside the container work, was
 completed without a container runtime: the revision applies to an empty database,

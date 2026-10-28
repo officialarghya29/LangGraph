@@ -8,9 +8,12 @@ pruning expires the volatile tiers without touching the curated one.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
@@ -23,6 +26,44 @@ from app.services.memory import (
     PostgresMemoryStore,
     build_memory_manager,
 )
+
+
+@contextmanager
+def counting(database: Database) -> Iterator[dict[str, int]]:
+    """Count the statements and returned rows a block issues on ``database``.
+
+    Listens on the engine rather than on the repository, so a query added anywhere
+    in the path — a repository, a store, a service that opened its own session — is
+    counted. Row counts are taken from the cursor description, which is enough to
+    tell a scan from a lookup.
+
+    Args:
+        database: The database whose engine to watch.
+
+    Yields:
+        A mutable mapping with ``queries`` and ``rows``, updated as the block runs.
+    """
+    stats = {"queries": 0, "rows": 0}
+
+    def before(
+        _conn: Any, _cursor: Any, _statement: str, _params: Any, _context: Any, _many: Any
+    ) -> None:
+        stats["queries"] += 1
+
+    def after(
+        _conn: Any, cursor: Any, _statement: str, _params: Any, _context: Any, _many: Any
+    ) -> None:
+        if cursor.description is not None:
+            stats["rows"] += max(cursor.rowcount, 0)
+
+    engine = database.engine.sync_engine
+    event.listen(engine, "before_cursor_execute", before)
+    event.listen(engine, "after_cursor_execute", after)
+    try:
+        yield stats
+    finally:
+        event.remove(engine, "before_cursor_execute", before)
+        event.remove(engine, "after_cursor_execute", after)
 
 
 def build_manager(database: Database, **overrides: object) -> MemoryManager:
@@ -318,6 +359,63 @@ async def test_the_manager_is_owner_scoped_through_the_real_store(database: Data
 
     assert recalled
     assert all(item.user_id != "bob" for item in recalled)
+
+
+async def test_one_recall_reads_one_candidate_query(database: Database) -> None:
+    """A scan must not cost a query per tier, or read more rows than it returns.
+
+    Retrieval used to run the same statement once per tier, then sort the union in
+    Python to recover ``limit`` rows: two tiers meant up to twice as many rows read
+    as returned, plus a second place responsible for the ordering. Counted at the
+    driver rather than timed, because a query count is the same on every machine
+    and a duration is not.
+    """
+    manager = build_manager(database)
+    for index in range(40):
+        await manager.remember(
+            f"note {index} about the checkpointing backend and its recovery time",
+            user_id="alice",
+            importance=0.9,
+        )
+
+    store = PostgresMemoryStore(database)
+    with counting(database) as stats:
+        candidates = await store.candidates(
+            user_id="alice",
+            kinds=(MemoryType.LONG_TERM, MemoryType.EXECUTION),
+            limit=25,
+        )
+
+    assert len(candidates) == 25
+    # Two: the identity lookup and the one candidate query. Three would mean the
+    # per-tier loop is back; more would mean a candidate conversion that queries.
+    assert stats["queries"] == 2, f"{stats['queries']} queries for one scan"
+    assert stats["rows"] <= 26, f"read {stats['rows']} rows to return 25"
+
+
+async def test_a_whole_recall_stays_within_its_query_budget(database: Database) -> None:
+    """The end-to-end path, counted: fetch, embed, rank, and record access.
+
+    The number includes the write that marks what was used, which is the one part
+    of a recall that is not a read. It is asserted so that adding a stage to
+    retrieval — a second scan, a lookup per candidate, a re-read after the write —
+    shows up as a failing test rather than as a slower task.
+    """
+    manager = build_manager(database)
+    for index in range(40):
+        await manager.remember(
+            f"note {index} about the checkpointing backend and its recovery time",
+            user_id="alice",
+            importance=0.9,
+        )
+
+    with counting(database) as stats:
+        recalled = await manager.recall(
+            MemoryQuery(text="checkpointing recovery time", user_id="alice", limit=5)
+        )
+
+    assert recalled
+    assert stats["queries"] <= 4, f"{stats['queries']} queries for one recall"
 
 
 async def test_consolidation_against_real_rows(database: Database) -> None:

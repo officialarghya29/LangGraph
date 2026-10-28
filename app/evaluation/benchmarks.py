@@ -330,12 +330,31 @@ def agrees_within(
 # --------------------------------------------------------------------------- #
 
 
+def _sample_query_embedding() -> list[float]:
+    """Return a deterministic query vector at the width retrieval actually uses.
+
+    Separate from the samples so every scoring benchmark can share it. A query
+    vector of a different width from the candidates does not measure a slower or
+    faster scoring loop — the cosine returns early on the length mismatch — so the
+    width is taken from settings rather than written as a literal.
+
+    Returns:
+        A vector of ``embedding_dimensions`` components in ``(0, 1)``.
+    """
+    width = get_settings().embedding_dimensions
+    return [((index * 5) % 13) / 13 + 0.01 for index in range(width)]
+
+
 def _sample_memories(count: int = _SCAN_SIZE) -> list[tuple[MemoryItem, list[float]]]:
     """Return synthetic memories and embeddings for the scoring benchmarks.
 
     The content is varied enough that lexical overlap is not degenerate, and the
-    embeddings are low-dimensional so the benchmark measures the scoring loop
-    rather than vector arithmetic on a realistic 1536-dimension model output.
+    embeddings are at the configured width, so the benchmark prices the cosine the
+    service actually computes. They used to be three-dimensional — which reported
+    1.6 ms for a scan that costs about 10 ms, because the dot product it never ran
+    was most of the work. The index arithmetic has period seven in ``index``, so
+    two rows seven apart are identical vectors and the sample still contains the
+    exact ties the ranking tests rely on.
 
     Args:
         count: How many memories to build.
@@ -351,6 +370,7 @@ def _sample_memories(count: int = _SCAN_SIZE) -> list[tuple[MemoryItem, list[flo
         "memory retrieval blends similarity importance and recency",
         "approvals are persisted so they survive a restart",
     )
+    width = get_settings().embedding_dimensions
     memories: list[tuple[MemoryItem, list[float]]] = []
     for index in range(count):
         content = f"{topics[index % len(topics)]} (note {index})"
@@ -365,7 +385,7 @@ def _sample_memories(count: int = _SCAN_SIZE) -> list[tuple[MemoryItem, list[flo
                     created_at=now - timedelta(days=index % 30),
                     metadata={"index": index},
                 ),
-                [float(index % 7), float((index + 1) % 5), float((index + 2) % 3)],
+                [((index % 7) * (position + 3) % 17) / 17 + 0.01 for position in range(width)],
             )
         )
     return memories
@@ -428,7 +448,7 @@ def scoring_comparison(*, iterations: int = 200) -> BenchmarkResult:
         The paired comparison.
     """
     memories = _sample_memories()
-    query_embedding = [0.5, 0.25, 0.75]
+    query_embedding = _sample_query_embedding()
     manager = build_memory_manager(get_settings(), embeddings=None)
     query = MemoryQuery(user_id="bench-user", text=_SAMPLE_REQUEST, limit=10)
 
@@ -471,7 +491,7 @@ def benchmark_suite(*, iterations: int = 200) -> tuple[TimingResult, ...]:
         One result per measured operation, in reporting order.
     """
     memories = _sample_memories()
-    context = _prepare_query(_SAMPLE_REQUEST, [0.5, 0.25, 0.75])
+    context = _prepare_query(_SAMPLE_REQUEST, _sample_query_embedding())
 
     def tokenise() -> frozenset[str]:
         return frozenset(_tokens(_SAMPLE_REQUEST))
@@ -480,7 +500,7 @@ def benchmark_suite(*, iterations: int = 200) -> tuple[TimingResult, ...]:
         return estimate_importance(_SAMPLE_REQUEST)
 
     def prepare_query() -> object:
-        return _prepare_query(_SAMPLE_REQUEST, [0.5, 0.25, 0.75])
+        return _prepare_query(_SAMPLE_REQUEST, _sample_query_embedding())
 
     def score_prepared() -> list[float]:
         return [score_candidate(context, item, embedding) for item, embedding in memories]
@@ -512,12 +532,16 @@ async def recall_measurement(*, iterations: int = 200) -> TimingResult:
 
     Three results worth keeping, all measured rather than assumed. At the default
     scan limit of 500 the in-memory split is roughly 0.3 ms fetching, 0.1 ms
-    embedding with the local embedder, and 0.7 ms scoring and ranking, so the cost
-    is the scoring loop rather than the store. Against PostgreSQL the same
-    retrieval costs about 32 ms, split as 13 ms for the query and row transfer,
-    5 ms building a ``MemoryItem`` per candidate, and the rest in the session and
-    the embedding coercion — which is why the scan limit is the knob that matters
-    on that path and why the durable store narrows by kind in the query. And
+    embedding with the local embedder, and 10 to 16 ms scoring and ranking — a
+    cosine and a norm per candidate — so the cost is the scoring loop rather than
+    the store. Against PostgreSQL the same
+    retrieval over 500 rows of 256-dimensional vectors is about 140 ms, and the
+    split is the opposite of the in-memory one: about 10 ms for the query without
+    the vectors, about 55 ms transferring them, and about 95 ms parsing 128 000
+    numbers back out of JSONB. That is why the scan limit is the knob that matters
+    on that path and why the durable store narrows by kind in the query — and why
+    the next lever there is a binary vector column rather than JSONB, which is a
+    migration with a backfill and is not taken here. And
     replacing the full sort with ``heapq.nlargest`` was measured at 0.71 ms
     against 0.72 ms for sorting 500 scores: a difference inside the noise, because
     the scoring dominates and the ranking is a few hundred comparisons. It was

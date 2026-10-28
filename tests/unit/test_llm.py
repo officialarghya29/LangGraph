@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from typing import Any
 
 import httpx
 import pytest
@@ -628,6 +629,80 @@ async def test_an_ordinary_model_keeps_both_parameters() -> None:
     assert body["temperature"] == 0.4
     assert body["max_tokens"] == 512
     assert "max_completion_tokens" not in body
+
+
+async def test_the_model_catalogue_is_parsed_from_either_vendor_shape() -> None:
+    """Both list ``data[].id`` behind different headers, which is the whole point.
+
+    Asserted against a scripted server rather than the live suite, because the
+    parsing is the part that can be tested offline: the live test only asks
+    whether the configured name is in the list this returns.
+    """
+    openai_payload = {"object": "list", "data": [{"id": "gpt-6.1-sol"}, {"id": "gpt-6-luna"}]}
+    openai = OpenAICompatibleProvider(api_key="k", model="gpt-6.1-sol")
+    anthropic = AnthropicProvider(api_key="k", model="claude-sonnet-5-5")
+
+    for provider, payload in (
+        (openai, openai_payload),
+        (anthropic, {"data": [{"id": "claude-sonnet-5-5", "type": "model"}]}),
+    ):
+        seen: dict[str, Any] = {}
+
+        def handler(request: httpx.Request, *, seen=seen, payload=payload) -> httpx.Response:
+            seen["url"] = str(request.url)
+            seen["headers"] = dict(request.headers)
+            return httpx.Response(200, json=payload, request=request)
+
+        await provider.aclose()
+        provider._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            models = await provider.alist_models()
+        finally:
+            await provider.aclose()
+
+        assert models[0] == payload["data"][0]["id"]
+        assert seen["url"].endswith("/models")
+
+
+async def test_the_catalogue_request_uses_each_vendors_own_header() -> None:
+    """Sending ``Authorization`` to Anthropic is a 401, not a fallback."""
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["headers"] = dict(request.headers)
+        return httpx.Response(200, json={"data": [{"id": "claude-sonnet-5-5"}]}, request=request)
+
+    provider = AnthropicProvider(api_key="secret-key", model="claude-sonnet-5-5")
+    provider._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        await provider.alist_models()
+    finally:
+        await provider.aclose()
+
+    headers = seen["headers"]
+    assert headers["x-api-key"] == "secret-key"
+    assert headers["anthropic-version"]
+    assert "authorization" not in headers, "the Anthropic surface does not accept a bearer token"
+
+
+async def test_a_refused_catalogue_is_an_error_not_an_empty_list() -> None:
+    """An empty list would read as "the vendor serves nothing", which is a lie."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, json={"error": "bad key"}, request=request)
+
+    provider = OpenAICompatibleProvider(api_key="k", model="gpt-6.1-sol")
+    provider._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        with pytest.raises(LLMError, match="model listing"):
+            await provider.alist_models()
+    finally:
+        await provider.aclose()
+
+
+async def test_the_fake_offers_no_catalogue() -> None:
+    """The interface default, so the live check cannot pass on a fake."""
+    assert await FakeLLMProvider().alist_models() == ()
 
 
 async def test_consecutive_calls_share_one_http_client(
