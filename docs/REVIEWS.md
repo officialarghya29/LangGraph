@@ -425,6 +425,19 @@ server), resolved in one place, and asserted against the provider enum so adding
 provider without adding a model fails in the test suite rather than on the first
 request.
 
+**The right provider, and the wrong tier.** That fix named `gpt-5.6-terra`, on the
+belief that it was the balanced default. OpenAI's own model page for it says it
+"roughly corresponds to the mini model tier used in earlier GPT-5 families", and
+the line has since been superseded by GPT-6.1, whose balanced tier is
+`gpt-6.1-sol`. A model name written into a default is a claim about a vendor's
+lineup at one moment, and it decays into a claim about a retired model without
+anyone editing the file — so the name now cites the vendor's description of the
+tier and lists the siblings, which is the part that stays true. The Anthropic
+default is deliberate rather than defaulted: Anthropic recommends Opus for "most
+workloads", and Sonnet is the cheaper tier this system can afford to call five
+times a run. What none of this establishes is that a live call succeeds; there is
+no vendor key on this host, and the tests still speak to a scripted server.
+
 **A request shape that the new defaults reject outright.** This is the finding
 that would have made the system dead on arrival, and it was latent before the
 default changed: OpenAI's reasoning models do not ignore `temperature`, they fail
