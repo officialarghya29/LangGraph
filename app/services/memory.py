@@ -517,7 +517,12 @@ class PostgresMemoryStore(MemoryStore):
             records = await MemoryRepository(session).list_for_user(
                 owner, kinds=[kind.value for kind in kinds], limit=limit
             )
-            return [(self._to_item(record), _as_float_list(record.embedding)) for record in records]
+            # The column is a float array, so the driver has already produced a
+            # list of floats. There used to be a coercion here because JSONB could
+            # bring back integers, strings, or an object — and it copied every
+            # component of every candidate to defend against a value the column
+            # now refuses to store.
+            return [(self._to_item(record), record.embedding) for record in records]
 
     async def mark_accessed(self, memory_ids: Sequence[str]) -> None:
         """Bump the access counter for retrieved memories."""
@@ -560,21 +565,6 @@ class PostgresMemoryStore(MemoryStore):
             if owner is None:
                 return {}
             return await MemoryRepository(session).count_for_user(owner)
-
-
-def _as_float_list(value: object) -> list[float] | None:
-    """Coerce a stored JSON column back into a float vector, or ``None``.
-
-    JSONB round-trips integers as integers, so a vector written as ``[0, 1]``
-    returns ``[0, 1]`` rather than ``[0.0, 1.0]``. Anything that is not a list of
-    numbers is treated as absent rather than partially trusted.
-    """
-    if not isinstance(value, list):
-        return None
-    try:
-        return [float(component) for component in value]
-    except (TypeError, ValueError):
-        return None
 
 
 class MemoryManager:

@@ -535,13 +535,13 @@ async def recall_measurement(*, iterations: int = 200) -> TimingResult:
     embedding with the local embedder, and 10 to 16 ms scoring and ranking — a
     cosine and a norm per candidate — so the cost is the scoring loop rather than
     the store. Against PostgreSQL the same
-    retrieval over 500 rows of 256-dimensional vectors is about 140 ms, and the
-    split is the opposite of the in-memory one: about 10 ms for the query without
-    the vectors, about 55 ms transferring them, and about 95 ms parsing 128 000
-    numbers back out of JSONB. That is why the scan limit is the knob that matters
+    retrieval over 500 rows of 256-dimensional vectors is about 45 ms, and the
+    split is the opposite of the in-memory one: about 9 ms for the query without
+    the vectors and about 35 ms turning the column into 128 000 Python floats,
+    against 10 ms of scoring. That is why the scan limit is the knob that matters
     on that path and why the durable store narrows by kind in the query — and why
-    the next lever there is a binary vector column rather than JSONB, which is a
-    migration with a backfill and is not taken here. And
+    the embedding column is a ``double precision[]``: the same values in JSONB had
+    to be parsed out of text on every read, which made the scan 139 to 154 ms. And
     replacing the full sort with ``heapq.nlargest`` was measured at 0.71 ms
     against 0.72 ms for sorting 500 scores: a difference inside the noise, because
     the scoring dominates and the ranking is a few hundred comparisons. It was

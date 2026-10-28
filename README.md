@@ -403,16 +403,22 @@ different enough to say so. In memory, one recall over the default scan window o
 query with the local embedder, and the rest scoring and ranking.
 
 Against PostgreSQL the same retrieval over 500 rows of 256-dimensional vectors
-costs about 140 ms, and almost none of it is the work the in-memory figure
-measures. The query without the vectors is about 10 ms; the vectors cost about
-130 ms more, of which roughly 55 ms is transferring them as text and 95 ms is
-parsing 128 000 numbers back out of JSONB. Scoring, which is essentially the
-whole cost in memory, is 10 ms of it. That is why the scan limit, not the scoring
-loop, is the knob that matters on the durable path, and why that query narrows by
-tier in SQL and returns at most `limit` rows. It is also why the next lever there is a binary
-vector column rather than JSONB — storing the embedding as a float array would
-remove the parse entirely — which is a migration with a backfill and is not taken
-here, because nothing at this scale needs it yet.
+costs about 45 ms, and almost none of it is the work the in-memory figure
+measures. The query without the vectors is about 9 ms; the vectors add about
+35 ms, which is the driver turning the column into 128 000 Python floats and the
+floor without a vector extension. Scoring is about 10 ms of it. That is why the
+scan limit, not the scoring loop, is the knob that matters on the durable path,
+and why that query narrows by tier in SQL and returns at most `limit` rows.
+
+The embedding column is a `double precision[]`, not JSONB, which is where it
+started. The values were always floats; JSONB only made them convenient to write
+and expensive to read, because every scan re-tokenised 128 000 numbers before it
+could compute a single similarity. Measured on the same 500 rows before and after
+the migration: **139–154 ms became 43–49 ms**, and a downgrade followed by an
+upgrade reproduces every stored vector bit for bit. `double precision` rather
+than `real` because narrowing the storage would move the last bits of every score
+and reorder exact ties between near-duplicate memories — a saving of four bytes a
+row against a ranking that changes, which is not a trade worth making.
 
 The cosine numerator is written as `sum(map(mul, a, b))` rather than a generator
 expression. Both sum the same products in the same order, so the scores are
@@ -1082,17 +1088,17 @@ check. Two embeddings in the sample data are *exactly* tied by construction, so
 the harness also refuses to assert an order between tied rows — the contract is
 about the ranking, not about which of two equal rows came first.
 
-Measured on the development host, with budgets in the test suite set an order of
-magnitude above these so they fail on a real regression rather than on a busy
-machine:
+Measured on the development host, with budgets in the test suite set above these
+numbers — generously enough that a busy machine does not fail them, tightly enough
+that a regressing change does:
 
 | Operation | Mean | Throughput |
 | :--- | ---: | ---: |
 | Tokenise a request | 0.012 ms | ~81,000/s |
 | Estimate importance | 0.025 ms | ~41,000/s |
-| Prepare a query context | 0.018 ms | ~55,000/s |
-| Score 500 candidates (vectors) | 2.15 ms | ~465/s |
-| Score 500 candidates (lexical fallback) | 3.37 ms | ~297/s |
+| Prepare a query context | 0.08 ms | ~12,000/s |
+| Score 500 candidates (vectors) | 12–16 ms | ~70/s |
+| Score 500 candidates (lexical fallback) | 3.6 ms | ~280/s |
 
 ---
 

@@ -11,11 +11,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import JSON, DateTime, MetaData, Uuid, func
+from sqlalchemy import ARRAY, JSON, DateTime, Float, MetaData, Uuid, func
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-__all__ = ["Base", "JsonColumn", "TimestampMixin", "utc_now"]
+__all__ = ["Base", "JsonColumn", "TimestampMixin", "VectorColumn", "utc_now"]
 
 #: Deterministic names for every index and constraint, so migrations are
 #: reversible and a review can see the intended name before it exists.
@@ -31,6 +31,18 @@ NAMING_CONVENTION = {
 #: deployment because it is indexable and validates on write; the portable
 #: variant keeps the models usable against a lightweight backend in a unit test.
 JsonColumn = JSON().with_variant(JSONB(), "postgresql")
+
+#: A float vector. PostgreSQL stores it as ``double precision[]``, which the driver
+#: decodes natively; the same numbers kept in JSONB had to be parsed back into
+#: floats on every read, and that parse was the dominant cost of a durable
+#: retrieval — about 95 ms of a 140 ms scan over 500 rows at 256 dimensions.
+#:
+#: ``double precision`` rather than ``real``: retrieval computes cosine similarity
+#: in Python floats, so narrowing the storage would change the last bits of every
+#: score, and with them the order of exact ties between near-duplicate memories.
+#: The JSON variant keeps the models usable against a lightweight backend, which
+#: is the same reason :data:`JsonColumn` has one.
+VectorColumn = ARRAY(Float).with_variant(JSON(), "sqlite")
 
 
 def utc_now() -> datetime:

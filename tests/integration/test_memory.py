@@ -1,9 +1,10 @@
 """Integration tests for durable memory, against real PostgreSQL.
 
 The manager's own decisions are covered by unit tests; what only a real server
-can prove is here — that a vector survives a JSONB round trip without losing its
-type, that retrieval never crosses an owner boundary at the SQL level, and that
-pruning expires the volatile tiers without touching the curated one.
+can prove is here — that a vector survives a round trip through an array column
+without losing its type, that the column refuses a value that is not a vector,
+that retrieval never crosses an owner boundary at the SQL level, and that pruning
+expires the volatile tiers without touching the curated one.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import pytest
 from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -128,11 +130,12 @@ async def test_a_memory_survives_a_round_trip(database: Database) -> None:
 
 
 async def test_an_embedding_round_trips_as_floats(database: Database) -> None:
-    """JSONB stores ``0`` as an integer; a vector must still come back numeric.
+    """Integers written by a caller must come back as the same floats.
 
-    A cosine similarity computed against mixed int and float components is
-    correct in Python but the column type is not guaranteed, so the store
-    coerces rather than trusting what the dialect hands back.
+    The vector arrives here as ``[0, 1, -1, 0.5]`` — a list a caller could
+    reasonably build — and cosine similarity is computed in floats, so the column
+    and the driver have to hand something back that compares equal to the float
+    form rather than to the integers that were written.
     """
     await store_item(database, user="alice", content="vector test", embedding=[0, 1, -1, 0.5])
 
@@ -146,14 +149,14 @@ async def test_an_embedding_round_trips_as_floats(database: Database) -> None:
     assert all(isinstance(component, float) for component in embedding)
 
 
-async def test_a_non_vector_embedding_is_treated_as_absent(
+async def test_a_row_without_an_embedding_has_no_vector(
     database: Database, session: AsyncSession
 ) -> None:
-    """A malformed stored value must degrade retrieval, not crash it.
+    """A memory with no vector is retrieved and scored lexically, not skipped.
 
-    Written through the ORM rather than the repository-facing API, because the
-    point is a value that no correct caller would produce but a hand-edit or an
-    older schema version could have left behind.
+    Lexical matching is a weaker signal than cosine similarity, so a row without
+    an embedding would be quietly demoted if the reader treated it as absent from
+    the scan entirely rather than as a candidate without a vector.
     """
     from app.database.repositories import MemoryRepository, UserRepository
 
@@ -161,8 +164,7 @@ async def test_a_non_vector_embedding_is_treated_as_absent(
     await MemoryRepository(session).create(
         user_id=owner.id,
         kind=MemoryType.LONG_TERM.value,
-        content="malformed vector",
-        embedding={"not": "a vector"},  # type: ignore[arg-type]
+        content="no vector here",
     )
     await session.commit()
 
@@ -172,6 +174,39 @@ async def test_a_non_vector_embedding_is_treated_as_absent(
 
     assert candidates
     assert all(embedding is None for _, embedding in candidates)
+
+
+async def test_the_column_refuses_a_value_that_is_not_a_vector(
+    database: Database, session: AsyncSession
+) -> None:
+    """The old column accepted an object; the new one refuses to store one.
+
+    The reader used to defend against a malformed value by copying and coercing
+    every component of every candidate on every scan. ``double precision[]`` makes
+    that state unrepresentable, so the defence moves to the write and the read
+    stops paying for it — which is worth a test, because a migration back to JSON
+    would silently restore the old behaviour without failing anything else.
+    """
+    from app.core.exceptions import DatabaseError
+    from app.database.repositories import MemoryRepository, UserRepository
+
+    owner = await UserRepository(session).get_or_create("alice")
+
+    with pytest.raises(DatabaseError):
+        await MemoryRepository(session).create(
+            user_id=owner.id,
+            kind=MemoryType.LONG_TERM.value,
+            content="malformed vector",
+            embedding={"not": "a vector"},  # type: ignore[arg-type]
+        )
+    await session.rollback()
+
+    assert (
+        await PostgresMemoryStore(database).candidates(
+            user_id="alice", kinds=(MemoryType.LONG_TERM,), limit=5
+        )
+        == []
+    )
 
 
 # --------------------------------------------------------------------------- #

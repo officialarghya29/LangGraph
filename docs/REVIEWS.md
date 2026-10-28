@@ -682,6 +682,28 @@ of truth for a derived number. The honest description is "inside the noise of th
 thing it sits inside". Both the heap and the norm are recorded here so the next
 person does not derive the same two numbers and ship the second one.
 
+### The column the measurement pointed at
+
+What the 95 ms of JSON parsing did justify was changing the column. The
+embeddings were always a list of floats; JSONB was a way to write one, not a
+property of the value, and it charged a re-tokenisation of 128 000 numbers on
+every scan before a single similarity could be computed. `double precision[]` is
+decoded by the driver instead. On the same 500 rows, through the same store:
+**139–154 ms became 43–49 ms**, measured before and after the migration.
+
+Three details were not optional. The width: `real` would have been smaller and
+faster to transfer, but cosine similarity is computed in Python floats, so
+narrowing the column would change the last bits of every score and with them the
+order of exact ties — the property the dot-product change was careful to keep.
+The backfill: the old column accepted a string, an object, or an array with a
+non-number in it, because nothing said otherwise; those rows were already treated
+as having no vector by the reader, so the migration sets them to NULL rather than
+failing the upgrade, and a downgrade followed by an upgrade reproduces every
+remaining vector bit for bit. And the reader: the coercion that copied and
+converted every component of every candidate existed only because JSONB could
+return an integer or a string, so it is gone, and a test now asserts that the
+column refuses what the reader used to have to survive.
+
 ## Verification
 
 | Phase | Scope | Status |
@@ -692,7 +714,7 @@ person does not derive the same two numbers and ship the second one.
 | — | Deep scan | Complete — thirteen findings fixed, one verified non-defect, five settings documented and two configuration defects closed |
 | — | Deep scan, third pass | Complete — seven findings fixed, all in the model layer or found from it; two settings added, two configuration defects closed |
 | — | Deep scan, fourth pass | Complete — four findings fixed, each measured rather than assumed: 264 ms of handshake removed per model call, one database session removed per stream poll, a template line that parsed as a value, an uncalled list branch. Three of the four now have a test that fails without the fix |
-| — | Deep scan, fifth pass | Complete — four findings fixed in the paths the fourth pass opened: one query instead of one per tier, a dot product 1.7× faster with bit-identical output, a fivefold cheaper idle stream, and a live check that CI now actually runs. Three measurement defects corrected — two benchmarks and the durable figure they contradicted; two optimisations measured and rejected, both recorded so they are not re-derived |
+| — | Deep scan, fifth pass | Complete — four findings fixed in the paths the fourth pass opened: one query instead of one per tier, a dot product 1.7× faster with bit-identical output, a fivefold cheaper idle stream, and a live check that CI now actually runs. Three measurement defects corrected — two benchmarks and the durable figure they contradicted; two optimisations measured and rejected, both recorded so they are not re-derived; the embedding column moved from JSONB to a float array, 139–154 ms to 43–49 ms |
 
 Migration verification, which was blocked alongside the container work, was
 completed without a container runtime: the revision applies to an empty database,
