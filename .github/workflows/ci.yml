@@ -205,6 +205,26 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    # PostgreSQL is here for the conftest, not for the tests. The session-scoped
+    # fixture that points the whole run at a throwaway database is autouse, so
+    # without a server every test in this job — the live ones included — skips on
+    # an unreachable database instead of on the credential it is meant to check.
+    # That is how this job stayed green while proving nothing even when the model
+    # catalogue was wrong: the skip reason named PostgreSQL, not the missing key.
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: langgraph
+          POSTGRES_PASSWORD: langgraph
+          POSTGRES_DB: langgraph
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U langgraph"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     env:
       # Configured as a repository secret. Absent, the suite skips in one line;
       # present, this is the only job that can notice a model name the vendor has
@@ -212,6 +232,11 @@ jobs:
       LLM_PROVIDER: openai
       LLM_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       APP_ENV: development
+      DATABASE_URL: postgresql+asyncpg://langgraph:langgraph@127.0.0.1:5432/langgraph
+      CHECKPOINT_BACKEND: postgres
+      # A missing service is a failure here, not a skip. The only thing this job
+      # is allowed to skip on is the credential, and the step below says so.
+      REQUIRE_SERVICES: "1"
     steps:
       - uses: actions/checkout@v5
 
